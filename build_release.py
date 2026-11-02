@@ -99,14 +99,15 @@ def patched_bytes(path: str, repo: str) -> bytes:
     return raw
 
 
-def build_zip(target: str, repo: str, extra: list[str] | None = None) -> None:
+def build_zip(target: str, repo: str, extra: list[tuple[str, str]] | None = None) -> None:
+    """extra: [(源相对路径, 包内路径)]，用来把部署脚本摊到包根目录。"""
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for full, rel in iter_files():
             zf.writestr(rel, patched_bytes(full, repo))
-        for item in extra or []:
-            full = os.path.join(ROOT, item)
+        for src, arc in extra or []:
+            full = os.path.join(ROOT, src)
             if os.path.isfile(full):
-                zf.writestr(item, patched_bytes(full, repo))
+                zf.writestr(arc, patched_bytes(full, repo))
 
 
 def build_tar(target: str, repo: str) -> None:
@@ -162,7 +163,13 @@ def main() -> int:
     print("  写出", os.path.basename(plain), f"{os.path.getsize(plain) // 1024} KB")
     build_tar(linux, repo)
     print("  写出", os.path.basename(linux), f"{os.path.getsize(linux) // 1024} KB")
-    build_zip(windows, repo)
+    # Windows 包把 bat 摊到根目录：解压后双击 install.bat 就能装，不用进两层子目录
+    build_zip(windows, repo, extra=[
+        ("deploy/windows/install.bat", "install.bat"),
+        ("deploy/windows/start.bat", "start.bat"),
+        ("deploy/windows/stop.bat", "stop.bat"),
+        ("deploy/windows/uninstall.bat", "uninstall.bat"),
+    ])
     print("  写出", os.path.basename(windows), f"{os.path.getsize(windows) // 1024} KB")
 
     sums = []

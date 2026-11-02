@@ -14,7 +14,9 @@ set "REPO=__REPO__"
 set "WK_HOME=%LOCALAPPDATA%\%APP%"
 if not "%WK_HOME_OVERRIDE%"=="" set "WK_HOME=%WK_HOME_OVERRIDE%"
 set "PORT=8765"
+if not "%WK_PORT%"=="" set "PORT=%WK_PORT%"
 set "TOKEN=qq928820655"
+if not "%WK_TOKEN%"=="" set "TOKEN=%WK_TOKEN%"
 
 echo.
 echo ============================================
@@ -79,6 +81,12 @@ set "DLURL="
 if not "%WK_PACKAGE%"=="" (
   set "DLURL=file:///%WK_PACKAGE%"
   echo [i] 使用本地包：%WK_PACKAGE%
+) else if exist "%~dp0server.py" (
+  rem 解压后的离线包：脚本和代码在同一目录，直接用本目录，不必联网
+  set "LOCALPKG=%~dp0"
+  set "LOCALPKG=!LOCALPKG:~0,-1!"
+  set "DLURL=dir:!LOCALPKG!"
+  echo [i] 检测到本地代码，直接就地安装
 ) else (
   echo [i] 查询最新版本...
   for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command ^
@@ -94,6 +102,12 @@ if "%DLURL%"=="" (
   exit /b 1
 )
 
+if "!DLURL:~0,4!"=="dir:" (
+  rem 本地目录模式：跳过下载，直接把当前目录当解压源
+  set "EXTRACT=!DLURL:~4!"
+  goto :have_source
+)
+
 echo [i] 下载：%DLURL%
 powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '%DLURL%' -OutFile '%TMPZIP%' -UseBasicParsing"
 if not exist "%TMPZIP%" (
@@ -103,14 +117,20 @@ if not exist "%TMPZIP%" (
 )
 
 rem ---------- 7. 解压覆盖代码 ----------
-set "EXTRACT=%TEMP%\%APP%-unpack"
-if exist "%EXTRACT%" rd /s /q "%EXTRACT%"
-powershell -NoProfile -Command "Expand-Archive -Path '%TMPZIP%' -DestinationPath '%EXTRACT%' -Force"
+:have_source
+if "%EXTRACT%"=="" (
+  set "EXTRACT=%TEMP%\%APP%-unpack"
+  if exist "!EXTRACT!" rd /s /q "!EXTRACT!"
+  powershell -NoProfile -Command "Expand-Archive -Path '%TMPZIP%' -DestinationPath '!EXTRACT!' -Force"
+  set "TEMP_SRC=1"
+)
 
 set "SRC=%EXTRACT%"
 rem 包内如果只有一层目录，进去
-for /d %%d in ("%EXTRACT%\*") do (
-  if not exist "%EXTRACT%\server.py" set "SRC=%%d"
+if not exist "%EXTRACT%\server.py" (
+  for /d %%d in ("%EXTRACT%\*") do (
+    if exist "%%d\server.py" set "SRC=%%d"
+  )
 )
 if not exist "%SRC%\server.py" (
   echo [X] 包里没有 server.py，不是本程序的发布包
@@ -118,11 +138,27 @@ if not exist "%SRC%\server.py" (
   exit /b 1
 )
 
+rem 源目录就是安装目录时不能自己删自己。
+rem 用 pushd + %CD% 拿规范化绝对路径比较：直接比字符串会被末尾反斜杠和
+rem 短路径（8.3 名）坑到，pushd 出来的 %CD% 一定是完整路径且不带尾斜杠。
+pushd "%SRC%" 2>nul
+set "SRCABS=%CD%"
+popd
+pushd "%WK_HOME%" 2>nul
+set "HOMABS=%CD%"
+popd
+if /i "%SRCABS%"=="%HOMABS%" (
+  echo [i] 当前目录就是安装目录，跳过复制
+  goto :after_copy
+)
+
 if exist "%WK_HOME%\wk" rd /s /q "%WK_HOME%\wk"
 if exist "%WK_HOME%\web" rd /s /q "%WK_HOME%\web"
 xcopy "%SRC%\*" "%WK_HOME%\" /E /Y /Q >nul
-rd /s /q "%EXTRACT%" >nul 2>&1
-del /q "%TMPZIP%" >nul 2>&1
+:after_copy
+rem 只在临时解压目录时才清理，本地目录模式不能删源
+if not "%TEMP_SRC%"=="" rd /s /q "%EXTRACT%" >nul 2>&1
+if exist "%TMPZIP%" del /q "%TMPZIP%" >nul 2>&1
 echo [✓] 代码已更新（data 与 config 未动）
 
 rem ---------- 8. 写配置 ----------
