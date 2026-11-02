@@ -56,7 +56,7 @@ def main() -> int:
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--wait-port", type=float, default=0,
                         help="等端口释放的秒数（升级重启用）")
-    parser.add_argument("--version", action="version", version=f"wk-switch {version.VERSION}")
+    parser.add_argument("--version", action="version", version=f"wk-switch {version.version()}")
     args = parser.parse_args()
 
     port = find_port(args.port, wait=args.wait_port)
@@ -64,7 +64,7 @@ def main() -> int:
     url = f"http://127.0.0.1:{port}"
 
     print("=" * 58)
-    print(f"  wk-switch v{version.VERSION} · 跨项目账户导入导出转换")
+    print(f"  wk-switch v{version.version()} · 跨项目账户导入导出转换")
     print(f"  地址：{url}")
     print("  停止：Ctrl+C")
     print("=" * 58)

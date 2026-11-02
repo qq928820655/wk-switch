@@ -585,7 +585,7 @@ class Handler(BaseHTTPRequestHandler):
             result = updater.check()
         except ValueError as exc:
             self._json(200, {"ok": False, "error": str(exc),
-                             "current": version.VERSION})
+                             "current": version.version()})
             return
         self._json(200, {"ok": True, **result})
 

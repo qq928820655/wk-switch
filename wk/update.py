@@ -40,7 +40,7 @@ REPLACEABLE = (
 DEFAULT_CONFIG = {
     "repo": "",
     "api": "https://api.github.com",
-    "asset": r"^wk-switch-.*\.zip$",
+    "asset": r"^wk-switch-[0-9.]+zip$",
     "index_url": "",
     "timeout": 30,
     "allow_prerelease": False,
@@ -99,7 +99,7 @@ def save_config(patch: dict) -> dict:
 
 def _request(url: str, timeout: int = 30, accept: str = "application/vnd.github+json"):
     req = urllib.request.Request(url, headers={
-        "User-Agent": "wk-switch/" + version.VERSION,
+        "User-Agent": "wk-switch/" + version.version(),
         "Accept": accept,
     })
     # 本机常挂代理：这里只走系统默认，不额外注入
@@ -132,7 +132,9 @@ def _github_latest(cfg: dict) -> dict:
         assets = [a for a in rel.get("assets") or [] if pattern.search(a.get("name") or "")]
         if not assets:
             continue
-        asset = assets[0]
+        ver = str(rel.get("tag_name") or rel.get("name") or "").lstrip("vV")
+        exact = f"wk-switch-{ver}.zip"
+        asset = next((a for a in assets if a.get("name") == exact), assets[0])
         return {
             "version": str(rel.get("tag_name") or rel.get("name") or "").lstrip("vV"),
             "url": asset.get("browser_download_url"),
@@ -172,9 +174,9 @@ def _index_latest(cfg: dict) -> dict:
 def check() -> dict:
     cfg = config()
     latest = _index_latest(cfg) if cfg.get("index_url") else _github_latest(cfg)
-    newer = version.is_newer(latest["version"], version.VERSION)
+    newer = version.is_newer(latest["version"], version.version())
     return {
-        "current": version.VERSION,
+        "current": version.version(),
         "latest": latest["version"],
         "newer": newer,
         "up_to_date": not newer,
@@ -223,7 +225,7 @@ def apply(progress=None) -> dict:
 
     info = check()
     if not info["newer"]:
-        return {"ok": True, "upgraded": False, "current": version.VERSION,
+        return {"ok": True, "upgraded": False, "current": version.version(),
                 "latest": info["latest"], "message": "已经是最新版本"}
 
     rel = info["release"]
@@ -246,7 +248,7 @@ def apply(progress=None) -> dict:
     # 先备份当前代码：升级失败要能原样退回去
     os.makedirs(BACKUP_DIR, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = os.path.join(BACKUP_DIR, f"code-{version.VERSION}-{stamp}.zip")
+    backup = os.path.join(BACKUP_DIR, f"code-{version.version()}-{stamp}.zip")
     with zipfile.ZipFile(backup, "w", compression=zipfile.ZIP_DEFLATED) as bz:
         for top in ("main.py", "server.py", "wk", "web", "deploy"):
             path = os.path.join(ROOT, top)
@@ -289,7 +291,7 @@ def apply(progress=None) -> dict:
     return {
         "ok": True,
         "upgraded": True,
-        "from": version.VERSION,
+        "from": version.version(),
         "to": rel["version"],
         "backup": os.path.basename(backup),
         "restart_required": True,

@@ -122,7 +122,7 @@ JSON
 {
   "repo": "${REPO}",
   "api": "https://api.github.com",
-  "asset": "^wk-switch-.*\\\\.zip$",
+  "asset": "^wk-switch-[0-9.]+zip$",
   "index_url": "",
   "timeout": 30,
   "allow_prerelease": false

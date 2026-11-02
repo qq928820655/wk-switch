@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -79,11 +79,23 @@ def iter_files():
 
 
 def patched_bytes(path: str, repo: str) -> bytes:
-    """部署脚本里的 __REPO__ 占位换成真实仓库名。"""
+    """部署脚本里的 __REPO__ 占位换成真实仓库名，并按扩展名归一换行。
+
+    Windows 工作区的 .sh 常是 CRLF，打进 Linux 包会变成
+    `/bin/bash^M: bad interpreter`；反过来 .bat 必须是 CRLF，
+    cmd 解析 LF-only 的 goto/label 会错行。所以这里强制归一并
+    不依赖 git 的 eol 设置——打包脚本要能单独跑对。
+    """
     with open(path, "rb") as f:
         raw = f.read()
     if b"__REPO__" in raw and repo:
         raw = raw.replace(b"__REPO__", repo.encode("utf-8"))
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".sh", ".py", ".md", ".html", ".css", ".js", ".json", ".txt", ".yml", ".yaml"):
+        raw = raw.replace(b"\r\n", b"\n")
+    elif ext in (".bat", ".cmd"):
+        raw = raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
     return raw
 
 
@@ -103,9 +115,12 @@ def build_tar(target: str, repo: str) -> None:
             data = patched_bytes(full, repo)
             info = tf.gettarinfo(full, arcname=rel)
             info.mtime = int(time.time())
-            if rel.endswith(".sh"):
-                info.mode = 0o755
-            import io
+            # 换行归一后长度会变（CRLF→LF 少字节），必须按实际数据重置
+            info.size = len(data)
+            # Windows 上 gettarinfo 拿不到 unix 权限，统一给个合理值
+            info.mode = 0o755 if rel.endswith(".sh") else 0o644
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
             tf.addfile(info, io.BytesIO(data))
 
 

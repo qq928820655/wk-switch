@@ -140,7 +140,7 @@ if not exist "%WK_HOME%\config\update.json" (
   > "%WK_HOME%\config\update.json" echo {
   >>"%WK_HOME%\config\update.json" echo   "repo": "%REPO%",
   >>"%WK_HOME%\config\update.json" echo   "api": "https://api.github.com",
-  >>"%WK_HOME%\config\update.json" echo   "asset": "^wk-switch-.*\\.zip$",
+  >>"%WK_HOME%\config\update.json" echo   "asset": "^wk-switch-[0-9.]+zip$",
   >>"%WK_HOME%\config\update.json" echo   "index_url": "",
   >>"%WK_HOME%\config\update.json" echo   "timeout": 30,
   >>"%WK_HOME%\config\update.json" echo   "allow_prerelease": false

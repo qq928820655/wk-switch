@@ -9,22 +9,36 @@ APP_NAME = "wk-switch"
 VERSION = "1.0.0"
 CHANNEL = "stable"
 
-#: 构建时写入；从源码直接跑时用文件 mtime 兜底
-_BUILD_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "BUILD")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BUILD_FILE = os.path.join(_ROOT, "BUILD")
+_VERSION_FILE = os.path.join(_ROOT, "VERSION")
+
+
+def _read_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def version() -> str:
+    """VERSION 文件优先。
+
+    一键升级会把新版本号写进 VERSION 文件，重启后无需改动本模块就能
+    反映真实版本；包里的常量只是源码直跑时的兜底。
+    """
+    return _read_file(_VERSION_FILE) or VERSION
 
 
 def build_time() -> str:
-    try:
-        with open(_BUILD_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip() or "dev"
-    except OSError:
-        return "dev"
+    return _read_file(_BUILD_FILE) or "dev"
 
 
 def info() -> dict:
     return {
         "app": APP_NAME,
-        "version": VERSION,
+        "version": version(),
         "channel": CHANNEL,
         "build": build_time(),
         "python": "%d.%d.%d" % __import__("sys").version_info[:3],
@@ -49,5 +63,5 @@ def parse_semver(text: str) -> tuple:
     return tuple(parts)
 
 
-def is_newer(candidate: str, current: str = VERSION) -> bool:
-    return parse_semver(candidate) > parse_semver(current)
+def is_newer(candidate: str, current: str = "") -> bool:
+    return parse_semver(candidate) > parse_semver(current or version())
