@@ -10,7 +10,14 @@ rem  已安装则自动走更新（保留 data 与 config），未安装则全�
 rem ============================================================
 
 set "APP=wk-switch"
+rem 仓库名：WK_REPO 覆盖 > 打包时替换的占位 > 内置默认
+rem 真实 owner/name 一定含斜杠，未替换的占位不含，据此兜底；
+rem 不用字符串比对占位符，因为打包脚本会全局替换它
 set "REPO=__REPO__"
+if not "%WK_REPO%"=="" set "REPO=%WK_REPO%"
+rem 空值时 echo 会打印开关状态，用 echo( 才是纯空行
+echo(!REPO!| find "/" >nul
+if errorlevel 1 set "REPO=qq928820655/wk-switch"
 set "WK_HOME=%LOCALAPPDATA%\%APP%"
 if not "%WK_HOME_OVERRIDE%"=="" set "WK_HOME=%WK_HOME_OVERRIDE%"
 set "PORT=8765"
