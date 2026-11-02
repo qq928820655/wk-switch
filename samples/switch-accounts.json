@@ -1,0 +1,67 @@
+[
+  {
+    "id": "u-cn-1001",
+    "uid": "u-cn-1001",
+    "nickname": "阿岩",
+    "email": "ayan@example.cn",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDEiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTUzNDAwMDMsImlhdCI6MTc5NTI1MzYwM30.c2lnbmF0dXJl",
+    "refresh_token": "rt-cn-1001-xxxxxxxxxxxxxxxx",
+    "token_type": "Bearer",
+    "domain": "copilot.tencent.com",
+    "expiresAt": 1795340003,
+    "refreshExpiresAt": 1797932003,
+    "createdAt": 1793352803
+  },
+  {
+    "id": "u-intl-2002",
+    "uid": "u-intl-2002",
+    "nickname": "Avery",
+    "email": "avery@example.com",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWludGwtMjAwMiIsImlzcyI6Imh0dHBzOi8vd3d3LndvcmtidWRkeS5haSIsImV4cCI6MTc5NDEzMDQwMywiaWF0IjoxNzk0MDQ0MDAzfQ.c2lnbmF0dXJl",
+    "refresh_token": "rt-intl-2002-yyyyyyyyyyyyyyyy",
+    "token_type": "Bearer",
+    "domain": "www.workbuddy.ai",
+    "expiresAt": 1794130403,
+    "refreshExpiresAt": 1796722403,
+    "createdAt": 1793352803
+  },
+  {
+    "id": "u-cn-1003",
+    "uid": "u-cn-1003",
+    "nickname": "测试号·过期",
+    "email": "",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDMiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTEwMjAwMDMsImlhdCI6MTc5MDkzMzYwM30.c2lnbmF0dXJl",
+    "refresh_token": "",
+    "token_type": "Bearer",
+    "domain": "codebuddy.cn",
+    "expiresAt": 1791020003,
+    "refreshExpiresAt": 0,
+    "createdAt": 1793352803
+  },
+  {
+    "id": "u-cn-1001",
+    "uid": "u-cn-1001",
+    "nickname": "阿岩（旧凭据）",
+    "email": "ayan@example.cn",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDEiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTM3ODQ4MDMsImlhdCI6MTc5MzY5ODQwM30.c2lnbmF0dXJl",
+    "refresh_token": "rt-cn-1001-old",
+    "token_type": "Bearer",
+    "domain": "copilot.tencent.com",
+    "expiresAt": 1793784803,
+    "refreshExpiresAt": 1796376803,
+    "createdAt": 1793352803
+  },
+  {
+    "id": "apikey-9f2c",
+    "uid": "apikey-9f2c",
+    "nickname": "静态 Key 号",
+    "email": "",
+    "access_token": "ck_9f2c.ZmFrZS1zZWNyZXQtdmFsdWU=",
+    "refresh_token": "",
+    "token_type": "Bearer",
+    "domain": "copilot.tencent.com",
+    "expiresAt": 0,
+    "refreshExpiresAt": 0,
+    "createdAt": 1793352803
+  }
+]

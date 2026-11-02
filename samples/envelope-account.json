@@ -1,0 +1,13 @@
+{
+  "account": {
+    "uid": "u-env-3001",
+    "nickname": "信封号"
+  },
+  "auth": {
+    "accessToken": "{\"$wbEncrypted\": 1, \"envelope\": \"eyJzdWl0ZSI6MX0=\"}",
+    "refreshToken": "",
+    "expiresAt": 1794476003,
+    "domain": "www.workbuddy.ai",
+    "realm": "intl"
+  }
+}

@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>wk-switch · 跨项目账户转换</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⇄</span>
+    <div>
+      <h1>wk-switch</h1>
+      <p>跨项目账户导入导出转换</p>
+    </div>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="convert">导入转换</button>
+    <button class="tab" data-view="store">账户库 <span class="tab-count" id="store-count">0</span></button>
+    <button class="tab" data-view="update">升级 <span class="tab-dot" id="update-dot" hidden></span></button>
+  </nav>
+
+  <div class="topbar-right">
+    <button class="btn small" id="btn-logout">退出</button>
+  </div>
+</header>
+
+<main>
+
+<div id="view-convert">
+
+  <!-- 步骤条：内容区首行。放顶栏的话账户库视图会空出一条横杠 -->
+  <div class="steps-bar">
+    <nav class="steps" id="steps">
+      <span class="step active" data-step="1"><i>1</i>导入</span>
+      <span class="step" data-step="2"><i>2</i>转换</span>
+      <span class="step" data-step="3"><i>3</i>导出</span>
+    </nav>
+  </div>
+
+  <!-- ============ 1. 导入 ============ -->
+  <section class="card" id="card-import">
+    <div class="card-head">
+      <h2>导入源文件</h2>
+      <span class="hint">支持 .json / .zip / .txt，可多选</span>
+    </div>
+
+    <div class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" multiple accept=".json,.zip,.txt,.info">
+      <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 16V4m0 0L7 9m5-5 5 5" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round"/>
+      </svg>
+      <p class="dz-title">拖文件到这里，或点击选择</p>
+      <p class="dz-sub">七个项目的导出包都能直接读：Hub 文档 / Hub 目录包 / Manager 包 / Panel 凭据目录 / Switch 账号库 / Qoder 账号库 / Daily 登录结果</p>
+      <p class="dz-demo">没有现成文件？<a href="#" id="loadSample">载入示例数据</a></p>
+    </div>
+
+    <div class="sources" id="sources"></div>
+    <div class="notes" id="notes"></div>
+  </section>
+
+  <!-- ============ 2. 转换 ============ -->
+  <section class="card hidden" id="card-convert">
+    <div class="card-head">
+      <h2>转换设置</h2>
+      <span class="hint" id="convert-count"></span>
+    </div>
+
+    <div class="options">
+      <label class="field">
+        <span>去重依据</span>
+        <select id="opt-dedupe-key">
+          <option value="uid">uid（同一账号只留一条）</option>
+          <option value="token">access_token（同一条凭据只留一条）</option>
+          <option value="uid_token">uid 优先，缺失时看 token</option>
+          <option value="none">不去重</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>冲突处理</span>
+        <select id="opt-dedupe-policy">
+          <option value="keep_first">保留第一条</option>
+          <option value="keep_last">保留最后一条</option>
+          <option value="keep_newest">保留到期最晚的</option>
+          <option value="keep_both">两条都留（uid 加后缀）</option>
+        </select>
+      </label>
+
+      <label class="check"><input type="checkbox" id="opt-require-token" checked> 跳过无 access_token 的账号</label>
+      <label class="check"><input type="checkbox" id="opt-allow-envelope" checked> 允许加密信封账号（可切换，签到不可用）</label>
+      <label class="check"><input type="checkbox" id="opt-allow-expired" checked> 允许已过期账号（保留 RT 待续期）</label>
+      <label class="check"><input type="checkbox" id="opt-only-enabled"> 只保留 enabled 的账号</label>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="card-head sub">
+      <h2>结果预览</h2>
+      <span class="hint" id="preview-hint"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="grid" id="preview-table">
+        <thead>
+          <tr>
+            <th>#</th><th>uid</th><th>昵称</th><th>账号</th><th>区域</th>
+            <th>凭据状态</th><th>到期</th><th>AT</th><th>RT</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <details class="issues" id="issues-box">
+      <summary>问题清单 <span class="badge" id="issues-count">0</span></summary>
+      <ul id="issues-list"></ul>
+    </details>
+  </section>
+
+  <!-- ============ 3. 导出 ============ -->
+  <section class="card hidden" id="card-export">
+    <div class="card-head">
+      <h2>选择目标格式</h2>
+      <span class="hint">导出文件按目标项目的目录约定命名</span>
+    </div>
+
+    <div class="profiles" id="profiles"></div>
+
+    <div class="export-bar">
+      <button class="btn primary" id="btn-export" disabled>生成导出文件</button>
+      <button class="btn" id="btn-save-store">保存到账户库</button>
+      <span class="hint" id="export-hint">先选择一种目标格式</span>
+    </div>
+
+    <div class="realm-row" id="export-realm-row">
+      <span class="realm-label">导出版本</span>
+      <div class="seg">
+        <label><input type="radio" name="export-realm" value="all" checked><span>全部</span></label>
+        <label><input type="radio" name="export-realm" value="cn"><span>国内版</span></label>
+        <label><input type="radio" name="export-realm" value="intl"><span>国际版</span></label>
+        <label><input type="radio" name="export-realm" value="split"><span>分版本各一份</span></label>
+      </div>
+    </div>
+
+    <div class="downloads" id="downloads"></div>
+  </section>
+
+</div><!-- /view-convert -->
+
+<!-- ============ 账户库 ============ -->
+<div id="view-store" class="hidden">
+
+  <section class="card">
+    <div class="card-head">
+      <h2>本地账户库</h2>
+      <div class="head-right">
+        <span class="hint db-path" id="store-db"></span>
+        <button class="btn small danger" id="btn-store-clear">清空账户库</button>
+      </div>
+    </div>
+
+    <div class="store-stats" id="store-stats"></div>
+
+    <div class="store-toolbar">
+      <div class="seg" id="store-realm-seg">
+        <label><input type="radio" name="store-realm" value="" checked><span>全部</span></label>
+        <label><input type="radio" name="store-realm" value="cn"><span>国内版</span></label>
+        <label><input type="radio" name="store-realm" value="intl"><span>国际版</span></label>
+      </div>
+
+      <label class="search-box">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
+        </svg>
+        <input type="search" id="store-search" placeholder="搜索名称 / uid / 邮箱">
+      </label>
+
+    </div>
+
+    <div class="sel-bar" id="sel-bar">
+      <span class="sel-count" id="sel-count">未选择</span>
+      <div class="sel-actions">
+        <button class="btn small" id="btn-sel-export" disabled>导出选中</button>
+        <button class="btn small danger" id="btn-sel-delete" disabled>删除选中</button>
+        <button class="link" id="btn-sel-clear" disabled>取消</button>
+      </div>
+    </div>
+
+    <div class="table-wrap tall">
+      <table class="grid" id="store-table">
+        <thead>
+          <tr>
+            <th class="col-check"><input type="checkbox" id="store-check-all" title="全选本页"></th>
+            <th>名称</th><th>版本</th><th>uid</th><th>状态</th>
+            <th>到期</th><th>AT</th><th>RT</th><th>更新</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="hint" id="store-hint"></p>
+
+    <details class="issues" id="store-history">
+      <summary>导入记录 <span class="badge" id="history-count">0</span></summary>
+      <ul id="history-list"></ul>
+    </details>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>备份与还原</h2>
+      <span class="hint">整库打包成 zip（accounts.db + accounts.json），换机器或重装后直接还原</span>
+    </div>
+
+    <div class="export-bar">
+      <button class="btn primary" id="btn-store-backup">下载备份包</button>
+      <button class="btn" id="btn-store-restore">选择备份文件还原</button>
+      <input type="file" id="restoreInput" accept=".zip,.json" hidden>
+      <span class="realm-label">还原方式</span>
+      <div class="seg">
+        <label><input type="radio" name="restore-mode" value="merge" checked><span>合并</span></label>
+        <label><input type="radio" name="restore-mode" value="replace"><span>覆盖（先清空）</span></label>
+      </div>
+    </div>
+
+    <div class="downloads" id="backup-downloads"></div>
+    <p class="hint" id="backup-hint"></p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>从账户库导出</h2>
+      <span class="hint">按版本拆开导出，直接喂给对应的系统</span>
+    </div>
+
+    <div class="profiles compact" id="store-profiles"></div>
+
+    <div class="realm-row">
+      <span class="realm-label">导出版本</span>
+      <div class="seg">
+        <label><input type="radio" name="store-export-realm" value="all" checked><span>全部</span></label>
+        <label><input type="radio" name="store-export-realm" value="cn"><span>仅国内版</span></label>
+        <label><input type="radio" name="store-export-realm" value="intl"><span>仅国际版</span></label>
+        <label><input type="radio" name="store-export-realm" value="split"><span>分版本各一份</span></label>
+      </div>
+    </div>
+
+    <div class="export-bar">
+      <button class="btn primary" id="btn-store-export" disabled>从库导出</button>
+      <span class="hint" id="store-export-hint">先选择一种目标格式</span>
+    </div>
+
+    <div class="downloads" id="store-downloads"></div>
+  </section>
+
+</div><!-- /view-store -->
+
+<!-- ============ 升级 ============ -->
+<div id="view-update" class="hidden">
+
+  <section class="card">
+    <div class="card-head">
+      <h2>当前版本</h2>
+      <span class="hint" id="ver-build"></span>
+    </div>
+    <div class="ver-grid" id="ver-grid"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>在线升级</h2>
+      <span class="hint">从制品库拉最新发布包，只替换代码，账号库与口令不动</span>
+    </div>
+
+    <div class="upd-source">
+      <label class="field">
+        <span>制品仓库（GitHub owner/repo）</span>
+        <input type="text" id="upd-repo" placeholder="例如 qq928820655/wk-switch">
+      </label>
+      <label class="field">
+        <span>或制品索引地址（返回 {version,url}）</span>
+        <input type="text" id="upd-index" placeholder="https://example.com/wk-switch/latest.json">
+      </label>
+      <button class="btn small" id="btn-save-source">保存制品源</button>
+    </div>
+
+    <div class="upd-status" id="upd-status">
+      <div class="upd-line" id="upd-line">还没检查过</div>
+      <div class="upd-notes" id="upd-notes"></div>
+    </div>
+
+    <div class="export-bar">
+      <button class="btn primary" id="btn-check-update">检查更新</button>
+      <button class="btn" id="btn-apply-update" disabled>一键升级</button>
+      <button class="btn" id="btn-restart" disabled>重启生效</button>
+      <span class="hint" id="upd-hint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>部署与备份</h2>
+      <span class="hint">Linux / Windows 一键部署脚本在仓库 deploy/ 下</span>
+    </div>
+    <div class="ver-grid">
+      <div class="kv"><span>Linux 安装</span><code>curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/linux/install.sh | bash</code></div>
+      <div class="kv"><span>Windows 安装</span><code>deploy\windows\install.bat</code></div>
+      <div class="kv"><span>代码备份</span><code>backups/</code>（每次升级前自动打包）</div>
+      <div class="kv"><span>数据与口令</span><code>data/accounts.db</code> · <code>config/auth.json</code></div>
+    </div>
+  </section>
+
+</div><!-- /view-update -->
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

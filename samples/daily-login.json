@@ -1,0 +1,37 @@
+[
+  {
+    "phone": "13800001001",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDEiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTUzNDAwMDMsImlhdCI6MTc5NTI1MzYwM30.c2lnbmF0dXJl",
+    "refresh_token": "rt-cn-1001-xxxxxxxxxxxxxxxx",
+    "env_line": "13800001001:eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDEiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTUzNDAwMDMsImlhdCI6MTc5NTI1MzYwM30.c2lnbmF0dXJl:rt-cn-1001-xxxxxxxxxxxxxxxx",
+    "login_at": "2026-11-01 09:12:33"
+  },
+  {
+    "phone": "13800002002",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWludGwtMjAwMiIsImlzcyI6Imh0dHBzOi8vd3d3LndvcmtidWRkeS5haSIsImV4cCI6MTc5NDEzMDQwMywiaWF0IjoxNzk0MDQ0MDAzfQ.c2lnbmF0dXJl",
+    "refresh_token": "rt-intl-2002-yyyyyyyyyyyyyyyy",
+    "env_line": "13800002002:eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWludGwtMjAwMiIsImlzcyI6Imh0dHBzOi8vd3d3LndvcmtidWRkeS5haSIsImV4cCI6MTc5NDEzMDQwMywiaWF0IjoxNzk0MDQ0MDAzfQ.c2lnbmF0dXJl:rt-intl-2002-yyyyyyyyyyyyyyyy",
+    "login_at": "2026-11-01 09:12:33"
+  },
+  {
+    "phone": "13800001003",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDMiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTEwMjAwMDMsImlhdCI6MTc5MDkzMzYwM30.c2lnbmF0dXJl",
+    "refresh_token": "",
+    "env_line": "13800001003:eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDMiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTEwMjAwMDMsImlhdCI6MTc5MDkzMzYwM30.c2lnbmF0dXJl:",
+    "login_at": "2026-11-01 09:12:33"
+  },
+  {
+    "phone": "13800001001",
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDEiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTM3ODQ4MDMsImlhdCI6MTc5MzY5ODQwM30.c2lnbmF0dXJl",
+    "refresh_token": "rt-cn-1001-old",
+    "env_line": "13800001001:eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJ1LWNuLTEwMDEiLCJpc3MiOiJodHRwczovL2NvcGlsb3QudGVuY2VudC5jb20iLCJleHAiOjE3OTM3ODQ4MDMsImlhdCI6MTc5MzY5ODQwM30.c2lnbmF0dXJl:rt-cn-1001-old",
+    "login_at": "2026-11-01 09:12:33"
+  },
+  {
+    "phone": "13800009f2c",
+    "access_token": "ck_9f2c.ZmFrZS1zZWNyZXQtdmFsdWU=",
+    "refresh_token": "",
+    "env_line": "13800009f2c:ck_9f2c.ZmFrZS1zZWNyZXQtdmFsdWU=:",
+    "login_at": "2026-11-01 09:12:33"
+  }
+]

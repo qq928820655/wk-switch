@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+data/
+config/
+backups/
+dist/
+*.db
+*.log
+_shot_*.png
+_s_*.png
+_v_*.png
+shot_tool.py
+.workbuddy/
