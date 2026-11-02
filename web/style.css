@@ -537,7 +537,8 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 .dz-demo a:hover { border-bottom-style: solid; }
 
 /* ---------- 视图切换 ---------- */
-#view-convert.hidden, #view-store.hidden { display: none; }
+/* 三个视图各是一条规则：漏一个就会让上个视图的内容留在下面 */
+#view-convert.hidden, #view-store.hidden, #view-update.hidden { display: none; }
 
 .tabs { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: var(--line-2); }
 

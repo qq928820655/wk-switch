@@ -54,14 +54,21 @@ curl -fsSL .../install.sh | sudo bash -s -- --yes --token 你的口令 --port 87
 
 ### Windows
 
+下载 `wk-switch-<ver>-windows.zip`，解压后双击根目录的 `install.bat`。
+
+- 解压目录里有完整代码 → 就地安装，不联网
+- 只有 `install.bat` 一个文件 → 自动去 Releases 拉最新包
+
+装完在 `%LOCALAPPDATA%\wk-switch` 生成：
+
 ```bat
-deploy\windows\install.bat      :: 安装 / 更新（管理员）
-deploy\windows\start.bat        :: 启动
-deploy\windows\stop.bat         :: 停止
-deploy\windows\uninstall.bat    :: 卸载（保留数据）
+start.bat        :: 启动（写 wk.pid，开浏览器）
+stop.bat         :: 停止（按端口找进程，不按进程名误伤）
+uninstall.bat    :: 卸载（保留 data 与 config）
 ```
 
-默认目录 `%LOCALAPPDATA%\wk-switch`。
+端口与口令可用环境变量覆盖：`WK_PORT` / `WK_TOKEN` / `WK_HOME_OVERRIDE`；
+离线安装包路径写 `WK_PACKAGE`。
 
 ## 升级
 
@@ -72,8 +79,22 @@ deploy\windows\uninstall.bat    :: 卸载（保留数据）
 - GitHub Releases（默认）：`config/update.json` 的 `repo`，或 `.git` 的 origin
 - 任意制品索引：`index_url` 返回 `{"version": "1.0.1", "url": "包地址"}`
 
-升级只替换 `main.py` `server.py` `wk/` `web/` `deploy/`，`data/` `config/` 不动；
-每次升级前旧代码自动打包到 `backups/`。
+**下载拉不动时**（国内直连 `github.com` 的 release 资产常被掐断，而
+`api.github.com` 往往还能通，所以「检查更新成功、下载卡住」是常见组合）：
+
+- 页面「下载代理」填本地代理，如 `http://127.0.0.1:7890`；留空则用环境变量
+  `HTTPS_PROXY` / `HTTP_PROXY`
+- 或用「本地包升级」：浏览器里手动下载 `wk-switch-x.y.z.zip`，在页面上传，
+  走浏览器自己的网络栈，与本服务无关
+
+升级只替换 `main.py` `server.py` `wk/` `web/`，`data/` `config/` 不动，
+`deploy/` 也不动（安装器里的端口、路径、服务名是装的时候定的，被覆盖会冲掉
+用户的部署配置）；每次升级前旧代码自动打包到 `backups/`。
+
+包版本低于当前版本时按回滚处理，结果里会标 `downgraded: true`。
+
+重启走 `--wait-port`：新进程只在原端口上等旧进程退出，不往后找——端口一漂
+书签和反代就全失联了。
 
 ## 打包发布
 
