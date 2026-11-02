@@ -321,10 +321,14 @@
       <span class="hint">Linux / Windows 一键部署脚本在仓库 deploy/ 下</span>
     </div>
     <div class="ver-grid">
-      <div class="kv"><span>Linux 安装</span><code>curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/linux/install.sh | bash</code></div>
+      <div class="kv"><span>Linux 安装</span><code>deploy/linux/install.sh</code></div>
       <div class="kv"><span>Windows 安装</span><code>deploy\windows\install.bat</code></div>
-      <div class="kv"><span>代码备份</span><code>backups/</code>（每次升级前自动打包）</div>
-      <div class="kv"><span>数据与口令</span><code>data/accounts.db</code> · <code>config/auth.json</code></div>
+      <div class="kv"><span>代码备份</span><code>backups/</code><b class="kv-note">升级前自动打包</b></div>
+      <div class="kv"><span>数据与口令</span><code>data/accounts.db</code></div>
+    </div>
+    <div class="kv kv-wide">
+      <span>Linux 一键部署（新装 / 更新自动判断）</span>
+      <code id="linux-cmd">curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/linux/install.sh | sudo bash</code>
     </div>
   </section>
 

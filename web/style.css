@@ -900,6 +900,15 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   word-break: break-all;
   line-height: 1.6;
 }
+/* 完整部署命令太长，单独占一整行；格子不够宽时横向滚动而不是断成四行 */
+.kv-wide { margin-top: 10px; }
+.kv-wide code {
+  word-break: normal;
+  white-space: pre;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.kv-note { font-size: 11px; font-weight: 400; color: var(--ink-3); }
 
 .upd-source {
   display: grid;
@@ -920,6 +929,8 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   outline: none;
 }
 .upd-source input:focus { border-color: var(--brand); background: #fff; box-shadow: 0 0 0 3px rgba(79,70,229,.1); }
+/* 按钮文字不能被网格的 auto 列压成两行 */
+.upd-source .btn { white-space: nowrap; height: 34px; }
 
 .upd-status {
   padding: 12px 14px;
@@ -992,5 +1003,7 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   .upd-source .btn { width: 100%; }
   .ver-grid { grid-template-columns: 1fr; }
   .lu-row { flex-direction: column; align-items: stretch; }
+  /* column 方向下 flex-basis 会变成高度，260px 的 basis 直接撑出一大块空白 */
+  .lu-row input[type="file"] { flex: none; width: 100%; }
   .lu-row .btn { width: 100%; }
 }
