@@ -284,6 +284,10 @@
         <span>或制品索引地址（返回 {version,url}）</span>
         <input type="text" id="upd-index" placeholder="https://example.com/wk-switch/latest.json">
       </label>
+      <label class="field">
+        <span>下载代理（留空则用系统环境变量）</span>
+        <input type="text" id="upd-proxy" placeholder="http://127.0.0.1:7890">
+      </label>
       <button class="btn small" id="btn-save-source">保存制品源</button>
     </div>
 
@@ -297,6 +301,17 @@
       <button class="btn" id="btn-apply-update" disabled>一键升级</button>
       <button class="btn" id="btn-restart" disabled>重启生效</button>
       <span class="hint" id="upd-hint"></span>
+    </div>
+
+    <div class="local-upgrade">
+      <div class="lu-head">
+        <b>本地包升级</b>
+        <span class="hint">网络拉不动时用：浏览器里下载 <code>wk-switch-x.y.z.zip</code>，在这里上传</span>
+      </div>
+      <div class="lu-row">
+        <input type="file" id="upd-file" accept=".zip,application/zip">
+        <button class="btn" id="btn-apply-local">上传并升级</button>
+      </div>
     </div>
   </section>
 

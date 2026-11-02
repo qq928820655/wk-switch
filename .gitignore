@@ -12,3 +12,4 @@ _v_*.png
 shot_tool.py
 .workbuddy/
 BUILD
+.wk-upgrade-*/

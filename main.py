@@ -23,10 +23,17 @@ from wk import version
 
 
 def port_free(port: int, host: str = "127.0.0.1") -> bool:
+    """端口能不能真的绑上。
+
+    这里**不设** SO_REUSEADDR：Linux 上它只影响 TIME_WAIT，Windows 上却
+    允许绑定一个正在 LISTEN 的端口，会把「已被占用」误判成「空闲」，
+    于是升级重启时新进程以为 8765 空着、绑上去、实际抢不到而退出。
+    不设它，Windows 的 bind 遇到已监听端口会直接报 WSAEADDRINUSE。
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
+            sock.listen(1)
         except OSError:
             return False
         return True
@@ -36,18 +43,24 @@ def find_port(start: int, host: str = "127.0.0.1", tries: int = 20,
               wait: float = 0) -> int:
     """找一个能绑的端口。
 
-    wait > 0 时先原地等端口释放：升级重启场景下旧进程还没退干净，
-    立刻往后找端口会让用户的书签指向新端口。
+    wait > 0 是升级重启场景：此时**只等 start 这一个端口**，不往后找。
+    旧进程还在退出的那零点几秒里，8765 被占着而 8766 空着，一往后找
+    就绑到 8766 了——用户的书签、反向代理、防火墙规则全都指着 8765，
+    端口一漂就等于服务失联。真等不到（比如被别的程序长期占着）才退回
+    往后找，避免彻底起不来。
     """
     deadline = time.time() + max(0.0, wait)
-    while True:
-        for offset in range(tries):
-            port = start + offset
-            if port_free(port, host):
-                return port
-        if time.time() >= deadline:
-            raise SystemExit(f"从 {start} 起连续 {tries} 个端口都被占用")
-        time.sleep(0.5)
+    if wait > 0:
+        while time.time() < deadline:
+            if port_free(start, host):
+                return start
+            time.sleep(0.2)
+
+    for offset in range(tries):
+        port = start + offset
+        if port_free(port, host):
+            return port
+    raise SystemExit(f"从 {start} 起连续 {tries} 个端口都被占用")
 
 
 def main() -> int:

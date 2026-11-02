@@ -774,6 +774,7 @@ async function loadVersion() {
   const repo = data.update && data.update.repo ? data.update.repo : '';
   if (document.activeElement !== $('#upd-repo')) $('#upd-repo').value = repo;
   if (document.activeElement !== $('#upd-index')) $('#upd-index').value = (data.update && data.update.index_url) || '';
+  if (document.activeElement !== $('#upd-proxy')) $('#upd-proxy').value = (data.update && data.update.proxy) || '';
 
   // 部署命令里的 {repo} 占位换成真实仓库名
   document.querySelectorAll('#view-update code').forEach((el) => {
@@ -851,6 +852,46 @@ async function applyUpdate() {
   }
 }
 
+async function applyLocal() {
+  const input = $('#upd-file');
+  const file = input.files && input.files[0];
+  if (!file) {
+    toast('先选一个 zip 包', true);
+    return;
+  }
+  if (!/\.zip$/i.test(file.name)) {
+    toast('只接受 .zip 升级包', true);
+    return;
+  }
+  const btn = $('#btn-apply-local');
+  btn.disabled = true;
+  btn.textContent = '上传中…';
+  try {
+    const b64 = await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => {
+        const s = String(fr.result || '');
+        resolve(s.slice(s.indexOf(',') + 1));
+      };
+      fr.onerror = () => reject(new Error('读取文件失败'));
+      fr.readAsDataURL(file);
+    });
+    const data = await api('/api/update/local', { name: file.name, data: b64 });
+    const verb = data.downgraded ? '回滚' : '升级';
+    $('#upd-line').innerHTML = `已用本地包${verb}到 <b>v${esc(data.to)}</b>，重启后生效`;
+    $('#upd-notes').textContent = `替换 ${data.files} 个文件，升级前代码已备份为 ${data.backup}`;
+    $('#btn-restart').disabled = false;
+    $('#upd-hint').textContent = '点「重启生效」自动拉起新进程';
+    input.value = '';
+    toast(`已${verb}到 v${data.to}`);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '上传并升级';
+  }
+}
+
 async function restartServer() {
   const btn = $('#btn-restart');
   btn.disabled = true;
@@ -881,6 +922,7 @@ async function saveSource() {
     const data = await api('/api/update/config', {
       repo: $('#upd-repo').value.trim(),
       index_url: $('#upd-index').value.trim(),
+      proxy: $('#upd-proxy').value.trim(),
     });
     toast('制品源已保存');
     $('#upd-hint').textContent = '仓库：' + (data.config.repo || '未设置');
@@ -1010,6 +1052,7 @@ function bind() {
   /* --- 升级 --- */
   $('#btn-check-update').addEventListener('click', checkUpdate);
   $('#btn-apply-update').addEventListener('click', applyUpdate);
+  $('#btn-apply-local').addEventListener('click', applyLocal);
   $('#btn-restart').addEventListener('click', restartServer);
   $('#btn-save-source').addEventListener('click', saveSource);
 

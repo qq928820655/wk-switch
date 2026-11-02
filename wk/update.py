@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "api": "https://api.github.com",
     "asset": r"^wk-switch-[0-9.]+zip$",
     "index_url": "",
+    "proxy": "",
     "timeout": 30,
     "allow_prerelease": False,
 }
@@ -80,6 +81,10 @@ def config() -> dict:
     data.update(_read_json(CONFIG_PATH))
     if not data.get("repo"):
         data["repo"] = _repo_from_git()
+    if not data.get("proxy"):
+        # 配置没写就吃环境变量，服务从带代理的 shell 起来时不用再配一遍
+        data["proxy"] = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                         or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "")
     return data
 
 
@@ -97,13 +102,27 @@ def save_config(patch: dict) -> dict:
     return data
 
 
-def _request(url: str, timeout: int = 30, accept: str = "application/vnd.github+json"):
+def _opener(cfg: dict | None = None):
+    """带代理的 opener。
+
+    代理优先级：config/update.json 的 proxy > 环境变量 HTTPS_PROXY/HTTP_PROXY。
+    国内直连 github.com 下载 release 包基本会超时，而 api.github.com 常常
+    能通——所以「检查更新成功、下载卡死」是常态，必须让代理可配。
+    """
+    proxy = str((cfg or {}).get("proxy") or "").strip()
+    if proxy:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    return urllib.request.build_opener()
+
+
+def _request(url: str, timeout: int = 30, accept: str = "application/vnd.github+json",
+             cfg: dict | None = None):
     req = urllib.request.Request(url, headers={
         "User-Agent": "wk-switch/" + version.version(),
         "Accept": accept,
     })
-    # 本机常挂代理：这里只走系统默认，不额外注入
-    return urllib.request.urlopen(req, timeout=timeout)
+    return _opener(cfg).open(req, timeout=timeout)
 
 
 def _github_latest(cfg: dict) -> dict:
@@ -112,7 +131,7 @@ def _github_latest(cfg: dict) -> dict:
         raise ValueError("还没有配置制品仓库（config/update.json 的 repo，或 .git 的 origin）")
     url = f"{cfg['api'].rstrip('/')}/repos/{repo}/releases"
     try:
-        with _request(url, int(cfg.get("timeout") or 30)) as resp:
+        with _request(url, int(cfg.get("timeout") or 30), cfg=cfg) as resp:
             releases = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise ValueError(f"制品库返回 {exc.code}（{repo} 可能还没有发布版本）") from exc
@@ -153,7 +172,7 @@ def _index_latest(cfg: dict) -> dict:
     if not url:
         raise ValueError("index_url 为空")
     try:
-        with _request(url, int(cfg.get("timeout") or 30), accept="application/json") as resp:
+        with _request(url, int(cfg.get("timeout") or 30), accept="application/json", cfg=cfg) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise ValueError(f"连不上制品索引：{exc.reason}") from exc
@@ -217,26 +236,49 @@ def _safe_members(zf: zipfile.ZipFile) -> list[tuple[str, str]]:
     return picked
 
 
-def apply(progress=None) -> dict:
-    """下载并覆盖代码。返回升级结果；调用方负责重启。"""
-    def say(text: str) -> None:
-        if progress:
-            progress(text)
+def _download(url: str, cfg: dict, attempts: int = 3, say=None) -> bytes:
+    """下载制品，失败重试。
 
-    info = check()
-    if not info["newer"]:
-        return {"ok": True, "upgraded": False, "current": version.version(),
-                "latest": info["latest"], "message": "已经是最新版本"}
+    release 资产挂在 github.com（会 302 到 objects.githubusercontent.com），
+    国内链路上这条域名比 api.github.com 更容易被掐断，单次失败很常见，
+    重试两轮基本能过；仍失败再让用户配代理或用本地包。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            with _request(url, 120, accept="*/*", cfg=cfg) as resp:
+                return resp.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = getattr(exc, "reason", exc)
+            if i + 1 < attempts:
+                wait = 2 * (i + 1)
+                if say:
+                    say(f"下载失败（{last}），{wait}s 后重试 {i + 2}/{attempts}")
+                time.sleep(wait)
+    raise ValueError(
+        f"下载失败：{last}。制品在 github.com 上，国内直连常被掐断；"
+        f"可在页面「下载代理」里填本地代理，或用下方「本地包升级」直接上传 zip"
+    )
 
-    rel = info["release"]
-    say(f"下载 {rel['asset'] or rel['url']}")
+
+def _cleanup_stale_tmp() -> None:
+    """清掉上次升级中途留下的 .wk-upgrade-* 目录。
+
+    临时目录现在放在 ROOT 下（同盘才能用 os.replace），进程若在替换
+    途中被杀，残留目录会一直躺在项目根目录里。
+    """
     try:
-        with _request(rel["url"], 120, accept="*/*") as resp:
-            blob = resp.read()
-    except urllib.error.URLError as exc:
-        raise ValueError(f"下载失败：{exc.reason}") from exc
+        for name in os.listdir(ROOT):
+            if name.startswith(".wk-upgrade-"):
+                shutil.rmtree(os.path.join(ROOT, name), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _install_zip(blob: bytes, target_version: str, say) -> dict:
+    """把 zip 里的白名单文件覆盖到当前目录。调用方负责重启。"""
     if not blob.startswith(b"PK"):
-        raise ValueError("下载到的不是 zip 包")
+        raise ValueError("不是 zip 包（文件头不对）")
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(blob))
@@ -248,7 +290,8 @@ def apply(progress=None) -> dict:
     # 先备份当前代码：升级失败要能原样退回去
     os.makedirs(BACKUP_DIR, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = os.path.join(BACKUP_DIR, f"code-{version.version()}-{stamp}.zip")
+    old_version = version.version()
+    backup = os.path.join(BACKUP_DIR, f"code-{old_version}-{stamp}.zip")
     with zipfile.ZipFile(backup, "w", compression=zipfile.ZIP_DEFLATED) as bz:
         for top in ("main.py", "server.py", "wk", "web", "deploy"):
             path = os.path.join(ROOT, top)
@@ -261,42 +304,103 @@ def apply(progress=None) -> dict:
                         bz.write(full, os.path.relpath(full, ROOT))
     say(f"已备份到 {os.path.basename(backup)}")
 
-    # 落盘：先解到临时目录再逐个替换，避免解压中途失败留下半个程序
-    tmpdir = tempfile.mkdtemp(prefix="wk-upgrade-")
+    # 落盘：先解到临时目录再逐个替换，避免解压中途失败留下半个程序。
+    # 临时目录必须放在 ROOT 下：跨盘符（C: → E:）时 os.replace 会报
+    # WinError 17「无法将文件移到不同的磁盘驱动器」，而 os.replace 是
+    # 唯一能保证「要么旧文件、要么新文件」的原子操作，不能放弃。
+    _cleanup_stale_tmp()
+    tmpdir = tempfile.mkdtemp(prefix=".wk-upgrade-", dir=ROOT)
     try:
-        for name, rel in members:
+        for arc, rel in members:
             target = os.path.join(tmpdir, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(target) or tmpdir, exist_ok=True)
-            with zf.open(name) as src, open(target, "wb") as dst:
+            with zf.open(arc) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
-        for name, rel in members:
+        for arc, rel in members:
             src = os.path.join(tmpdir, rel.replace("/", os.sep))
             dst = os.path.join(ROOT, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(dst) or ROOT, exist_ok=True)
             if os.path.exists(dst):
-                os.replace(src, dst)
+                try:
+                    os.replace(src, dst)
+                except OSError:
+                    # 极少数情况（目标被占用/权限）退回覆盖写，仍保证内容完整
+                    shutil.copyfile(src, dst)
+                    os.remove(src)
             else:
                 shutil.move(src, dst)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # 记录构建时间与版本号文件（页面读 BUILD 显示）
+    # 记录构建时间与版本号文件（页面读 BUILD / VERSION 显示）
     with open(os.path.join(ROOT, "BUILD"), "w", encoding="utf-8") as f:
         f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
     with open(os.path.join(ROOT, "VERSION"), "w", encoding="utf-8") as f:
-        f.write(rel["version"] + "\n")
+        f.write(target_version + "\n")
 
+    downgraded = version.parse_semver(target_version) < version.parse_semver(old_version)
     say("代码已替换，重启后生效")
     return {
         "ok": True,
         "upgraded": True,
-        "from": version.version(),
-        "to": rel["version"],
+        "downgraded": downgraded,
+        "from": old_version,
+        "to": target_version,
+        "files": len(members),
         "backup": os.path.basename(backup),
         "restart_required": True,
-        "message": f"已升级到 {rel['version']}，重启服务后生效",
+        "message": (f"已回滚到 {target_version}，重启服务后生效" if downgraded
+                    else f"已升级到 {target_version}，重启服务后生效"),
     }
+
+
+def apply(progress=None) -> dict:
+    """从制品库下载最新包并覆盖代码。调用方负责重启。"""
+    def say(text: str) -> None:
+        if progress:
+            progress(text)
+
+    info = check()
+    if not info["newer"]:
+        return {"ok": True, "upgraded": False, "current": version.version(),
+                "latest": info["latest"], "message": "已经是最新版本"}
+
+    rel = info["release"]
+    say(f"下载 {rel['asset'] or rel['url']}")
+    blob = _download(rel["url"], config(), say=say)
+    return _install_zip(blob, rel["version"], say)
+
+
+def apply_local(blob: bytes, filename: str = "", progress=None) -> dict:
+    """用上传的 zip 直接升级，不走网络。
+
+    版本号优先取包内 VERSION 文件，没有就看文件名里的 x.y.z，
+    都取不到就沿用当前版本——宁可版本号不动，也不要写个假版本进去。
+    包版本低于当前版本时按「回滚」处理并在结果里标出来。
+    """
+    def say(text: str) -> None:
+        if progress:
+            progress(text)
+
+    target = ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            for name in zf.namelist():
+                if name == "VERSION" or name.endswith("/VERSION"):
+                    target = zf.read(name).decode("utf-8", "replace").strip()
+                    break
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"升级包损坏：{exc}") from exc
+
+    if not target:
+        match = re.search(r"(\d+\.\d+\.\d+)", filename or "")
+        target = match.group(1) if match else version.version()
+
+    say(f"使用本地包 {filename or '(未命名)'}，目标版本 {target}")
+    result = _install_zip(blob, target, say)
+    result["source"] = "local:" + (filename or "")
+    return result
 
 
 def restart(port: int) -> dict:

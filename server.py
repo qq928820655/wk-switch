@@ -159,9 +159,11 @@ class Handler(BaseHTTPRequestHandler):
         if self._need_auth(path):
             return
         if path == "/api/version":
+            cfg = updater.config()
             self._json(200, {"ok": True, "version": version.info(),
-                             "update": {"repo": updater.config().get("repo") or "",
-                                        "index_url": updater.config().get("index_url") or ""}})
+                             "update": {"repo": cfg.get("repo") or "",
+                                        "index_url": cfg.get("index_url") or "",
+                                        "proxy": cfg.get("proxy") or ""}})
             return
         if path == "/api/update/check":
             self._update_check()
@@ -228,6 +230,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._store_restore(payload)
             elif path == "/api/update/apply":
                 self._update_apply()
+            elif path == "/api/update/local":
+                self._update_local(payload)
             elif path == "/api/update/restart":
                 self._update_restart()
             elif path == "/api/update/config":
@@ -604,12 +608,31 @@ class Handler(BaseHTTPRequestHandler):
         # 先把响应刷出去，再结束进程；否则浏览器只会看到连接被重置
         threading.Timer(0.6, lambda: os._exit(0)).start()
 
+    def _update_local(self, payload: dict) -> None:
+        """上传本地升级包。
+
+        国内到 github.com 的 release 下载常被掐断，让用户自己在浏览器里
+        下载 zip 再传回来是最省事的兜底路径——下载走浏览器自己的网络栈，
+        和本服务无关。
+        """
+        name = str(payload.get("name") or "").strip()
+        raw = payload.get("data") or ""
+        if not raw:
+            raise ValueError("没有收到文件内容")
+        try:
+            blob = base64.b64decode(raw, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("文件内容不是合法的 base64") from exc
+        if len(blob) > 64 * 1024 * 1024:
+            raise ValueError("包太大了（上限 64MB）")
+        self._json(200, updater.apply_local(blob, name))
+
     def _update_config(self, payload: dict) -> None:
-        patch = {k: payload[k] for k in ("repo", "index_url", "asset", "allow_prerelease")
+        patch = {k: payload[k] for k in ("repo", "index_url", "asset", "allow_prerelease", "proxy")
                  if k in payload}
         cfg = updater.save_config(patch)
         self._json(200, {"ok": True, "config": {k: cfg.get(k) for k in
-                                                ("repo", "index_url", "asset", "allow_prerelease")}})
+                                                ("repo", "index_url", "asset", "allow_prerelease", "proxy")}})
 
     # ---- 备份 / 还原 -----------------------------------------------
     def _store_backup(self) -> None:
