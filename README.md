@@ -43,11 +43,19 @@ python main.py --version    # 版本号
 
 ```bash
 # 菜单式（自动判断新装 / 更新）
-curl -fsSL https://raw.githubusercontent.com/<owner>/wk-switch/main/deploy/linux/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/qq928820655/wk-switch/main/deploy/linux/install.sh | sudo bash
 
 # 全自动
-curl -fsSL .../install.sh | sudo bash -s -- --yes --token 你的口令 --port 8765
+curl -fsSL https://raw.githubusercontent.com/qq928820655/wk-switch/main/deploy/linux/install.sh \
+  | sudo bash -s -- --yes --token 你的口令 --port 8765
+
+# 网络受限：走代理或 GitHub 镜像
+curl -fsSL .../install.sh | sudo bash -s -- --proxy http://127.0.0.1:7890
+curl -fsSL .../install.sh | sudo bash -s -- --mirror https://ghfast.top
 ```
+
+脚本自己认仓库：`--repo` > `WK_REPO` > 打包时写入的占位 > raw 地址解析 > 内置默认，
+所以直接 `curl` 仓库里的原始脚本也能跑，不会拼出 `repos/__REPO__/releases/latest`。
 
 装完是 systemd 服务：`systemctl status wk-switch` / `journalctl -u wk-switch -f`。
 默认目录 `/opt/wk-switch`，`data/` 与 `config/` 在更新时不会被覆盖。
@@ -68,7 +76,7 @@ uninstall.bat    :: 卸载（保留 data 与 config）
 ```
 
 端口与口令可用环境变量覆盖：`WK_PORT` / `WK_TOKEN` / `WK_HOME_OVERRIDE`；
-离线安装包路径写 `WK_PACKAGE`。
+离线安装包路径写 `WK_PACKAGE`；换仓库写 `WK_REPO=owner/name`。
 
 ## 升级
 
