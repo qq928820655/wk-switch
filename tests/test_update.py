@@ -93,6 +93,15 @@ class SafeMembersTests(unittest.TestCase):
         rels = [rel for _arc, rel in update._safe_members(zf)]
         self.assertEqual(rels, ["server.py"])
 
+    def test_deploy_is_never_replaced(self):
+        """安装器不参与在线升级：用户可能改过端口/路径，覆盖会冲掉部署配置。"""
+        zf = self._zip({"server.py": "x",
+                        "deploy/linux/install.sh": "#!/bin/sh",
+                        "deploy/windows/install.bat": "@echo off"})
+        rels = [rel for _arc, rel in update._safe_members(zf)]
+        self.assertEqual(rels, ["server.py"])
+        self.assertNotIn("deploy", update.REPLACEABLE)
+
     def test_rejects_path_traversal(self):
         zf = self._zip({"server.py": "x", "../../evil.py": "bad", "/abs.py": "bad"})
         rels = [rel for _arc, rel in update._safe_members(zf)]

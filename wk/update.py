@@ -31,8 +31,11 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "update.json")
 BACKUP_DIR = os.path.join(ROOT, "backups")
 
 #: 允许被升级覆盖的顶层条目。没列进来的一律不动（data/ config/ .git/）。
+#: deploy/ 故意不在里面：那是安装器，装完之后用户可能改过端口、路径、
+#: 服务名，被升级覆盖会直接把人家的部署配置冲掉；要换安装器就重跑一次
+#: 部署脚本。docs/ 同理，属于说明文档，和运行无关。
 REPLACEABLE = (
-    "main.py", "server.py", "wk", "web", "deploy", "docs",
+    "main.py", "server.py", "wk", "web",
     "README.md", "requirements.txt", "VERSION", "BUILD", "LICENSE",
     "start.sh", "stop.sh", "start.bat", "stop.bat",
 )
