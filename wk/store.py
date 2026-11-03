@@ -482,7 +482,7 @@ def backup_bytes() -> tuple[bytes, str]:
     import zipfile
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    name = f"wk-accounts-backup-{stamp}.zip"
+    name = f"wk-switch-backup-{stamp}.zip"
 
     records = dump_records()
     accounts = [r for r in records if not r.get("__import_log__")]

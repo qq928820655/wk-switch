@@ -22,6 +22,7 @@ FALLBACK_REPO="qq928820655/wk-switch"
 HOME_DIR="${WK_HOME:-/opt/wk-switch}"
 SERVICE="/etc/systemd/system/${APP}.service"
 PORT="${WK_PORT:-8765}"
+HOST="${WK_HOST:-127.0.0.1}"
 TOKEN="${WK_TOKEN:-qq928820655}"
 PROXY="${WK_PROXY:-}"
 MIRROR="${WK_MIRROR:-}"
@@ -41,6 +42,7 @@ while [ $# -gt 0 ]; do
     --yes|-y)     ASSUME_YES=1 ;;
     --token)      TOKEN="${2:-}"; shift ;;
     --port)       PORT="${2:-}"; shift ;;
+    --host)       HOST="${2:-}"; shift ;;
     --home)       HOME_DIR="${2:-}"; shift ;;
     --repo)       REPO="${2:-}"; shift ;;
     --proxy)      PROXY="${2:-}"; shift ;;
@@ -187,7 +189,102 @@ JSON
   fi
 }
 
+# ---------- 服务进程 ----------
+# 有 systemd 就走 unit，没有（容器、WSL1、Alpine 非系统 init）就走 nohup。
+# 两种方式都生成 start.sh / stop.sh，systemd 模式下也留着当应急手柄。
+has_systemd() {
+  [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+write_start_script() {
+  local py
+  py="$(command -v python3)"
+  cat > "$HOME_DIR/start.sh" <<SH
+#!/usr/bin/env bash
+# 由 install.sh 生成。用法：./start.sh [端口]
+set -e
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+PORT="\${1:-${PORT}}"
+HOST="\${WK_HOST:-${HOST}}"
+PIDF="\$DIR/wk.pid"
+LOGF="\$DIR/logs/wk-switch.log"
+mkdir -p "\$DIR/logs"
+
+# 已在跑就别再起一个，避免端口冲突
+if [ -f "\$PIDF" ]; then
+  OLD="\$(cat "\$PIDF")"
+  if kill -0 "\$OLD" 2>/dev/null; then
+    echo "已在运行 PID \$OLD"
+    exit 0
+  fi
+  rm -f "\$PIDF"
+fi
+
+cd "\$DIR"
+nohup ${py} main.py "\$PORT" --host "\$HOST" --no-browser >> "\$LOGF" 2>&1 &
+echo \$! > "\$PIDF"
+sleep 1.5
+PID="\$(cat "\$PIDF")"
+if kill -0 "\$PID" 2>/dev/null; then
+  echo "已启动 PID \$PID  监听 \$HOST:\$PORT"
+  echo "日志 \$LOGF"
+else
+  echo "启动失败，最近日志："
+  tail -20 "\$LOGF" 2>/dev/null || true
+  rm -f "\$PIDF"
+  exit 1
+fi
+SH
+  chmod +x "$HOME_DIR/start.sh"
+}
+
+write_stop_script() {
+  cat > "$HOME_DIR/stop.sh" <<SH
+#!/usr/bin/env bash
+# 由 install.sh 生成。用法：./stop.sh [端口]
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+PORT="\${1:-${PORT}}"
+PIDF="\$DIR/wk.pid"
+have() { command -v "\$1" >/dev/null 2>&1; }
+stopped=0
+
+if [ -f "\$PIDF" ]; then
+  PID="\$(cat "\$PIDF")"
+  if kill -0 "\$PID" 2>/dev/null; then
+    kill "\$PID" 2>/dev/null && echo "已发停止信号 PID \$PID"
+    # 优雅退出给 3 秒，没退就强杀，别让僵尸占着端口
+    for _ in 1 2 3 4 5 6; do
+      kill -0 "\$PID" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -0 "\$PID" 2>/dev/null && kill -9 "\$PID" 2>/dev/null && echo "强制结束 PID \$PID"
+    stopped=1
+  fi
+  rm -f "\$PIDF"
+fi
+
+# 兜底：pid 文件丢了或进程换过，按端口找
+if have ss; then
+  PID2="\$(ss -ltnp 2>/dev/null | grep ":\${PORT} " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+  [ -n "\$PID2" ] && [ "\$PID2" != "\$PID" ] && kill "\$PID2" 2>/dev/null && { echo "已停止端口 \$PORT 上的 PID \$PID2"; stopped=1; }
+fi
+
+[ "\$stopped" = "1" ] || echo "没有在运行"
+SH
+  chmod +x "$HOME_DIR/stop.sh"
+}
+
 install_service() {
+  write_start_script
+  write_stop_script
+  if has_systemd; then
+    install_systemd
+  else
+    install_nohup
+  fi
+}
+
+install_systemd() {
   local py
   py="$(command -v python3)"
   cat > "$SERVICE" <<UNIT
@@ -199,11 +296,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${HOME_DIR}
-ExecStart=${py} ${HOME_DIR}/main.py ${PORT} --no-browser
+ExecStart=${py} ${HOME_DIR}/main.py ${PORT} --host ${HOST} --no-browser
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
-# 只监听本机；要对外暴露请在前面加 nginx 并配 TLS
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
@@ -215,6 +311,15 @@ UNIT
   systemctl enable "$APP" >/dev/null 2>&1
   systemctl restart "$APP"
   ok "systemd 服务已安装并启动：${SERVICE}"
+}
+
+install_nohup() {
+  # 旧实例（可能是旧 pid 或旧 systemd 残留）先停掉，避免新进程绑不上端口
+  bash "$HOME_DIR/stop.sh" >/dev/null 2>&1 || true
+  # 这台机器可能连 systemctl 都没有，先判一下，别往 stderr 甩 command not found
+  if have systemctl; then systemctl stop "$APP" >/dev/null 2>&1 || true; fi
+  bash "$HOME_DIR/start.sh"
+  ok "已用 nohup 启动（start.sh / stop.sh 在 ${HOME_DIR}）"
 }
 
 unpack() { # $1=zip
@@ -243,7 +348,7 @@ do_install() {
   apply_proxy
   info ""
   info "安装目录：$HOME_DIR"
-  info "监听端口：$PORT（仅 127.0.0.1）"
+  info "监听：${HOST}:${PORT}"
   info ""
 
   local zip url root old
@@ -286,10 +391,15 @@ do_install() {
   ver="$(current_version)"
   info ""
   ok "安装完成，版本 v${ver}"
-  info "  地址：http://127.0.0.1:${PORT}"
+  info "  地址：http://127.0.0.1:${PORT}（对外用 ${HOST}）"
   info "  口令：${TOKEN}（改 ${HOME_DIR}/config/auth.json）"
-  info "  状态：systemctl status ${APP}"
-  info "  日志：journalctl -u ${APP} -f"
+  if has_systemd; then
+    info "  状态：systemctl status ${APP}"
+    info "  日志：journalctl -u ${APP} -f"
+  else
+    info "  启停：${HOME_DIR}/start.sh ${PORT}  /  ${HOME_DIR}/stop.sh"
+    info "  日志：${HOME_DIR}/logs/wk-switch.log"
+  fi
   [ -n "$old" ] && [ "$old" != "未知" ] && info "  升级：v${old} → v${ver}"
 }
 
@@ -309,11 +419,14 @@ do_uninstall() {
     read -r ans < "${TTY:-/dev/stdin}" || ans="n"
     case "$ans" in y|Y|yes|YES) : ;; *) info "已取消"; return ;; esac
   fi
+  # 先停进程：nohup 模式走 stop.sh，systemd 模式走 systemctl
+  bash "$HOME_DIR/stop.sh" >/dev/null 2>&1 || true
   systemctl stop "$APP" >/dev/null 2>&1 || true
   systemctl disable "$APP" >/dev/null 2>&1 || true
   rm -f "$SERVICE"
-  systemctl daemon-reload
-  rm -rf "$HOME_DIR/wk" "$HOME_DIR/web" "$HOME_DIR/main.py" "$HOME_DIR/server.py"
+  systemctl daemon-reload 2>/dev/null || true
+  rm -rf "$HOME_DIR/wk" "$HOME_DIR/web" "$HOME_DIR/main.py" "$HOME_DIR/server.py" \
+         "$HOME_DIR/start.sh" "$HOME_DIR/stop.sh" "$HOME_DIR/wk.pid" "$HOME_DIR/logs"
   ok "服务已卸载；数据保留在 ${HOME_DIR}/data，配置保留在 ${HOME_DIR}/config"
 }
 
@@ -321,11 +434,21 @@ do_status() {
   info "安装目录：$HOME_DIR"
   info "当前版本：$(current_version)"
   info "更新源：${REPO}"
-  if have systemctl; then
-    systemctl is-active "$APP" >/dev/null 2>&1 && ok "服务运行中" || warn "服务未运行"
+  if has_systemd && systemctl is-active "$APP" >/dev/null 2>&1; then
+    ok "服务运行中（systemd）"
+  elif [ -f "$HOME_DIR/wk.pid" ]; then
+    local pid
+    pid="$(cat "$HOME_DIR/wk.pid" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      ok "服务运行中（PID $pid）"
+    else
+      warn "pid 文件存在但进程已退出，请重启"
+    fi
+  else
+    warn "服务未运行"
   fi
   if have ss; then
-    ss -ltnp 2>/dev/null | grep -E ":${PORT}\b" || warn "端口 ${PORT} 没有监听"
+    ss -ltn 2>/dev/null | grep -E ":${PORT}\b" || warn "端口 ${PORT} 没有监听"
   fi
   [ -f "$HOME_DIR/config/auth.json" ] && info "口令文件：$HOME_DIR/config/auth.json"
   return 0
@@ -344,7 +467,7 @@ menu() {
     info "=============================="
     info "  wk-switch 部署菜单"
     info "  已安装：$(installed && echo "是（v$(current_version)）" || echo "否")"
-    info "  目录：$HOME_DIR   端口：$PORT"
+    info "  目录：$HOME_DIR   端口：$PORT   监听：${HOST}"
     info "  更新源：$REPO"
     info "=============================="
     info "  1) 安装 / 更新（自动判断）"
@@ -357,7 +480,9 @@ menu() {
     case "$choice" in
       1) do_update; return ;;
       2) do_status ;;
-      3) need_root; systemctl restart "$APP" && ok "已重启" ;;
+      3) need_root
+         if has_systemd; then systemctl restart "$APP" && ok "已重启"
+         else bash "$HOME_DIR/stop.sh"; bash "$HOME_DIR/start.sh"; fi ;;
       4) do_uninstall; return ;;
       0|"") return ;;
       *) warn "无效选项" ;;

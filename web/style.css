@@ -879,6 +879,8 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   vertical-align: 2px;
   animation: pulse 1.6s ease-in-out infinite;
 }
+/* 作者样式的 display 会盖掉 [hidden] 的 UA 默认值，必须显式关掉 */
+.tab-dot[hidden] { display: none; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
 .ver-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }

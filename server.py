@@ -472,13 +472,15 @@ class Handler(BaseHTTPRequestHandler):
         """
         if realm_mode == "split":
             outputs = []
+            # 同一批导出共用时间戳，两份文件不会跨秒、排序时挨在一起
+            stamp = time.strftime("%Y%m%d-%H%M%S")
             for realm in ("cn", "intl"):
                 subset = [a for a in accounts if (a.realm or "").lower() == realm]
                 if not subset:
                     continue
-                for out in formats.render(subset, profile_id, {"realm_filter": realm}):
-                    out.name = _suffix_name(out.name, realm)
-                    outputs.append(out)
+                # 文件名里的版本段由 formats.export_filename 负责，这里不再叠后缀
+                outputs.extend(formats.render(
+                    subset, profile_id, {"realm_filter": realm, "stamp": stamp}))
             if not outputs:
                 raise ValueError("账号里没有可识别的版本，无法分版本导出")
             return outputs
@@ -667,14 +669,6 @@ class Handler(BaseHTTPRequestHandler):
 
         result = store.restore_bytes(raw, filename=name, mode=mode)
         self._json(200, {"ok": True, **result, "stats": store.stats()})
-
-
-def _suffix_name(name: str, suffix: str) -> str:
-    """给文件名加版本后缀：accounts.zip → accounts-cn.zip。"""
-    head, dot, ext = name.rpartition(".")
-    if dot and head:
-        return f"{head}-{suffix}.{ext}"
-    return f"{name}-{suffix}"
 
 
 def _guess_type(path: Path) -> str:

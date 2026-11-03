@@ -446,6 +446,27 @@ def _safe_name(value: str, fallback: str) -> str:
     return text or fallback
 
 
+_EXT_OF = {"json": "json", "zip": "zip", "text": "txt"}
+
+
+def export_filename(profile: Profile, realm_filter: str = "",
+                    stamp: str | None = None) -> str:
+    """导出文件名：<项目>-<版本>-<时间戳>.<ext>。
+
+    各目标项目的默认名都是 accounts.json / accounts.zip 这一类，下载到同一个
+    目录里完全分不清是哪次、哪个项目的导出。统一带上项目名和时间戳；realm
+    只在显式过滤时插入，这样国内版和国际版的包不会互相覆盖。
+    """
+    ext = _EXT_OF.get(profile.container, "dat")
+    stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
+    parts = [_safe_name(profile.project, profile.id)]
+    realm = (realm_filter or "").strip().lower()
+    if realm in ("cn", "intl"):
+        parts.append(realm)
+    parts.append(stamp)
+    return "-".join(parts) + "." + ext
+
+
 def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
@@ -488,6 +509,9 @@ def render(accounts: list[Account], profile_id: str, opts: dict | None = None) -
     if not accounts:
         raise ValueError("没有可导出的账号")
 
+    # 一次导出内所有文件共用一个时间戳，避免同批文件跨秒
+    out_name = export_filename(profile, realm_filter, opts.get("stamp"))
+
     if profile_id == "hub_document":
         doc = {
             "format": "workbuddy-accounts",
@@ -496,14 +520,14 @@ def render(accounts: list[Account], profile_id: str, opts: dict | None = None) -
             "count": len(accounts),
             "accounts": [to_hub_flat(a) for a in accounts],
         }
-        return [OutputFile(profile.filename_hint, _json_bytes(doc))]
+        return [OutputFile(out_name, _json_bytes(doc))]
 
     if profile_id == "hub_dir_zip":
         items = []
         for index, acc in enumerate(accounts, 1):
             name = _safe_name(acc.uid, f"account-{index}") + ".json"
             items.append((name, _json_bytes(to_hub_flat(acc))))
-        return [OutputFile(profile.filename_hint, _zip_bytes(items))]
+        return [OutputFile(out_name, _zip_bytes(items))]
 
     if profile_id in ("manager_zip", "panel_zip"):
         items = []
@@ -511,10 +535,10 @@ def render(accounts: list[Account], profile_id: str, opts: dict | None = None) -
             # 目标项目按 workbuddy-<uid>.json 扫目录，前缀不能省
             name = "workbuddy-" + _safe_name(acc.uid, f"account-{index}") + ".json"
             items.append((name, _json_bytes(to_nested(acc))))
-        return [OutputFile(profile.filename_hint, _zip_bytes(items))]
+        return [OutputFile(out_name, _zip_bytes(items))]
 
     if profile_id == "switch_json":
-        return [OutputFile(profile.filename_hint, _json_bytes([to_switch_flat(a) for a in accounts]))]
+        return [OutputFile(out_name, _json_bytes([to_switch_flat(a) for a in accounts]))]
 
     if profile_id == "qoder_json":
         payload = []
@@ -523,10 +547,10 @@ def render(accounts: list[Account], profile_id: str, opts: dict | None = None) -
             # 这个项目用 id 做主键，缺了会当成新记录追加
             row["id"] = row.get("id") or acc.uid
             payload.append(row)
-        return [OutputFile(profile.filename_hint, _json_bytes(payload))]
+        return [OutputFile(out_name, _json_bytes(payload))]
 
     if profile_id == "daily_json":
-        return [OutputFile(profile.filename_hint, _json_bytes([to_daily(a) for a in accounts]))]
+        return [OutputFile(out_name, _json_bytes([to_daily(a) for a in accounts]))]
 
     if profile_id == "daily_env":
         lines = []
@@ -539,7 +563,7 @@ def render(accounts: list[Account], profile_id: str, opts: dict | None = None) -
             else:
                 lines.append(acc.access_token)
         text = "\n".join(lines) + "\n"
-        return [OutputFile(profile.filename_hint, text.encode("utf-8"))]
+        return [OutputFile(out_name, text.encode("utf-8"))]
 
     raise ValueError(f"目标格式 {profile_id} 未实现渲染")
 

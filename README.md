@@ -11,7 +11,8 @@
 - **本地账户库**：SQLite 留存，唯一键 `(uid, realm)`；同名不同号不会被合并
 - **国内版 / 国际版分离**：按 JWT issuer 与域名判定，导出可「全部 / 仅国内 / 仅国际 / 分版本各一份」
 - **备份还原**：整库打包 zip（`accounts.db` + `accounts.json`），支持合并与覆盖两种还原
-- **一键升级**：页面「升级」标签页检查制品库最新版，下载、备份、替换代码、重启
+- **一键升级**：页面「升级」标签页检查制品库最新版，下载、备份、替换代码、重启；仅当制品库版本更高时标签页才标红点
+- **导出命名可辨**：文件名统一为 `<项目名>-<版本>-<时间戳>.<扩展名>`，例如 `workbuddy-manager-cn-20261103-125433.zip`，下载一堆包不会互相覆盖
 - **访问口令**：登录页口令换会话 cookie，默认 `qq928820655`（改 `config/auth.json`）
 
 ## 快速开始
@@ -26,16 +27,21 @@ python main.py --version    # 版本号
 
 ## 支持的格式
 
-| 目标格式 | 落盘形态 | 文件名 |
+导出文件名统一带项目名与时间戳，分版本时再插版本段：
+
+| 目标格式 | 落盘形态 | 文件名示例 |
 |---|---|---|
-| Hub 导出文档 | `{format,version,count,accounts[]}` 扁平 camelCase | `workbuddy-accounts.json` |
-| Hub 账户目录 | 每账户一个文件 | `<uid>.json` |
-| Manager 账号包 | 嵌套 `{account,auth,device_token}` | `accounts.zip` |
-| Panel 凭据目录 | 同嵌套形 | `<uid>.json` |
-| Switch 账号库 | 扁平 snake_case 数组 | `accounts.json` |
-| Qoder 账号库 | 扁平 snake_case 数组 | `accounts.json` |
-| Daily 登录结果 | `{phone,access_token,refresh_token,env_line,login_at}` | `wb_login_result.json` |
-| Daily 环境变量行 | `手机号:AT:RT` | `wb_env.txt` |
+| Hub 导出文档 | `{format,version,count,accounts[]}` 扁平 camelCase | `workbuddy2api-hub-20261103-125433.json` |
+| Hub 账户目录 | 每账户一个文件，打成 zip | `workbuddy2api-hub-20261103-125433.zip` |
+| Manager 账号包 | 嵌套 `{account,auth,device_token}` | `workbuddy-manager-20261103-125433.zip` |
+| Panel 凭据目录 | 同嵌套形 | `workbuddy2api-panel-20261103-125433.zip` |
+| Switch 账号库 | 扁平 snake_case 数组 | `workbuddy-switch-20261103-125433.json` |
+| Qoder 账号库 | 扁平 snake_case 数组 | `qoder-trae-workbuddy-switch-20261103-125433.json` |
+| Daily 登录结果 | `{phone,access_token,refresh_token,env_line,login_at}` | `WorkBuddy-Daily-20261103-125433.json` |
+| Daily 环境变量行 | `手机号:AT:RT` | `WorkBuddy-Daily-20261103-125433.txt` |
+
+分版本导出时文件名插版本段：`workbuddy-manager-cn-20261103-125433.zip`、`workbuddy-manager-intl-20261103-125433.zip`。
+本地库备份为 `wk-switch-backup-20261103-125433.zip`。
 
 ## 部署
 
@@ -57,8 +63,18 @@ curl -fsSL .../install.sh | sudo bash -s -- --mirror https://ghfast.top
 脚本自己认仓库：`--repo` > `WK_REPO` > 打包时写入的占位 > raw 地址解析 > 内置默认，
 所以直接 `curl` 仓库里的原始脚本也能跑，不会拼出 `repos/__REPO__/releases/latest`。
 
-装完是 systemd 服务：`systemctl status wk-switch` / `journalctl -u wk-switch -f`。
-默认目录 `/opt/wk-switch`，`data/` 与 `config/` 在更新时不会被覆盖。
+装完自动选运行方式，不用手工判断：
+
+- 有 systemd（`/run/systemd/system` 存在且 `systemctl` 可用）→ 装 unit，`systemctl status wk-switch` / `journalctl -u wk-switch -f`
+- 没有 systemd（容器、WSL1、Alpine 非系统 init）→ 生成 `start.sh` / `stop.sh` 用 nohup 起，日志在 `logs/wk-switch.log`
+
+两种方式都会在安装目录留 `start.sh` / `stop.sh` 当应急手柄。默认目录 `/opt/wk-switch`，`data/` 与 `config/` 在更新时不会被覆盖。
+
+默认只监听 `127.0.0.1`。要对外提供访问（反代后面或直连）加 `--host 0.0.0.0`：
+
+```bash
+curl -fsSL .../install.sh | sudo bash -s -- --host 0.0.0.0 --port 8765
+```
 
 ### Windows
 

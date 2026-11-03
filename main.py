@@ -1,9 +1,10 @@
 """启动器：起本地服务并打开浏览器。
 
 用法：
-    python main.py                      # 默认 8765 端口
+    python main.py                      # 默认 8765 端口，只绑 127.0.0.1
     python main.py 9000                 # 指定端口
     python main.py --no-browser         # 只起服务（部署脚本用这个）
+    python main.py --host 0.0.0.0       # 对外监听（容器 / 反代场景）
     python main.py 8765 --wait-port 25  # 升级重启：等端口释放最多 25 秒
 
 端口被占用时会自动往后找（最多 20 个），不会因为上次没关干净就起不来。
@@ -12,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sys
 import threading
@@ -66,18 +68,23 @@ def find_port(start: int, host: str = "127.0.0.1", tries: int = 20,
 def main() -> int:
     parser = argparse.ArgumentParser(prog="wk-switch", add_help=True)
     parser.add_argument("port", nargs="?", type=int, default=8765, help="监听端口，默认 8765")
+    parser.add_argument("--host", default=os.environ.get("WK_HOST") or "127.0.0.1",
+                        help="监听地址，默认 127.0.0.1；对外暴露用 0.0.0.0")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--wait-port", type=float, default=0,
                         help="等端口释放的秒数（升级重启用）")
     parser.add_argument("--version", action="version", version=f"wk-switch {version.version()}")
     args = parser.parse_args()
 
-    port = find_port(args.port, wait=args.wait_port)
-    httpd = server.serve(port=port)
-    url = f"http://127.0.0.1:{port}"
+    host = args.host
+    port = find_port(args.port, host=host, wait=args.wait_port)
+    httpd = server.serve(host=host, port=port)
+    # 绑 0.0.0.0 时本机访问仍用回环地址，别把 0.0.0.0 塞进浏览器
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::', '') else host}:{port}"
 
     print("=" * 58)
     print(f"  wk-switch v{version.version()} · 跨项目账户导入导出转换")
+    print(f"  监听：{host}:{port}")
     print(f"  地址：{url}")
     print("  停止：Ctrl+C")
     print("=" * 58)
