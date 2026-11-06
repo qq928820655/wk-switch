@@ -879,6 +879,8 @@ async function storeExport() {
 /* ---------- 版本与升级 ---------- */
 
 const updateState = { version: null, latest: null, canApply: false, checking: false };
+/* 进度区的计时起点。重启要等几十秒，只写「正在重启」用户会以为卡死了。 */
+const progressState = { started: 0 };
 
 async function loadVersion() {
   const data = await apiGet('/api/version');
@@ -913,7 +915,8 @@ function renderUpdate(info) {
     $('#upd-line').textContent = '检查失败：' + ((info && info.error) || '未知原因');
     $('#upd-notes').textContent = '';
     $('#btn-apply-update').disabled = true;
-    $('#btn-restart').disabled = true;
+    // 「只重启」不依赖检查结果，检查失败也得能点——它本身就是排障手段
+    $('#btn-restart').disabled = false;
     if (dot) dot.hidden = true;
     return;
   }
@@ -923,11 +926,13 @@ function renderUpdate(info) {
     $('#upd-line').innerHTML = `发现新版本 <b>v${esc(info.latest)}</b>　当前 v${esc(info.current)}`;
     $('#upd-hint').textContent = rel.asset ? '包：' + rel.asset : '';
     $('#btn-apply-update').disabled = false;
+    $('#btn-restart').disabled = false;
     if (dot) dot.hidden = false;
   } else {
     $('#upd-line').innerHTML = `已是最新版本 <b>v${esc(info.current)}</b>`;
     $('#upd-hint').textContent = rel.asset ? '制品库最新：v' + esc(info.latest) : '';
     $('#btn-apply-update').disabled = true;
+    $('#btn-restart').disabled = false;
     if (dot) dot.hidden = true;
   }
   $('#upd-notes').textContent = rel.notes ? rel.notes.slice(0, 600) : '';
@@ -951,27 +956,34 @@ async function checkUpdate() {
   }
 }
 
+/* 一键升级：一个请求里做完「下载 → 替换 → 交棒重启」，
+   然后等新进程应答、自动刷新。不再有「升级完还要再点一次重启」这一步。 */
 async function applyUpdate() {
   const btn = $('#btn-apply-update');
   btn.disabled = true;
   btn.textContent = '升级中…';
+  showProgress('正在下载并替换代码…', '别关页面，完成后会自动重启');
   try {
-    const data = await api('/api/update/apply', {});
+    const data = await api('/api/update/upgrade', {});
     if (!data.upgraded) {
       $('#upd-line').textContent = data.message || '已经是最新版本';
       toast(data.message || '已是最新');
+      hideProgress();
       return;
     }
-    $('#upd-line').innerHTML = `已升级 <b>v${esc(data.to)}</b>，重启后生效`;
-    $('#upd-notes').textContent = '升级前代码已备份为 ' + data.backup;
-    $('#btn-restart').disabled = false;
-    $('#upd-hint').textContent = '点「重启生效」自动拉起新进程';
-    toast('已升级到 v' + data.to);
+    $('#upd-line').innerHTML = `已升级到 <b>v${esc(data.to)}</b>`;
+    $('#upd-notes').textContent = `替换 ${data.files} 个文件，升级前代码已备份为 ${data.backup}`;
+    if (!data.restarting) {
+      failProgress('重启没交棒出去', (data.restart && data.restart.error) || '');
+      return;
+    }
+    await waitForRestart(data.to, data.old_pid);
   } catch (err) {
+    failProgress('升级失败', err.message);
     toast(err.message, true);
   } finally {
     btn.disabled = false;
-    btn.textContent = '一键升级';
+    btn.textContent = '一键升级并重启';
   }
 }
 
@@ -989,6 +1001,7 @@ async function applyLocal() {
   const btn = $('#btn-apply-local');
   btn.disabled = true;
   btn.textContent = '上传中…';
+  showProgress('正在上传本地包…', file.name);
   try {
     const b64 = await new Promise((resolve, reject) => {
       const fr = new FileReader();
@@ -1001,13 +1014,16 @@ async function applyLocal() {
     });
     const data = await api('/api/update/local', { name: file.name, data: b64 });
     const verb = data.downgraded ? '回滚' : '升级';
-    $('#upd-line').innerHTML = `已用本地包${verb}到 <b>v${esc(data.to)}</b>，重启后生效`;
+    $('#upd-line').innerHTML = `已用本地包${verb}到 <b>v${esc(data.to)}</b>`;
     $('#upd-notes').textContent = `替换 ${data.files} 个文件，升级前代码已备份为 ${data.backup}`;
-    $('#btn-restart').disabled = false;
-    $('#upd-hint').textContent = '点「重启生效」自动拉起新进程';
     input.value = '';
-    toast(`已${verb}到 v${data.to}`);
+    if (!data.restarting) {
+      failProgress('重启没交棒出去', (data.restart && data.restart.error) || '');
+      return;
+    }
+    await waitForRestart(data.to, data.old_pid);
   } catch (err) {
+    failProgress('本地包升级失败', err.message);
     toast(err.message, true);
   } finally {
     btn.disabled = false;
@@ -1015,29 +1031,175 @@ async function applyLocal() {
   }
 }
 
+/* 只重启，不升级。升级流程已经自带重启，这个按钮留着当兜底。 */
 async function restartServer() {
   const btn = $('#btn-restart');
   btn.disabled = true;
   btn.textContent = '重启中…';
+  showProgress('正在重启服务…', '');
+  let oldPid = 0;
   try {
-    await api('/api/update/restart', {});
+    const data = await api('/api/update/restart', {});
+    oldPid = data.old_pid || 0;
+    if (!data.ok) {
+      failProgress('重启没交棒出去', data.error || data.message || '');
+      return;
+    }
   } catch (err) {
-    /* 进程正在退出，请求断掉是正常的 */
+    /* 进程正在退出，请求断掉是正常的；oldPid 拿不到就退化成只判版本 */
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '只重启服务';
   }
-  // 轮询直到新进程接上，再刷新页面
-  for (let i = 0; i < 40; i += 1) {
-    await new Promise((r) => setTimeout(r, 500));
-    try {
-      const resp = await fetch('/api/version', { cache: 'no-store' });
-      if (resp.ok) {
-        location.reload();
-        return;
+  await waitForRestart('', oldPid);
+}
+
+async function rollbackServer() {
+  const btn = $('#btn-rollback');
+  btn.disabled = true;
+  showProgress('正在回滚到上一版…', '回滚同样会重启');
+  try {
+    const data = await api('/api/update/rollback', {});
+    $('#upd-line').innerHTML = `已回滚到 <b>v${esc(data.to)}</b>`;
+    $('#upd-notes').textContent = `来源 ${data.source || '备份'}；升级前代码已备份为 ${data.backup}`;
+    await waitForRestart(data.to, data.old_pid);
+  } catch (err) {
+    failProgress('回滚失败', err.message);
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* 等新进程应答。
+ *
+ * 四个判据缺一不可：
+ * 1. /api/ping 免鉴权 —— 会话在重启后可能还没补齐，用带鉴权的接口会一直 401；
+ * 2. 版本号要对 —— 端口通了但版本还是旧的，说明起来的是别的进程；
+ * 3. pid 必须换人 —— 旧进程在响应发出后还要活 0.5 秒，这期间 ping 是通的。
+ *    只判「通了」会把旧进程当成新进程，页面立刻刷新，正好撞上它退出，
+ *    浏览器看到的就是连接被重置——「重启出错」的观感有一半来自这里；
+ * 4. 容忍连接失败 —— 重启中间那几秒服务是断的，报错是正常的，不能当失败。
+ *
+ * 总预算 120 秒，比后端「等端口 45s + 探活 60s」略短：真失败的话后端会先
+ * 回滚，页面上看到的是「回滚后仍不可用」而不是干等。
+ */
+async function waitForRestart(targetVersion, oldPid) {
+  const total = 120;
+  let lastState = null;
+  for (let i = 0; i < total; i += 1) {
+    await new Promise((r) => setTimeout(r, 1000));
+    updateProgressElapsed(i + 1);
+    if (i % 3 === 0) {
+      const st = await fetchUpdateStatus();
+      if (st) {
+        lastState = st;
+        renderSteps(st);
+        if (st.state === 'failed') {
+          failProgress('重启失败', st.error || '');
+          return;
+        }
       }
+    }
+    try {
+      const resp = await fetch('/api/ping', { cache: 'no-store' });
+      if (!resp.ok) continue;
+      const info = await resp.json();
+      if (!info || !info.ok) continue;
+      if (oldPid && Number(info.pid) === Number(oldPid)) {
+        continue;   // 还是老进程，它还没退
+      }
+      if (targetVersion && String(info.version) !== String(targetVersion)) {
+        continue;   // 还没换过来，继续等
+      }
+      finishProgress(`已重启到 v${info.version}`, '正在刷新页面…');
+      await new Promise((r) => setTimeout(r, 800));
+      location.reload();
+      return;
     } catch (err) { /* 还没起来 */ }
   }
-  btn.disabled = false;
-  btn.textContent = '重启生效';
-  toast('服务没有在 20 秒内回来，请查看控制台输出', true);
+  failProgress('等了 120 秒服务没有回来', lastState ? (lastState.error || '') : '');
+}
+
+async function fetchUpdateStatus() {
+  try {
+    const resp = await fetch('/api/update/status', { cache: 'no-store' });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return (data && data.status) || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/* ---------- 升级进度区 ---------- */
+const STEP_TEXT = {
+  preparing: '已交棒给监督进程',
+  waiting: '等待旧进程退出、端口释放',
+  starting: '拉起新进程',
+  verifying: '等待新版本应答',
+  rolledback: '新版本没起来，正在回滚',
+  ok: '已就绪',
+  failed: '失败',
+};
+
+function showProgress(title, sub) {
+  const box = $('#upd-progress');
+  if (!box) return;
+  box.hidden = false;
+  $('#upd-progress-title').textContent = title;
+  $('#upd-progress-sub').textContent = sub || '';
+  $('#upd-recover').hidden = true;
+  $('#upd-log').hidden = true;
+  $('#upd-steps').innerHTML = '';
+  $('#upd-spinner').hidden = false;
+  progressState.started = Date.now();
+}
+
+function updateProgressElapsed(seconds) {
+  const sub = $('#upd-progress-sub');
+  if (!sub || !progressState.started) return;
+  const base = sub.textContent.split('　·　')[0];
+  sub.textContent = `${base}　·　已等 ${seconds}s`;
+}
+
+function renderSteps(st) {
+  const box = $('#upd-steps');
+  if (!box || !st) return;
+  const steps = Array.isArray(st.steps) ? st.steps.slice(-6) : [];
+  box.innerHTML = steps.map((s) => {
+    const t = new Date((s.at || 0) * 1000).toLocaleTimeString('zh-CN');
+    return `<li><span class="mono">${esc(t)}</span> ${esc(s.text || '')}</li>`;
+  }).join('');
+  if (st.state && STEP_TEXT[st.state]) {
+    $('#upd-progress-title').textContent = STEP_TEXT[st.state];
+  }
+}
+
+function finishProgress(title, sub) {
+  $('#upd-spinner').hidden = true;
+  $('#upd-progress-title').textContent = title;
+  if (sub) $('#upd-progress-sub').textContent = sub;
+  $('#upd-recover').hidden = true;
+}
+
+/* 失败时把服务端日志尾部摊开，并把回滚按钮亮出来——
+   「重启失败」最烦的是不知道失败在哪，让人去翻 data/logs 等于没修。 */
+function failProgress(title, detail) {
+  $('#upd-spinner').hidden = true;
+  $('#upd-progress-title').textContent = title;
+  $('#upd-progress-sub').textContent = detail || '';
+  $('#upd-recover').hidden = false;
+  toast(title, true);
+  fetchUpdateStatus().then((st) => {
+    renderSteps(st);
+    const tail = st && st.log_tail;
+    if (tail) {
+      const log = $('#upd-log');
+      log.hidden = false;
+      log.textContent = tail;
+    }
+  });
 }
 
 async function saveSource() {
@@ -1585,6 +1747,7 @@ function bind() {
   $('#btn-apply-update').addEventListener('click', applyUpdate);
   $('#btn-apply-local').addEventListener('click', applyLocal);
   $('#btn-restart').addEventListener('click', restartServer);
+  $('#btn-rollback').addEventListener('click', rollbackServer);
   $('#btn-save-source').addEventListener('click', saveSource);
 
   $('#btn-logout').addEventListener('click', async () => {

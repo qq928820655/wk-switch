@@ -157,6 +157,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._serve_file(target, _guess_type(target))
             return
+        if path == "/api/ping":
+            # 免鉴权：升级重启期间浏览器探活只认 200。只回版本号和 pid，
+            # 不含任何账号或配置信息。必须放在鉴权之前——重启后新进程的
+            # 会话表可能还没从磁盘补齐，要求登录的话页面永远等不到「回来了」。
+            self._json(200, {"ok": True, "app": version.APP_NAME,
+                             "version": version.version(), "pid": os.getpid()})
+            return
         if self._need_auth(path):
             return
         if path == "/api/version":
@@ -168,6 +175,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/update/check":
             self._update_check()
+            return
+        if path == "/api/update/status":
+            self._update_status()
             return
         if path == "/api/profiles":
             self._json(200, {"ok": True, "profiles": formats.profile_list()})
@@ -252,10 +262,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._recheck_track(payload)
             elif path == "/api/update/apply":
                 self._update_apply()
+            elif path == "/api/update/upgrade":
+                self._update_upgrade()
             elif path == "/api/update/local":
                 self._update_local(payload)
             elif path == "/api/update/restart":
                 self._update_restart()
+            elif path == "/api/update/rollback":
+                self._update_rollback(payload)
             elif path == "/api/update/config":
                 self._update_config(payload)
             elif path == "/api/reset":
@@ -608,6 +622,11 @@ class Handler(BaseHTTPRequestHandler):
         self._respond_files(outputs, profile_id, {}, realm_mode, len(accounts))
 
     # ---- 在线升级 -------------------------------------------------
+    def _site(self) -> tuple[int, str]:
+        """当前监听的 (端口, 地址)。重启要把这两个原样交代给监督进程。"""
+        host, port = self.server.server_address[:2]
+        return int(port), str(host or "127.0.0.1")
+
     def _update_check(self) -> None:
         try:
             result = updater.check()
@@ -618,6 +637,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, **result})
 
     def _update_apply(self) -> None:
+        """只替换代码，不重启。留给命令行 / 脚本用。"""
         try:
             result = updater.apply()
         except ValueError as exc:
@@ -625,15 +645,59 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
-    def _update_restart(self) -> None:
-        port = self.server.server_address[1]
-        result = updater.restart(port)
+    def _update_upgrade(self) -> None:
+        """一键升级：下载 → 替换 → 重启，一个请求做完。
+
+        响应先把「已交棒」发出去，重启在监督进程里继续；页面拿到 200 就切到
+        等待态轮询 /api/ping，不再让用户点第二次。
+        """
+        port, host = self._site()
+        try:
+            result = updater.upgrade(port, host)
+        except ValueError as exc:
+            self._error(400, str(exc))
+            return
+        result["old_pid"] = os.getpid()
         self._json(200, result)
-        # 先把响应刷出去，再结束进程；否则浏览器只会看到连接被重置
-        threading.Timer(0.6, lambda: os._exit(0)).start()
+        if result.get("restarting"):
+            # 响应已经刷出去，给浏览器 0.5 秒收完再退，否则它看到的是连接被重置
+            threading.Timer(0.5, lambda: os._exit(0)).start()
+
+    def _update_restart(self) -> None:
+        port, host = self._site()
+        result = updater.restart(port, host,
+                                 target_version=version.version(),
+                                 from_version=version.version())
+        result["old_pid"] = os.getpid()
+        self._json(200, result)
+        if result.get("ok"):
+            threading.Timer(0.5, lambda: os._exit(0)).start()
+
+    def _update_status(self) -> None:
+        """重启进度。重启期间旧进程已退，只有新进程起来后才读得到。"""
+        from wk import relaunch
+
+        self._json(200, {"ok": True, "status": relaunch.status(),
+                         "current": version.version()})
+
+    def _update_rollback(self, payload: dict) -> None:
+        """用备份回滚并重启。自动回滚失败时的手动兜底。"""
+        port, host = self._site()
+        prefer = str(payload.get("prefer_version") or "")
+        exclude = str(payload.get("exclude_version") or version.version())
+        try:
+            result = updater.rollback_latest(port, host, exclude_version=exclude,
+                                             prefer_version=prefer)
+        except ValueError as exc:
+            self._error(400, str(exc))
+            return
+        result["old_pid"] = os.getpid()
+        self._json(200, result)
+        if result.get("restarting"):
+            threading.Timer(0.5, lambda: os._exit(0)).start()
 
     def _update_local(self, payload: dict) -> None:
-        """上传本地升级包。
+        """上传本地升级包，替换 + 重启一步到位。
 
         国内到 github.com 的 release 下载常被掐断，让用户自己在浏览器里
         下载 zip 再传回来是最省事的兜底路径——下载走浏览器自己的网络栈，
@@ -649,7 +713,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("文件内容不是合法的 base64") from exc
         if len(blob) > 64 * 1024 * 1024:
             raise ValueError("包太大了（上限 64MB）")
-        self._json(200, updater.apply_local(blob, name))
+        port, host = self._site()
+        result = updater.upgrade_local(port, host, blob, name)
+        result["old_pid"] = os.getpid()
+        self._json(200, result)
+        if result.get("restarting"):
+            threading.Timer(0.5, lambda: os._exit(0)).start()
 
     def _update_config(self, payload: dict) -> None:
         patch = {k: payload[k] for k in ("repo", "index_url", "asset", "allow_prerelease", "proxy")

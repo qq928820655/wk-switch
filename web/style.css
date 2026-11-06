@@ -20,6 +20,11 @@
 
 * { box-sizing: border-box; }
 
+/* 作者样式里只要写了 display，就会盖掉 UA 对 [hidden] 的 display:none。
+   这个坑在视图容器、tab 红点、升级进度区各踩过一次，统一在源头关掉：
+   元素设了 hidden 属性就必须真的不显示。 */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -954,6 +959,66 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   white-space: pre-wrap;
   max-height: 120px;
   overflow: auto;
+}
+
+/* ---------- 升级进度 ---------- */
+/* 重启要等几十秒，期间服务是断的。这块存在的意义是让用户看到「在动」，
+   失败时还能直接看到日志尾巴，不用去翻 data/logs。 */
+.upd-progress {
+  margin: 4px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: #f7f8ff;
+}
+.upd-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.upd-progress-head b { font-size: 13px; color: var(--ink); font-weight: 600; }
+.upd-spinner {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(79, 70, 229, .22);
+  border-top-color: var(--brand);
+  border-radius: 50%;
+  animation: upd-spin .8s linear infinite;
+}
+@keyframes upd-spin { to { transform: rotate(360deg); } }
+.upd-steps {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+  line-height: 1.7;
+  max-height: 118px;
+  overflow: auto;
+}
+.upd-steps:empty { display: none; }
+.upd-steps .mono { color: var(--ink-3); margin-right: 6px; }
+.upd-log {
+  margin: 10px 0 0;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: #1e2233;
+  color: #d5daea;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.55;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.upd-recover {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
 }
 
 /* 本地包升级：和上面的在线升级拉开距离，避免误当成同一条流程 */

@@ -45,18 +45,21 @@ def find_port(start: int, host: str = "127.0.0.1", tries: int = 20,
               wait: float = 0) -> int:
     """找一个能绑的端口。
 
-    wait > 0 是升级重启场景：此时**只等 start 这一个端口**，不往后找。
-    旧进程还在退出的那零点几秒里，8765 被占着而 8766 空着，一往后找
-    就绑到 8766 了——用户的书签、反向代理、防火墙规则全都指着 8765，
-    端口一漂就等于服务失联。真等不到（比如被别的程序长期占着）才退回
-    往后找，避免彻底起不来。
+    wait > 0 是升级重启场景：此时**只等 start 这一个端口**，等不到就报错退出，
+    不往后找。理由是这个场景由 `wk/relaunch.py` 的监督进程看着：它先确认端口
+    空了才拉起本进程，所以这里等不到只可能是「同一个端口上还有别的东西」。
+    这时候往后挪一个端口，用户的书签、反向代理、防火墙规则全部失效，比明确
+    失败并触发回滚糟糕得多——失败能回滚，端口漂移没人知道。
+
+    不带 wait 的手动启动仍然往后找，那是「上次没关干净」的常规场景。
     """
-    deadline = time.time() + max(0.0, wait)
     if wait > 0:
+        deadline = time.time() + wait
         while time.time() < deadline:
             if port_free(start, host):
                 return start
             time.sleep(0.2)
+        raise SystemExit(f"端口 {start} 等 {wait:.0f} 秒仍被占用，未启动（避免端口漂移）")
 
     for offset in range(tries):
         port = start + offset
@@ -79,6 +82,13 @@ def main() -> int:
     host = args.host
     port = find_port(args.port, host=host, wait=args.wait_port)
     httpd = server.serve(host=host, port=port)
+    # 服务已经能应答了才敢说「就绪」——监督进程探活看的就是 /api/ping，
+    # 提前标记会掩盖「端口起来了但 handler 是坏的」这类问题。
+    try:
+        from wk import relaunch
+        relaunch.mark_ready(port, host)
+    except Exception:  # noqa: BLE001 — 重启标记失败不该拦住启动
+        pass
     # 绑 0.0.0.0 时本机访问仍用回环地址，别把 0.0.0.0 塞进浏览器
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::', '') else host}:{port}"
 

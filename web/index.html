@@ -277,7 +277,7 @@
   <section class="card">
     <div class="card-head">
       <h2>在线升级</h2>
-      <span class="hint">从制品库拉最新发布包，只替换代码，账号库与口令不动</span>
+      <span class="hint">一键完成：下载 → 替换代码 → 重启 → 自动刷新。只换代码，账号库与口令不动</span>
     </div>
 
     <div class="upd-source">
@@ -303,9 +303,23 @@
 
     <div class="export-bar">
       <button class="btn primary" id="btn-check-update">检查更新</button>
-      <button class="btn" id="btn-apply-update" disabled>一键升级</button>
-      <button class="btn" id="btn-restart" disabled>重启生效</button>
+      <button class="btn" id="btn-apply-update" disabled>一键升级并重启</button>
+      <button class="btn" id="btn-restart" disabled>只重启服务</button>
       <span class="hint" id="upd-hint"></span>
+    </div>
+
+    <div class="upd-progress" id="upd-progress" hidden>
+      <div class="upd-progress-head">
+        <span class="upd-spinner" id="upd-spinner"></span>
+        <b id="upd-progress-title">正在重启…</b>
+        <span class="hint" id="upd-progress-sub"></span>
+      </div>
+      <ol class="upd-steps" id="upd-steps"></ol>
+      <pre class="upd-log" id="upd-log" hidden></pre>
+      <div class="upd-recover" id="upd-recover" hidden>
+        <button class="btn small" id="btn-rollback">回滚到升级前的备份</button>
+        <span class="hint">回滚会换成上一版代码并再重启一次</span>
+      </div>
     </div>
 
     <div class="local-upgrade">

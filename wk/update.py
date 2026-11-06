@@ -406,24 +406,82 @@ def apply_local(blob: bytes, filename: str = "", progress=None) -> dict:
     return result
 
 
-def restart(port: int) -> dict:
-    """拉起一个新进程再退出当前进程。
+def restart(port: int, host: str = "", target_version: str = "",
+            backup: str = "", from_version: str = "") -> dict:
+    """交给监督进程重启，本进程随后退出。
 
-    新进程带 --wait-port，会等端口释放后自己绑上；这里直接退出，
-    否则旧进程占着端口，新进程只能失败退出。
+    这里不再自己 Popen 新进程——起早了抢不到端口、崩了没日志、坏了没退路，
+    三个坑都在 `wk/relaunch.py` 里一并处理了。本函数只负责把「要重启到哪个
+    版本、用哪份备份兜底」交接出去。
     """
-    python = sys.executable
-    args = [python, os.path.join(ROOT, "main.py"), str(port), "--no-browser", "--wait-port", "25"]
-    kwargs = {
-        "cwd": ROOT,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "stdin": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    from . import relaunch
+
+    return relaunch.spawn(port, host=host or "127.0.0.1",
+                          target_version=target_version,
+                          backup=backup, from_version=from_version)
+
+
+def upgrade(port: int, host: str = "127.0.0.1", progress=None) -> dict:
+    """下载 + 覆盖 + 重启，一步做完。
+
+    页面上的「一键升级」走这条。分成 apply / restart 两步的话，用户点完
+    升级还得记得再点一次重启；忘了就是「代码新的、进程旧的」，版本号对不上
+    更让人迷惑。
+    """
+    result = apply(progress=progress)
+    if not result.get("upgraded"):
+        return result
+    return _finish_with_restart(result, port, host)
+
+
+def upgrade_local(port: int, host: str, blob: bytes, filename: str = "",
+                  progress=None) -> dict:
+    """本地包升级 + 重启，一步做完。"""
+    return _finish_with_restart(apply_local(blob, filename, progress=progress), port, host)
+
+
+def _finish_with_restart(result: dict, port: int, host: str) -> dict:
+    """给升级结果补上「已交棒给监督进程」这一步。"""
+    from . import relaunch
+
+    spawn = relaunch.spawn(
+        port, host=host,
+        target_version=str(result.get("to") or ""),
+        backup=str(result.get("backup") or ""),
+        from_version=str(result.get("from") or ""),
+    )
+    result["restart"] = spawn
+    result["restarting"] = bool(spawn.get("ok"))
+    if spawn.get("ok"):
+        result["message"] = f"已升级到 {result.get('to')}，正在重启"
     else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen(args, **kwargs)
-    return {"ok": True, "message": "新进程已拉起，正在重启", "port": port}
+        result["message"] = (f"已升级到 {result.get('to')}，但重启没成功："
+                             f"{spawn.get('error')}；请手动重启")
+    return result
+
+
+def rollback_latest(port: int, host: str = "127.0.0.1",
+                    exclude_version: str = "", prefer_version: str = "") -> dict:
+    """用最近一份代码备份回滚，然后重启。
+
+    自动回滚失败时的手动兜底，也用于「升级完发现不对劲」想退回去。
+    """
+    blob, name = _read_backup(exclude_version or version.version(), prefer_version)
+    if not blob:
+        raise ValueError("backups/ 里没有可用的代码备份")
+    result = apply_local(blob, name)
+    result["source"] = "backup:" + name
+    return _finish_with_restart(result, port, host)
+
+
+def _read_backup(exclude_version: str, prefer_version: str = "") -> tuple[bytes, str]:
+    from . import relaunch
+
+    path = relaunch._latest_backup(exclude_version, prefer_version)
+    if not path:
+        return b"", ""
+    try:
+        with open(path, "rb") as f:
+            return f.read(), os.path.basename(path)
+    except OSError:
+        return b"", ""
