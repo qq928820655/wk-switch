@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>登录 · wk-switch</title>
+<link rel="icon" href="/static/assets/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="icon" type="image/svg+xml" href="/static/assets/icon.svg">
+<link rel="apple-touch-icon" href="/static/assets/apple-touch-icon.png">
+<meta name="theme-color" content="#4f46e5">
 <style>
   :root {
     --bg: #f5f6fa;
@@ -36,11 +40,9 @@
   .wrap { width: 100%; max-width: 372px; }
 
   .logo {
-    display: grid; place-items: center;
+    display: block;
     width: 46px; height: 46px; margin: 0 auto 14px;
-    border-radius: 13px;
-    background: linear-gradient(135deg, #6366f1, #4f46e5);
-    color: #fff; font-size: 23px; font-weight: 600;
+    border-radius: 12px;
     box-shadow: 0 10px 24px -10px rgba(79, 70, 229, .8);
   }
   h1 { margin: 0; text-align: center; font-size: 18px; font-weight: 650; letter-spacing: -.01em; }
@@ -114,7 +116,7 @@
 </head>
 <body>
 <div class="wrap">
-  <div class="logo">⇄</div>
+  <img class="logo" src="/static/assets/icon.svg" alt="wk-switch" width="46" height="46">
   <h1>wk-switch</h1>
   <p class="sub">跨项目账户导入导出转换</p>
 

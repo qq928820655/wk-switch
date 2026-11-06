@@ -34,7 +34,7 @@ DIST = os.path.join(ROOT, "dist")
 
 #: 进包的顶层条目
 INCLUDE = (
-    "main.py", "server.py", "wk", "web", "deploy", "samples", "tests",
+    "main.py", "server.py", "wk", "web", "deploy", "samples", "tests", "tools",
     "README.md", "requirements.txt", "VERSION", "BUILD", "LICENSE",
 )
 EXCLUDE_DIRS = {"__pycache__", ".git", ".workbuddy", "data", "config", "backups", "dist", ".idea"}

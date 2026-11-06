@@ -16,6 +16,7 @@
 - **上游校验与积分**：选中账号后可向上游只读查询，判定凭据是否仍然有效并取回积分余额。**不刷新 token**——refresh token rotation 会让别处正在用同一账号的服务掉线，详见下文
 - **封号复检**：被上游风控拦掉的账号单独进「封号复检」标签页，定时发一次最小对话探活；出口可走**同一 / 随机 / 自定义**三档，支持 mihomo 端口自动检测与自填代理表
 - **访问口令**：登录页口令换会话 cookie，默认 `qq928820655`（改 `config/auth.json`）
+- **应用图标**：indigo 双向箭头，favicon / 页头 / 任务栏 / PWA 主屏同一张图，随代码生成，`python tools/make_icon.py` 可重出任意尺寸
 
 ## 快速开始
 
@@ -302,6 +303,31 @@ gh release create v1.0.0 dist/*.zip dist/*.tar.gz dist/SHA256SUMS.txt
 
 产物：`wk-switch-<ver>.zip`（升级包）、`-linux.tar.gz`、`-windows.zip`。
 
+## 图标
+
+图标是代码生成的，不存二进制源文件——改个颜色或比例重跑一次就行，不用找设计文件：
+
+```bash
+python tools/make_icon.py          # 输出到 web/assets/
+python tools/make_icon.py --check  # 只检查文件齐不齐
+```
+
+打开 `tools/icon-preview.html` 能看各尺寸效果：标签栏、深色任务栏、16～192 阶梯、圆形/方圆/水滴三种系统裁切。
+
+```
+web/assets/icon.svg                矢量源
+web/assets/favicon.ico             16 / 32 / 48 三档
+web/assets/icon-192.png            PWA
+web/assets/icon-512.png            PWA / 商店
+web/assets/icon-maskable-512.png   Android 自适应图标（满幅背景 + 箭头缩进安全区）
+web/assets/apple-touch-icon.png    iOS 180
+web/assets/manifest.webmanifest
+```
+
+图形是 indigo 渐变圆角方 + 白色双向箭头，和页头 logo、favicon、任务栏用同一张图。低于 24px 会自动切到「极小版」几何（杆更粗、三角更大、留白更少），否则 16px 下三角会被量化掉，看上去只剩两条白线。
+
+光栅化是脚本自己算的（SDF + 解析抗锯齿），不依赖 Pillow——项目声明仅标准库，图标脚本也守住这条。
+
 ## 目录
 
 ```
@@ -320,10 +346,12 @@ wk/
   update.py          在线升级
   version.py         版本号
 web/                 index.html / login.html / app.js / style.css
+web/assets/          应用图标与 manifest（由 tools/make_icon.py 生成）
 deploy/linux/        install.sh / uninstall.sh
 deploy/windows/      install.bat / start.bat / stop.bat / uninstall.bat
 samples/             九个样例包与生成脚本
 tests/               单元测试
+tools/               图标生成脚本与预览页
 ```
 
 ## 测试

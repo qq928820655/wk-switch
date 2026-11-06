@@ -55,16 +55,14 @@ html, body {
 
 .brand { display: flex; align-items: center; gap: 12px; }
 
+/* 直接用应用图标本体，不再用 ⇄ 字符画方块：favicon、任务栏、页头三处
+   必须是同一张图，否则用户对不上「哪个窗口是它」。字符版在字重和比例上
+   和图标对不齐，换掉更省心。 */
 .logo {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 36px;
   height: 36px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #6366f1, #4f46e5);
-  color: #fff;
-  font-size: 19px;
-  font-weight: 600;
+  border-radius: 9px;
   box-shadow: 0 4px 12px -4px rgba(79, 70, 229, .6);
 }
 

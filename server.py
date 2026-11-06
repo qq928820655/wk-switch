@@ -148,6 +148,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._serve_file(WEB_DIR / "index.html", "text/html; charset=utf-8")
             return
+        if path == "/favicon.ico":
+            # 浏览器和不少客户端不看 <link>，直接按根路径要这个文件。
+            # 放在最前面：登录页也要能显示图标，不能走鉴权。
+            self._serve_file(WEB_DIR / "assets" / "favicon.ico", "image/x-icon")
+            return
         if path.startswith("/static/"):
             rel = path[len("/static/"):]
             target = (WEB_DIR / rel).resolve()
@@ -1032,6 +1037,7 @@ def _guess_type(path: Path) -> str:
         ".png": "image/png",
         ".ico": "image/x-icon",
         ".json": "application/json; charset=utf-8",
+        ".webmanifest": "application/manifest+json; charset=utf-8",
     }.get(path.suffix.lower(), "application/octet-stream")
 
 
