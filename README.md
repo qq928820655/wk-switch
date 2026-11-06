@@ -203,7 +203,14 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
 
 `host` 默认 `cli-proxy-mihomo`（docker 网络里的服务名），`ports` 默认 `17901-17910`，与 hub 的 `PROXY_DISCOVER_HOST` / `PROXY_DISCOVER_PORTS` 同源。
 
-`api` 是 mihomo 的 external-controller，填了才能显示**节点名**。出口 IP 分不出线路——同一订阅里两个节点出口落在同一段是常事，卡片上两格数字一模一样，看着像同一个槽测了两遍。mihomo 的 `/listeners` 里每个 listener 带着 `proxy`（这个端口钉死的出站节点名），那才是「我在用哪条线」的答案。留空时按 `host` 推 `http://<host>:9090`；控制器设了 secret 就填进 `secret`。
+`api` 是 mihomo 的 external-controller，填了才能显示**节点名**。出口 IP 分不出线路——同一订阅里两个节点出口落在同一段是常事，卡片上两格数字一模一样，看着像同一个槽测了两遍。留空时按 `host` 推 `http://<host>:9090`；控制器设了 secret 就填进 `secret`。
+
+**节点名是怎么拿到的**（官方 mihomo 的 API 里其实没有「列出所有监听端口」这个端点，`hub/route/server.go` 的路由表里没有）：
+
+1. 先试 `GET /listeners` —— 一步到位，但要面板 / fork 才有，官方 404 是常态。
+2. 404 就退到 `GET /connections` 反查 —— mihomo 每条连接带 `inboundPort`（从哪个监听进来的）和 `chains`（出站链路，第一个是真正用的节点）。于是对着每个端口各开一条隧道**先别关**（HTTP CONNECT 不通就试 SOCKS5，listener 的 type 从外面看不出来），再读一次连接表，端口和节点名就对上了。连接一断记录就没了，所以必须挂着读。
+
+第 2 步要开 N 条长连接，所以只在点「自动检测」时走；打开页面那一趟只问 `/listeners`。
 
 每张卡片一行四段：**端口 → 节点名 → 类型 → 延迟**。端口不写全 `127.0.0.1:17901` —— 十张卡片这串前缀一模一样，占掉十几个字符却分不出任何东西，留五位数就够认。类型（住宅 / 机房 / 代理）按节点名推断，名字里没写就不标：同一个订阅里机房 IP 和住宅 IP 混着，这两三个字是唯一能分辨的地方，猜错比不标更误导。出口 IP 退到鼠标悬停的提示里。
 
@@ -212,12 +219,12 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
 | 现象 | 提示 |
 |---|---|
 | 401 / 403 | secret 不对或没填 |
-| 404 | 这个地址没有 `/listeners`，版本太老或不是 mihomo |
 | 连接被拒绝 | 控制器没开，或端口不对 |
 | 域名解析不到 | 跨容器要写服务名，宿主机上要写 127.0.0.1 |
-| 通了但 `listeners` 为空 | 端口没在 mihomo 里配 listener |
+| `/listeners` 404 且反查也没结果 | 说清是「官方不带这个端点」+ 反查卡在哪一步 |
+| 通了但 `listeners` 为空 | 端口不是用 `listeners` 段开的，一个端口一个节点这件事不成立 |
 
-Clash 原版没有 `/listeners`，只有 mihomo 有。已经配过 hub 的机器直接就能复用，也可以用环境变量 `WB_PROXY_DISCOVER_HOST` / `WB_PROXY_DISCOVER_PORTS` 覆盖。
+已经配过 hub 的机器直接就能复用，也可以用环境变量 `WB_PROXY_DISCOVER_HOST` / `WB_PROXY_DISCOVER_PORTS` 覆盖。
 
 节点全不通时复检会直连——不会因为代理挂了就不检查，只是失去了换 IP 这层保护。`same` / `custom` 两档钉死了出口，就不会再去扫端口，省掉十来个用不上的请求。
 

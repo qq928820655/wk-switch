@@ -321,53 +321,48 @@ def api_base(mihomo: dict) -> str:
     return normalize_url(f"http://{host}:9090")
 
 
-def _fetch_listeners(cfg: dict, timeout: float = 2.5) -> tuple[dict[int, dict], str]:
-    """问 mihomo 「这些端口各走哪个节点」，返回 ({端口: {name, proxy}}, 错误说明)。
+def _api_get(base: str, path: str, headers: dict,
+             timeout: float) -> tuple[Any, int, str]:
+    """GET 一个控制器端点，返回 (JSON, HTTP 状态码, 人话错误)。
 
-    为什么要这一步：出口 IP 分不出线路。同一条订阅里两个节点落在同一个
-    AS 的相邻段，甚至直接共用出口，卡片上两格都是 `103.41.4.26`，看起来
-    像同一个槽位检测了两遍。mihomo 的 `/listeners` 里每个 listener 带
-    `proxy` 字段（这个端口钉死的出站节点名），那才是用户在找的东西。
-
-    Clash 原版没有这个端点，mihomo 有。拿不到时**必须把原因带出去**：
-    界面上只写「控制器未通」，用户不知道该改地址、补 secret，还是去给
-    mihomo 开 external-controller——这几种情况的处置完全不同。
+    状态码 0 表示没走到 HTTP 层（连不上 / 超时），此时 error 里已经是可以
+    照着改的说法。分开给状态码是因为调用方要靠它判断「这个端点不存在，
+    换一条路」和「地址根本不通，别浪费时间试别的」。
     """
-    base = api_base(cfg["mihomo"])
-    if not base:
-        return {}, "没填控制器地址，也没能从代理主机推出来（主机为空）"
-    headers = {"Accept": "application/json"}
-    secret = str(cfg["mihomo"].get("secret") or "").strip()
-    if secret:
-        headers["Authorization"] = "Bearer " + secret
     # 强制直连：环境里 HTTPS_PROXY 指向本地代理时，urllib 会把 127.0.0.1
     # 也塞给代理，问一次要绕一圈还可能直接失败。
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    req = urllib.request.Request(base + "/listeners", headers=headers)
+    req = urllib.request.Request(base + path, headers=headers)
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
+            code = int(getattr(resp, "status", 200) or 200)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            return {}, f"{base} 返回 401，需要填 secret"
-        if exc.code == 404:
-            return {}, f"{base} 返回 404，没有 /listeners（版本太老或不是 mihomo）"
-        return {}, f"{base} 返回 HTTP {exc.code}"
+        return None, int(exc.code), _explain_status(base, path, int(exc.code))
     except urllib.error.URLError as exc:
-        return {}, f"{base} {_why_unreachable(exc.reason, timeout)}"
+        return None, 0, f"{base}{path} {_why_unreachable(exc.reason, timeout)}"
     except TimeoutError:
-        return {}, f"{base} 超时 {timeout:g}s，地址不通"
+        return None, 0, f"{base}{path} 超时 {timeout:g}s，地址不通"
     except OSError as exc:
-        return {}, f"{base} {_why_unreachable(exc, timeout)}"
+        return None, 0, f"{base}{path} {_why_unreachable(exc, timeout)}"
     try:
-        data = json.loads(raw)
+        return json.loads(raw), code, ""
     except ValueError:
-        return {}, f"{base}/listeners 返回的不是 JSON"
-    if not isinstance(data, dict):
-        return {}, f"{base}/listeners 返回的不是对象"
+        return None, code, f"{base}{path} 返回的不是 JSON"
 
+
+def _explain_status(base: str, path: str, code: int) -> str:
+    if code in (401, 403):
+        return f"{base} 返回 {code}，需要填 secret（或 secret 不对）"
+    if code == 404:
+        return f"{base}{path} 返回 404"
+    return f"{base}{path} 返回 HTTP {code}"
+
+
+def _listener_map(items: Any) -> dict[int, dict]:
+    """把 `[{name, port, proxy}]` 折成 `{端口: {name, proxy}}`。"""
     out: dict[int, dict] = {}
-    for item in (data.get("listeners") or []):
+    for item in (items or []):
         if not isinstance(item, dict):
             continue
         try:
@@ -380,9 +375,231 @@ def _fetch_listeners(cfg: dict, timeout: float = 2.5) -> tuple[dict[int, dict], 
             "name": str(item.get("name") or "").strip(),
             "proxy": str(item.get("proxy") or "").strip(),
         }
-    if not out:
-        return {}, f"{base}/listeners 是空的，mihomo 里没有 listener"
-    return out, ""
+    return out
+
+
+def _fetch_listeners(cfg: dict, ports: Iterable[int] | None = None,
+                     timeout: float = 2.5,
+                     deep: bool = True) -> tuple[dict[int, dict], str]:
+    """问 mihomo 「这些端口各走哪个节点」，返回 ({端口: {name, proxy}}, 错误说明)。
+
+    为什么要这一步：出口 IP 分不出线路。同一条订阅里两个节点落在同一个
+    AS 的相邻段，甚至直接共用出口，卡片上两格都是 `103.41.4.26`，看起来
+    像同一个槽位检测了两遍。节点名才是用户在找的东西。
+
+    **两条路**（顺序不能反）：
+
+    1. `GET /listeners` —— 直接给出端口、监听名、钉死的出站节点。可惜
+       官方 mihomo 的 API 里**没有这个端点**（`hub/route/server.go` 的
+       路由表里没有 listener 相关项），只有部分面板 / fork 加了。所以它
+       命中是意外，404 才是常态。
+    2. `GET /connections` 反查 —— 每条连接都带 `inboundPort`（从哪个监听
+       进来）和 `chains`（出站链路，`chains[0]` 是真正用的节点）。对着每个
+       端口开一条 CONNECT 隧道并**先别关**，再读一次 `/connections`，就能
+       把端口和节点名对上。贵一点（N 条长连接），所以只在 `deep=True`
+       （用户点了「自动检测」）时才走。
+
+    拿不到时**必须把原因带出去**：界面上只写「控制器未通」，用户不知道该
+    改地址、补 secret，还是去给 mihomo 开 external-controller——这几种情况
+    的处置完全不同。
+    """
+    base = api_base(cfg["mihomo"])
+    if not base:
+        return {}, "没填控制器地址，也没能从代理主机推出来（主机为空）"
+    headers = {"Accept": "application/json"}
+    secret = str(cfg["mihomo"].get("secret") or "").strip()
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+
+    data, code, err = _api_get(base, "/listeners", headers, timeout)
+    if code == 200:
+        out = _listener_map(data.get("listeners") if isinstance(data, dict) else None)
+        if out:
+            return out, ""
+        # 端点存在但一个 listener 都没有：端口可能是用 mixed-port / port
+        # 之类开的，那就没有「每条线一个端口」这回事，也没有名字可给。
+        return {}, (f"{base}/listeners 是空的：端口不是用 listeners 段开的，"
+                    "一个端口对应一个节点这件事在这里不成立")
+    if code in (401, 403):
+        # 鉴权失败时别的端点也一样过不去，不用再试
+        return {}, err
+    if code == 0:
+        # 连不上 / 超时：地址本身有问题，反查也没有意义
+        return {}, err
+
+    if not deep:
+        return {}, f"{base} 没有 /listeners（官方 mihomo 不带这个端点），点「自动检测」再按连接反查"
+
+    got, why = _map_by_connections(cfg, list(ports or []), base, headers, timeout)
+    if got:
+        return got, ""
+    return {}, f"{base} 没有 /listeners（官方 mihomo 不带这个端点）；{why}"
+
+
+def _probe_host(probe_url: str) -> str:
+    """从探测地址取个能 CONNECT 出去的主机名。取不到就用 api.ipify.org。"""
+    text = str(probe_url or "").strip()
+    if not text:
+        return "api.ipify.org"
+    if "://" not in text:
+        text = "http://" + text
+    host = urllib.parse.urlsplit(text).hostname or ""
+    return host or "api.ipify.org"
+
+
+def _host_only(host: str) -> str:
+    """把 `http://a:1` / `a:1234` 这类写法剥成能 connect 的主机名。"""
+    text = str(host or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        text = urllib.parse.urlsplit(text).hostname or ""
+    elif text.count(":") == 1 and not text.startswith("["):
+        text = text.split(":", 1)[0]
+    return text
+
+
+def _http_tunnel(host: str, port: int, target: str,
+                 timeout: float) -> socket.socket | None:
+    """开一条 HTTP CONNECT 隧道，成功返回仍然连着的 socket。"""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        sock.settimeout(timeout)
+        sock.sendall((
+            f"CONNECT {target}:443 HTTP/1.1\r\n"
+            f"Host: {target}:443\r\n"
+            "Proxy-Connection: keep-alive\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head and len(head) < 4096:
+            chunk = sock.recv(512)
+            if not chunk:
+                break
+            head += chunk
+        if b"200" not in head.split(b"\r\n", 1)[0]:
+            sock.close()
+            return None
+        return sock
+    except OSError:
+        sock.close()
+        return None
+
+
+def _socks_tunnel(host: str, port: int, target: str,
+                  timeout: float) -> socket.socket | None:
+    """开一条 SOCKS5 隧道。listener 的 type 是 socks 时只有这条能通。
+
+    先试 HTTP CONNECT 再试这个：mixed listener 两种都收，但把 SOCKS5 的
+    二进制问候发给一个纯 HTTP 端口，对端会直接把连接关掉，所以顺序不能反。
+    """
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")          # VER=5, NMETHODS=1, NO AUTH
+        if sock.recv(2) != b"\x05\x00":
+            sock.close()
+            return None
+        name = target.encode()
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name
+                     + (443).to_bytes(2, "big"))
+        reply = sock.recv(4)
+        if len(reply) < 4 or reply[0] != 5 or reply[1] != 0:
+            sock.close()
+            return None
+        return sock
+    except OSError:
+        sock.close()
+        return None
+
+
+def _open_tunnels(host: str, ports: list[int], target: str,
+                  timeout: float) -> dict[int, socket.socket]:
+    """对着每个端口开一条隧道，返回 {端口: 仍然开着的 socket}。
+
+    隧道留着不关是全部意义所在：连接一断，mihomo 的 `/connections` 里就
+    没这条记录了，也就读不到它走的哪个节点。调用方读完必须自己关。
+
+    HTTP CONNECT 和 SOCKS5 都试一遍：listener 的 type 可能是 mixed 也可能
+    是 socks，从外面看不出来。并发开是因为 32 个端口串行等超时能拖到一分多钟。
+    """
+    held: dict[int, socket.socket] = {}
+    lock = threading.Lock()
+
+    def one(port: int) -> None:
+        sock = _http_tunnel(host, port, target, timeout)
+        if sock is None:
+            sock = _socks_tunnel(host, port, target, timeout)
+        if sock is None:
+            return
+        with lock:
+            held[port] = sock            # 所有权交出去，调用方负责关
+
+    threads = [threading.Thread(target=one, args=(p,), daemon=True) for p in ports]
+    for t in threads:
+        t.start()
+    # 一条隧道最多等两轮超时（HTTP 失败后再试 SOCKS），别让最慢那条拖住整体
+    for t in threads:
+        t.join(timeout * 2 + 1.0)
+    return held
+
+
+def _map_by_connections(cfg: dict, ports: list[int], base: str, headers: dict,
+                        timeout: float) -> tuple[dict[int, dict], str]:
+    """从 `/connections` 反查「这个端口走的是哪个节点」。
+
+    mihomo 每条连接带 `metadata.inboundPort` 和 `chains`，前者是收到的监听
+    端口，后者是出站链路（`[0]` 是真正在用的节点）。所以先让每个端口各挂
+    一条连接，再读一次连接表，端口和节点名就对上了。
+
+    这种反查只对「一个端口钉死一个节点」的 listener 有意义——普通 mixed-port
+    上所有连接共享一个端口，反查出来全是同一个名字。
+    """
+    mihomo = cfg["mihomo"]
+    host = _host_only(str(mihomo.get("host") or ""))
+    if not host:
+        return {}, "代理主机为空，没法开隧道反查"
+    if not ports:
+        return {}, "没有端口可反查"
+
+    target = _probe_host(str(mihomo.get("probe_url") or ""))
+    held = _open_tunnels(host, ports, target, min(timeout, 3.0))
+    if not held:
+        return {}, (f"从 {host} 的端口一条隧道都没开起来"
+                    "（HTTP CONNECT 和 SOCKS5 都试过了：节点全挂，或这几个端口不是代理口）")
+    try:
+        data, code, err = _api_get(base, "/connections", headers, timeout)
+        if code != 200 or not isinstance(data, dict):
+            return {}, f"{base}/connections 读不到：{err or code}"
+        out: dict[int, dict] = {}
+        for item in (data.get("connections") or []):
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata") or {}
+            try:
+                in_port = int(meta.get("inboundPort") or 0)
+            except (TypeError, ValueError):
+                continue
+            chains = [str(x) for x in (item.get("chains") or []) if x]
+            if in_port in held and chains and in_port not in out:
+                out[in_port] = {
+                    "name": str(meta.get("inboundName") or "").strip(),
+                    "proxy": chains[0],
+                }
+        if out:
+            return out, ""
+        return {}, (f"{base}/connections 里有 {len(data.get('connections') or [])} 条连接，"
+                    "但没有带 inboundPort 的（这个版本太老）")
+    finally:
+        for sock in held.values():
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 def _why_unreachable(reason: Any, timeout: float) -> str:
@@ -542,7 +759,8 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
     # 给 1 秒，点「自动检测」给 2.5 秒——那时候用户已经在等结果了。
     # 名单和失败原因一起拿：拿不到名字时界面要能说清是哪一步断的
     # （地址错 / 要 secret / 端点不存在），只说「未通」等于没给信息。
-    names, api_error = _fetch_listeners(cfg, timeout=2.5 if probe_now else 1.0)
+    names, api_error = _fetch_listeners(
+        cfg, ports=ports, timeout=2.5 if probe_now else 1.0, deep=probe_now)
 
     if not probe_now:
         nodes = [{"url": u, "ok": False, "exit_ip": "", "latency_ms": 0,

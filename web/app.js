@@ -1391,14 +1391,15 @@ function fillRecheckForm(cfg, disc) {
   if (disc) {
     // 打开页面就把控制器状态说清楚：只弹端口号的时候，用户第一反应是
     // 「功能没做」，而不是「地址没填对」，得先把原因摆出来。
+    // 没点检测前不提控制器：那时候压根没去问（deep=false），报错是噪音。
     let line = disc.probed
       ? `检测到 ${disc.ok_count} / ${(disc.ports || []).length} 个可用出口`
-      : '环境变量 WB_PROXY_DISCOVER_HOST / WB_PROXY_DISCOVER_PORTS 优先于这两栏';
-    if (!disc.named) {
-      line += disc.api_error ? `｜${disc.api_error}` : '｜控制器未通，只显示端口';
+      : '点「自动检测」开始测，节点名会一起读出来';
+    if (disc.probed && !disc.named) {
+      line += disc.api_error ? `｜${disc.api_error}` : '｜没拿到节点名，只显示端口';
     }
     $('#rc-detect-hint').textContent = line;
-    $('#rc-detect-hint').classList.toggle('bad', !disc.named);
+    $('#rc-detect-hint').classList.toggle('bad', disc.probed && !disc.named);
     renderNodes(disc.nodes || [], disc.probed);
   }
 }
@@ -1561,6 +1562,9 @@ async function saveRecheckCfg() {
 async function detectNodes() {
   const btn = $('#btn-rc-detect');
   btn.disabled = true;
+  // 读节点名要对着每个端口各挂一条隧道再读连接表，比单纯测延迟慢一点，
+  // 按钮上给个进行中的字，免得以为没点上
+  btn.textContent = '检测中…';
   $('#rc-detect-hint').textContent = '正在检测…';
   try {
     const data = await api('/api/recheck/nodes', {
@@ -1576,7 +1580,7 @@ async function detectNodes() {
     // 端点不存在，三种处置完全不同，只说「未通」等于让人自己猜。
     let line = `检测到 ${data.ok_count} / ${(data.ports || []).length} 个可用出口`;
     if (!data.named) {
-      line += data.api_error ? `｜${data.api_error}` : '｜控制器未通，只显示端口';
+      line += '｜' + shortApiError(data.api_error);
     }
     // 一个都不通时补一句排查方向，但**不能覆盖**上面那行：全不通最常见
     // 的原因就是主机名在这台机器上解析不到，把控制器错因冲掉正好丢掉
@@ -1594,7 +1598,16 @@ async function detectNodes() {
     $('#rc-detect-hint').classList.add('bad');
   } finally {
     btn.disabled = false;
+    btn.textContent = '自动检测';
   }
+}
+
+/* 控制器地址在提示里是噪音：它就在上面那两栏里写着，占掉十几个字符只会
+   把真正有用的后半句挤到看不见。去掉开头的 URL 再显示。 */
+function shortApiError(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return '没拿到节点名，只显示端口';
+  return raw.replace(/^https?:\/\/\S+\s*/, '') || raw;
 }
 
 async function detectCustom() {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socketserver
 import sys
 import tempfile
 import threading
@@ -631,21 +632,26 @@ class ControllerErrorTests(unittest.TestCase):
 
     def test_401_says_need_secret(self):
         port = self._fake(401)
-        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), 2.0)
+        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), timeout=2.0)
         self.assertEqual(names, {})
         self.assertIn("secret", err)
 
     def test_404_says_endpoint_missing(self):
+        """404 是常态：官方 mihomo 的路由表里根本没有 /listeners。
+
+        提示不能说成「版本太老」——那会让人去升级内核，升完照样 404。
+        """
         port = self._fake(404)
-        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), 2.0)
+        names, err = recheck._fetch_listeners(
+            self._cfg(f"http://127.0.0.1:{port}"), ports=[17901], timeout=2.0)
         self.assertEqual(names, {})
         self.assertIn("/listeners", err)
-        self.assertIn("404", err)
+        self.assertIn("官方 mihomo 不带这个端点", err)
 
     def test_empty_listeners_is_reported(self):
         """mihomo 通了但一个 listener 都没有，也得说清楚，不能当成「连上了」。"""
         port = self._fake(200, {"listeners": []})
-        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), 2.0)
+        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), timeout=2.0)
         self.assertEqual(names, {})
         self.assertIn("空", err)
 
@@ -656,9 +662,245 @@ class ControllerErrorTests(unittest.TestCase):
         self.assertIn("控制器", err)
 
     def test_unreachable_never_raises(self):
-        names, err = recheck._fetch_listeners(self._cfg("http://127.0.0.1:1"), 1.0)
+        names, err = recheck._fetch_listeners(self._cfg("http://127.0.0.1:1"), timeout=1.0)
         self.assertEqual(names, {})
         self.assertTrue(err)
+
+
+class _HoldProxy:
+    """假 listener：收 CONNECT、回 200、然后把连接挂着不关。
+
+    挂着才是重点——`/connections` 里能查到的是**活动**连接，一关就没了。
+    """
+
+    def __init__(self) -> None:
+        outer = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    self.request.settimeout(3.0)
+                    head = b""
+                    while b"\r\n\r\n" not in head and len(head) < 4096:
+                        chunk = self.request.recv(512)
+                        if not chunk:
+                            return
+                        head += chunk
+                    if not head.upper().startswith(b"CONNECT"):
+                        return
+                    self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    outer.seen.append(head.split(b"\r\n", 1)[0].decode("latin-1"))
+                    # 一直读到对端关闭，保证这条连接在探测期间是活的
+                    while self.request.recv(512):
+                        pass
+                except OSError:
+                    pass
+
+        self.seen: list[str] = []
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class _HoldSocks:
+    """假 SOCKS5 listener：握手成功后把连接挂着不关。
+
+    有些 listener 的 type 就是 socks，这时 HTTP CONNECT 过去只会被对端
+    直接关掉——`_open_tunnels` 必须能退到 SOCKS5 才算真能覆盖。
+    """
+
+    def __init__(self) -> None:
+        outer = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    self.request.settimeout(3.0)
+                    if self.request.recv(3) != b"\x05\x01\x00":
+                        return
+                    self.request.sendall(b"\x05\x00")
+                    head = self.request.recv(4)
+                    if len(head) < 4:
+                        return
+                    if head[3] == 0x03:
+                        n = self.request.recv(1)[0]
+                        self.request.recv(n)
+                    elif head[3] == 0x01:
+                        self.request.recv(4)
+                    else:
+                        self.request.recv(16)
+                    self.request.recv(2)                  # 端口
+                    self.request.sendall(b"\x05\x00\x00\x01"
+                                         b"\x00\x00\x00\x00\x00\x00")
+                    outer.seen.append("socks")
+                    while self.request.recv(512):
+                        pass
+                except OSError:
+                    pass
+
+        self.seen: list[str] = []
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class SocksTunnelTests(unittest.TestCase):
+    """listener 只收 SOCKS 时，CONNECT 那条路走不通，得能退到 SOCKS5。"""
+
+    def test_socks_only_listener_still_maps(self):
+        socks = _HoldSocks()
+        self.addCleanup(socks.close)
+
+        body = json.dumps({"connections": [{
+            "metadata": {"inboundPort": str(socks.port), "inboundName": "socks-in-1"},
+            "chains": ["日本-代理-01"],
+        }]}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):  # noqa: N802
+                if self.path.startswith("/listeners"):
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+
+        cfg = {"mihomo": {"host": "127.0.0.1", "ports": str(socks.port),
+                          "probe_url": "https://api.ipify.org", "timeout": 2.0,
+                          "api": f"http://127.0.0.1:{srv.server_address[1]}",
+                          "secret": "", "enabled": True}}
+        names, err = recheck._fetch_listeners(
+            cfg, ports=[socks.port], timeout=2.0, deep=True)
+        self.assertEqual(err, "")
+        self.assertEqual(names[socks.port]["proxy"], "日本-代理-01")
+        self.assertEqual(socks.seen, ["socks"])
+
+
+class ConnectionsFallbackTests(unittest.TestCase):
+    """官方 mihomo 没有 `/listeners`，唯一出路是从 `/connections` 反查。
+
+    起一个假控制器（/listeners 404、/connections 带 inboundPort 和 chains）
+    加一个假 listener（收 CONNECT 不关），验证端口真能对上节点名。
+    """
+
+    def _controller(self, connections: list[dict]) -> int:
+        body = json.dumps({"connections": connections}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):  # noqa: N802
+                if self.path.startswith("/listeners"):
+                    self.send_error(404)
+                    return
+                if self.path.startswith("/connections"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_error(404)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _cfg(self, ctrl_port: int, proxy_port: int) -> dict:
+        return {"mihomo": {"host": "127.0.0.1", "ports": str(proxy_port),
+                           "probe_url": "https://api.ipify.org", "timeout": 2.0,
+                           "api": f"http://127.0.0.1:{ctrl_port}",
+                           "secret": "", "enabled": True}}
+
+    def setUp(self) -> None:
+        self.proxy = _HoldProxy()
+        self.addCleanup(self.proxy.close)
+
+    def test_port_maps_to_chains_head(self):
+        ctrl = self._controller([{
+            "metadata": {"inboundPort": str(self.proxy.port),
+                         "inboundName": "mixed-in-1"},
+            "chains": ["香港住宅01", "GLOBAL"],
+        }])
+        names, err = recheck._fetch_listeners(
+            self._cfg(ctrl, self.proxy.port), ports=[self.proxy.port],
+            timeout=2.0, deep=True)
+        self.assertEqual(err, "")
+        self.assertEqual(names[self.proxy.port]["proxy"], "香港住宅01")
+        self.assertEqual(names[self.proxy.port]["name"], "mixed-in-1")
+        # 隧道真的发出去过，不然上面的映射就是空转
+        self.assertTrue(self.proxy.seen and "CONNECT" in self.proxy.seen[0])
+
+    def test_other_ports_are_ignored(self):
+        """连接表里一堆别的端口，只能取我们开过隧道的那几个。"""
+        ctrl = self._controller([
+            {"metadata": {"inboundPort": str(self.proxy.port + 1)}, "chains": ["别的"]},
+            {"metadata": {"inboundPort": str(self.proxy.port)}, "chains": ["香港住宅01"]},
+        ])
+        names, _ = recheck._fetch_listeners(
+            self._cfg(ctrl, self.proxy.port), ports=[self.proxy.port],
+            timeout=2.0, deep=True)
+        self.assertEqual(list(names), [self.proxy.port])
+
+    def test_no_inbound_port_says_version_too_old(self):
+        ctrl = self._controller([{"metadata": {}, "chains": ["香港住宅01"]}])
+        names, err = recheck._fetch_listeners(
+            self._cfg(ctrl, self.proxy.port), ports=[self.proxy.port],
+            timeout=2.0, deep=True)
+        self.assertEqual(names, {})
+        self.assertIn("inboundPort", err)
+
+    def test_deep_false_does_not_open_tunnels(self):
+        """列页面时不该去开 N 条长连接——用户还没点「自动检测」。"""
+        ctrl = self._controller([])
+        names, err = recheck._fetch_listeners(
+            self._cfg(ctrl, self.proxy.port), ports=[self.proxy.port],
+            timeout=1.0, deep=False)
+        self.assertEqual(names, {})
+        self.assertIn("自动检测", err)
+        self.assertEqual(self.proxy.seen, [])
+
+
+class HostParseTests(unittest.TestCase):
+    """CONNECT 隧道要的是纯主机名，配置里可能带着协议和端口。"""
+
+    def test_host_only(self):
+        self.assertEqual(recheck._host_only("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(recheck._host_only("http://127.0.0.1:9090"), "127.0.0.1")
+        self.assertEqual(recheck._host_only("cli-proxy-mihomo:7890"), "cli-proxy-mihomo")
+        self.assertEqual(recheck._host_only(""), "")
+
+    def test_probe_host(self):
+        self.assertEqual(recheck._probe_host("https://api.ipify.org"), "api.ipify.org")
+        self.assertEqual(recheck._probe_host("api.ipify.org"), "api.ipify.org")
+        self.assertEqual(recheck._probe_host(""), "api.ipify.org")
 
 
 class NodeKindTests(unittest.TestCase):
