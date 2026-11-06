@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from wk import auth, formats, pipeline, store, update as updater, version
+from wk import auth, formats, pipeline, probe, store, update as updater, version
 from wk.model import Account
 
 ROOT = Path(__file__).resolve().parent
@@ -183,6 +183,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/store/backup":
             self._store_backup()
             return
+        if path == "/api/probe/config":
+            self._json(200, {"ok": True, "config": probe_config()})
+            return
         if path.startswith("/api/download/"):
             self._download(path[len("/api/download/"):])
             return
@@ -228,6 +231,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._store_export(payload)
             elif path == "/api/store/restore":
                 self._store_restore(payload)
+            elif path == "/api/probe":
+                self._probe(payload)
+            elif path == "/api/probe/all":
+                self._probe_all(payload)
             elif path == "/api/update/apply":
                 self._update_apply()
             elif path == "/api/update/local":
@@ -669,6 +676,121 @@ class Handler(BaseHTTPRequestHandler):
 
         result = store.restore_bytes(raw, filename=name, mode=mode)
         self._json(200, {"ok": True, **result, "stats": store.stats()})
+
+    # ---- 上游校验 -------------------------------------------------
+    def _probe(self, payload: dict) -> None:
+        """校验选中的若干账号。
+
+        只读：探针只打计费查询接口，不刷新 token、不签到。刷新会让别处正在
+        用的同一个账号掉线，见 wk/probe.py 顶部。
+        """
+        ids = payload.get("ids") or []
+        if not isinstance(ids, list):
+            raise ValueError("ids 必须是数组")
+        if not ids:
+            raise ValueError("没有选中账号")
+
+        pairs = store.load_for_probe(ids=[int(i) for i in ids if str(i).isdigit()])
+        if not pairs:
+            raise ValueError("选中的账号在库里不存在")
+
+        self._json(200, self._run_probe(pairs))
+
+    def _probe_all(self, payload: dict) -> None:
+        """整库校验，可按版本筛。账号多时慢，界面上有进度提示。"""
+        realm = str(payload.get("realm") or "")
+        pairs = store.load_for_probe(realm=realm if realm in ("cn", "intl") else "")
+        if not pairs:
+            raise ValueError("库里没有账号")
+        self._json(200, self._run_probe(pairs))
+
+    def _run_probe(self, pairs: list) -> dict:
+        """跑探针 + 回写 + 返回汇总。两条路由共用这一份。"""
+        cfg = probe_config()
+        runner = probe.Prober(
+            concurrency=cfg["concurrency"],
+            timeout=cfg["timeout"],
+            min_gap=cfg["min_gap"],
+            max_gap=cfg["max_gap"],
+        )
+        accounts = [acc for _, acc in pairs]
+        results = runner.run(accounts)
+
+        # 结果按输入顺序返回，pairs 也是同一个顺序，用下标对齐
+        rows = []
+        for (row_id, acc), res in zip(pairs, results):
+            rows.append({
+                "id": row_id,
+                "state": res.get("state"),
+                "remain": res.get("remain"),
+                "used": res.get("used"),
+                "size": res.get("size"),
+                "checked_at": res.get("checked_at"),
+                "note": res.get("error") or "",
+            })
+
+        written = store.update_credits(rows)
+        summary = probe.summarize(results)
+        return {
+            "ok": True,
+            "written": written,
+            "summary": summary,
+            "results": [
+                {
+                    "id": row_id,
+                    "uid": acc.uid,
+                    "name": acc.nickname or acc.uid,
+                    "state": res.get("state"),
+                    "remain": res.get("remain"),
+                    "used": res.get("used"),
+                    "size": res.get("size"),
+                    "tier": res.get("tier") or "",
+                    "error": res.get("error") or "",
+                    "latency_ms": res.get("latency_ms") or 0,
+                    "endpoint": res.get("endpoint") or "",
+                }
+                for (row_id, acc), res in zip(pairs, results)
+            ],
+            "accounts": store.list_accounts(limit=500),
+            "stats": store.stats(),
+        }
+
+
+#: 探针默认参数。并发压到 4、请求间隔 200~500ms，是为了不把几十个账号
+#: 同时怼到同一个上游——那是标准的风控触发姿势。
+PROBE_DEFAULTS = {
+    "concurrency": 4,
+    "timeout": 12.0,
+    "min_gap": 0.20,
+    "max_gap": 0.50,
+}
+
+PROBE_CONFIG_PATH = ROOT / "config" / "probe.json"
+
+
+def probe_config() -> dict:
+    """读 config/probe.json，缺项用默认值补齐，坏文件不炸。"""
+    cfg = dict(PROBE_DEFAULTS)
+    try:
+        raw = json.loads(PROBE_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return cfg
+    if not isinstance(raw, dict):
+        return cfg
+    for key, default in PROBE_DEFAULTS.items():
+        value = raw.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            cfg[key] = float(value) if isinstance(default, float) else int(value)
+        except (TypeError, ValueError):
+            pass
+    # 并发上下限：0 或负数会让线程池直接抛异常，开太大又违反风控口径
+    cfg["concurrency"] = max(1, min(16, int(cfg["concurrency"])))
+    cfg["timeout"] = max(3.0, min(60.0, float(cfg["timeout"])))
+    cfg["min_gap"] = max(0.0, float(cfg["min_gap"]))
+    cfg["max_gap"] = max(cfg["min_gap"], float(cfg["max_gap"]))
+    return cfg
 
 
 def _guess_type(path: Path) -> str:

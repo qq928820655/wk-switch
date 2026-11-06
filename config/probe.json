@@ -1,0 +1,6 @@
+{
+  "concurrency": 4,
+  "timeout": 12.0,
+  "min_gap": 0.20,
+  "max_gap": 0.50
+}

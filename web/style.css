@@ -1010,3 +1010,76 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   .lu-row input[type="file"] { flex: none; width: 100%; }
   .lu-row .btn { width: 100%; }
 }
+
+/* ---------- 积分列与校验 ---------- */
+/* 列宽收窄：积分是数字，不需要占别的列那么多地方 */
+.col-credit { width: 96px; }
+
+.credit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* 撑满单元格，进度条才有足够长度——否则它跟着数字宽度走，
+     短余额时看起来像一条下划线 */
+  width: 100%;
+  min-width: 72px;
+}
+.credit-num {
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink-1, #1a1a2e);
+  line-height: 1.1;
+}
+/* 余额低于 10% 标红：这是「快用完了」的信号，不是错误 */
+.credit.low .credit-num { color: var(--bad); }
+.credit-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: #eef0f6;
+  overflow: hidden;
+}
+.credit-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--brand);
+  transition: width .25s ease;
+}
+.credit.low .credit-bar i { background: var(--bad); }
+
+/* 校验结论行：和表格之间留一点呼吸，别贴着表底 */
+.probe-hint {
+  margin-top: 6px;
+}
+.probe-hint.bad { color: var(--bad); }
+
+/* 窄屏下积分列缩到最小，进度条隐藏——只留数字，横向空间不够 */
+@media (max-width: 720px) {
+  .col-credit { width: 72px; }
+  .credit-bar { display: none; }
+  .credit-num { font-size: 12px; }
+}
+
+/* 积分列的失败态：小字不用 pill，避免和左边「状态」列的红胶囊混淆 */
+.credit-fail {
+  font-size: 12px;
+  color: var(--bad);
+  font-weight: 600;
+}
+.credit-skip {
+  font-size: 12px;
+  color: var(--ink-3, #9aa0b4);
+}
+
+/* 窄屏：uid / AT / RT / 更新 这四列是给核对用的，手机上一屏塞不下。
+   收掉它们，把「名称 / 版本 / 状态 / 积分」留在第一屏——积分的意义就是
+   扫一眼知道谁快没额度了，不该为了看它去横向滑动。 */
+@media (max-width: 720px) {
+  #store-table .col-uid,
+  #store-table .col-at,
+  #store-table .col-rt,
+  #store-table .col-upd,
+  #store-table .col-exp { display: none; }
+}

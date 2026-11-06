@@ -30,8 +30,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "accounts.db")
 
-#: 表结构版本。2 = 唯一键从 (name, realm) 改成 (uid, realm)。
-SCHEMA_VERSION = 2
+#: 表结构版本。
+#: 2 = 唯一键从 (name, realm) 改成 (uid, realm)
+#: 3 = 加探针列（积分三元组 / 校验状态 / 校验时间），见 wk/probe.py
+SCHEMA_VERSION = 3
+
+#: 探针状态的中文名。与 wk/probe.py 的 STATE_* 常量一一对应，
+#: 界面上不再自己拼字符串。
+PROBE_LABELS = {
+    "valid": "有效",
+    "invalid": "已失效",
+    "unknown": "未确认",
+    "skipped": "不可校验",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -54,6 +65,15 @@ CREATE TABLE IF NOT EXISTS accounts (
     payload      TEXT,
     created_at   TEXT,
     updated_at   TEXT,
+    -- 探针回填：上游实测值，与 payload 里导入时带的 credits 是两回事。
+    -- 导入的 credits 是来源系统上次拉取的快照，可能是几周前的；这三列只由
+    -- wk/probe.py 写，NULL 表示没查过（不是 0 余额）。
+    credit_remain REAL,
+    credit_used   REAL,
+    credit_size   REAL,
+    credit_state  TEXT,
+    checked_at    INTEGER DEFAULT 0,
+    checked_note  TEXT,
     UNIQUE (uid, realm)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_realm ON accounts(realm);
@@ -79,23 +99,50 @@ def _now() -> str:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """把 v1 的 (name, realm) 唯一键迁到 v2 的 (uid, realm)。
+    """把老库迁到当前结构。
+
+    v1 → v2：唯一键从 (name, realm) 换成 (uid, realm)。
+    v2 → v3：补探针列。SQLite 的 CREATE TABLE IF NOT EXISTS 不会给已有表加列，
+            所以必须显式 ALTER；漏了这一步，老库升级后每次写入都会
+            "no column named credit_remain"。
 
     v1 按名称合并过，信息已经丢了——只能按现有 uid 重新去重。这里保留最新
     一条，其余丢弃，并在 import_log 里留一条迁移记录，避免「怎么少了几条」
     变成无头案。
     """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version >= SCHEMA_VERSION:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+    if version >= SCHEMA_VERSION and cols:
         return
 
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
     if cols and "uid" not in cols:
         conn.execute("DROP TABLE IF EXISTS accounts")
+        cols = set()
 
     conn.executescript(SCHEMA)
 
-    if cols:
+    # ---- v2 → v3：补列 ----
+    # 逐列判断而不是按版本号，是因为有人可能跑过中间版本、也可能手工改过库，
+    # 按实际缺什么补什么最稳。
+    extra_cols = {
+        "credit_remain": "REAL",
+        "credit_used": "REAL",
+        "credit_size": "REAL",
+        "credit_state": "TEXT",
+        "checked_at": "INTEGER DEFAULT 0",
+        "checked_note": "TEXT",
+    }
+    current = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+    for name, decl in extra_cols.items():
+        if name not in current:
+            try:
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {decl}")
+            except sqlite3.Error:
+                # 并发打开时可能被别人先加了；真加不上也别让整个打开失败，
+                # 后面的 upsert 会显式带列，缺列会立刻报出来而不是静默丢数据。
+                pass
+
+    if version < 2 and cols:
         # 老表存在且列齐：按 (uid, realm) 去重，留 updated_at 最新的一条
         try:
             conn.execute("""
@@ -190,7 +237,7 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
             payload = json.dumps(acc.to_dict(), ensure_ascii=False)
 
             row = conn.execute(
-                "SELECT id FROM accounts WHERE uid = ? AND realm = ?",
+                "SELECT id, access_token FROM accounts WHERE uid = ? AND realm = ?",
                 (uid, realm),
             ).fetchone()
 
@@ -209,17 +256,36 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
                 stats["inserted"] += 1
                 action = "inserted"
             else:
-                conn.execute(
-                    """UPDATE accounts SET
-                         name=?, nickname=?, email=?, phone=?, access_token=?, refresh_token=?,
-                         device_token=?, token_state=?, expires_at=?, domain=?, enterprise_id=?,
-                         enabled=?, source=?, payload=?, updated_at=?
-                       WHERE id=?""",
-                    (name, acc.nickname, acc.email, acc.phone,
-                     acc.access_token, acc.refresh_token, acc.device_token, state,
-                     acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
-                     source or acc.source, payload, now, row["id"]),
-                )
+                # token 换了就作废旧的校验结果：同一 uid 重新扫码后拿到的是新
+                # 凭据，旧积分属于上一个 token，留着会让人以为「刚校验过」。
+                # token 没变（重复导入同一份文件）则保留，省一次上游查询。
+                same_token = str(row["access_token"] or "") == str(acc.access_token or "")
+                if same_token:
+                    conn.execute(
+                        """UPDATE accounts SET
+                             name=?, nickname=?, email=?, phone=?, access_token=?, refresh_token=?,
+                             device_token=?, token_state=?, expires_at=?, domain=?, enterprise_id=?,
+                             enabled=?, source=?, payload=?, updated_at=?
+                           WHERE id=?""",
+                        (name, acc.nickname, acc.email, acc.phone,
+                         acc.access_token, acc.refresh_token, acc.device_token, state,
+                         acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
+                         source or acc.source, payload, now, row["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE accounts SET
+                             name=?, nickname=?, email=?, phone=?, access_token=?, refresh_token=?,
+                             device_token=?, token_state=?, expires_at=?, domain=?, enterprise_id=?,
+                             enabled=?, source=?, payload=?, updated_at=?,
+                             credit_remain=NULL, credit_used=NULL, credit_size=NULL,
+                             credit_state=NULL, checked_at=0, checked_note=NULL
+                           WHERE id=?""",
+                        (name, acc.nickname, acc.email, acc.phone,
+                         acc.access_token, acc.refresh_token, acc.device_token, state,
+                         acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
+                         source or acc.source, payload, now, row["id"]),
+                    )
                 stats["updated"] += 1
                 action = "updated"
 
@@ -263,6 +329,11 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500) -> list[di
         state = row["token_state"] or tok.token_state(
             row["access_token"] or "", row["expires_at"] or 0, row["refresh_token"] or ""
         )
+        # 探针列可能是 NULL（没查过）——sqlite3.Row 缺列时也不会报，这里用
+        # keys() 兜一下，兼容升级前的旧库刚打开、ALTER 还没跑到的瞬间。
+        keys = row.keys()
+        credit_state = (row["credit_state"] if "credit_state" in keys else "") or ""
+        checked_at = int((row["checked_at"] if "checked_at" in keys else 0) or 0)
         out.append({
             "id": row["id"],
             "name": row["name"],
@@ -281,6 +352,17 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500) -> list[di
             "source": row["source"] or "",
             "created_at": row["created_at"] or "",
             "updated_at": row["updated_at"] or "",
+            # ---- 探针 ----
+            # None 原样透传：前端要能区分「没查过」和「0」
+            "credit_remain": row["credit_remain"] if "credit_remain" in keys else None,
+            "credit_used": row["credit_used"] if "credit_used" in keys else None,
+            "credit_size": row["credit_size"] if "credit_size" in keys else None,
+            "credit_state": credit_state,
+            "credit_state_label": PROBE_LABELS.get(credit_state, ""),
+            "checked_at": checked_at,
+            "checked": time.strftime("%m-%d %H:%M", time.localtime(checked_at))
+                       if checked_at else "",
+            "checked_note": (row["checked_note"] if "checked_note" in keys else "") or "",
         })
     return out
 
@@ -391,6 +473,67 @@ def rename(row_id: int, new_name: str) -> dict[str, Any]:
             (new_name, _now(), row_id),
         )
     return {"ok": True, "id": row_id, "name": new_name}
+
+
+def load_for_probe(ids: list[int] | None = None, realm: str = "") -> list[tuple[int, Account]]:
+    """取出待校验的账号，带行 id。
+
+    和 load_for_export 的区别是它要回填结果，所以必须知道每一条对应哪一行。
+    ids 为空表示「库里全部」（可按 realm 再筛一层），界面上「校验全部」走这条。
+    """
+    sql = "SELECT id, payload FROM accounts WHERE 1=1"
+    args: list[Any] = []
+    if ids:
+        sql += " AND id IN (%s)" % ",".join("?" * len(ids))
+        args.extend(int(i) for i in ids)
+    if realm in ("cn", "intl"):
+        sql += " AND realm = ?"
+        args.append(realm)
+    sql += " ORDER BY id"
+    out: list[tuple[int, Account]] = []
+    with connect() as conn:
+        for row in conn.execute(sql, args).fetchall():
+            try:
+                data = json.loads(row["payload"] or "{}")
+            except ValueError:
+                continue
+            out.append((int(row["id"]), _account_from_payload(data)))
+    return out
+
+
+def update_credits(results: list[dict[str, Any]]) -> int:
+    """把探针结果写回库。
+
+    results 里每条：{id, state, remain, used, size, tier, checked_at, note}
+
+    remain / used / size 为 None 时写 NULL 而不是 0——界面上「没查过」和
+    「查过了确实是 0」要能分开。这也是为什么这三列不设 DEFAULT 0。
+    """
+    if not results:
+        return 0
+    written = 0
+    with connect() as conn:
+        for item in results:
+            row_id = item.get("id")
+            if row_id is None:
+                continue
+            conn.execute(
+                """UPDATE accounts SET
+                     credit_remain = ?, credit_used = ?, credit_size = ?,
+                     credit_state = ?, checked_at = ?, checked_note = ?
+                   WHERE id = ?""",
+                (
+                    item.get("remain"),
+                    item.get("used"),
+                    item.get("size"),
+                    str(item.get("state") or ""),
+                    int(item.get("checked_at") or 0),
+                    str(item.get("note") or "")[:200] or None,
+                    int(row_id),
+                ),
+            )
+            written += 1
+    return written
 
 
 def delete(ids: list[int]) -> int:

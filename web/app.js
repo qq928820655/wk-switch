@@ -198,7 +198,7 @@ function renderPreview(rows, total) {
       <td>${esc(r.email) || '<span class="hint">—</span>'}</td>
       <td>${r.realm === 'cn' ? '国内' : r.realm === 'intl' ? '国际' : '<span class="hint">—</span>'}</td>
       <td><span class="pill ${STATE_PILL[r.state] || 'mute'}">${esc(r.state_label)}</span></td>
-      <td class="mono">${esc(r.expires) || '—'}</td>
+      <td class="mono col-exp">${esc(r.expires) || '—'}</td>
       <td class="mono">${esc(r.at)}</td>
       <td>${r.rt ? '<span class="pill ok">有</span>' : '<span class="hint">—</span>'}</td>
     </tr>`).join('');
@@ -474,7 +474,7 @@ function renderStoreStats(stats) {
 function renderStoreTable(rows) {
   const body = $('#store-table tbody');
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="10" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
     $('#store-hint').textContent = '';
     return;
   }
@@ -485,12 +485,13 @@ function renderStoreTable(rows) {
       <td class="col-check"><input type="checkbox" class="row-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
       <td><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
       <td><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
-      <td class="mono" title="${esc(r.uid)}">${esc(shortUid(r.uid))}</td>
+      <td class="mono col-uid" title="${esc(r.uid)}">${esc(shortUid(r.uid))}</td>
       <td><span class="pill ${STATE_PILL[r.state] || 'mute'}">${esc(r.state_label)}</span></td>
-      <td class="mono">${esc(r.expires) || '—'}</td>
-      <td class="mono" title="${esc(r.at)}">${esc(r.at)}</td>
-      <td>${r.has_rt ? '<span class="pill ok">有</span>' : '<span class="hint">—</span>'}</td>
-      <td class="mono" title="${esc(r.updated_at)}">${esc(shortTime(r.updated_at))}</td>
+      <td class="col-credit">${creditCell(r)}</td>
+      <td class="mono col-exp">${esc(r.expires) || '—'}</td>
+      <td class="mono col-at" title="${esc(r.at)}">${esc(r.at)}</td>
+      <td class="col-rt">${r.has_rt ? '<span class="pill ok">有</span>' : '<span class="hint">—</span>'}</td>
+      <td class="mono col-upd" title="${esc(r.updated_at)}">${esc(shortTime(r.updated_at))}</td>
       <td class="row-actions">
         <button class="link" data-act="rename">改名</button>
         <button class="link danger" data-act="delete">删除</button>
@@ -498,6 +499,55 @@ function renderStoreTable(rows) {
     </tr>`).join('');
 
   $('#store-hint').textContent = `共 ${rows.length} 条`;
+}
+
+/**
+ * 积分单元格。
+ *
+ * 三种「没有数字」的情况必须分开显示，否则用户会误判：
+ *   没查过（checked_at = 0）→ 「未查」
+ *   查了但上游拒绝      → 「失效」，并把原因挂在 title 上
+ *   查了但网络故障      → 「未确认」，过一次再试
+ * 只有真查到才显示数字，0 也照实显示成 0。
+ */
+function creditCell(r) {
+  const known = typeof r.credit_remain === 'number';
+  if (!r.checked_at && !r.credit_state) {
+    return '<span class="hint">未查</span>';
+  }
+  // 这里不用 pill：左边「状态」列已经是 pill 了，两列都出红胶囊会让人
+  // 分不清是「凭据过期」还是「积分没查到」。小字 + 颜色足够。
+  if (r.credit_state === 'invalid') {
+    return '<span class="credit-fail" title="' + esc(r.checked_note || '登录已过期') + '">失效</span>';
+  }
+  if (r.credit_state === 'skipped') {
+    return '<span class="credit-skip" title="' + esc(r.checked_note || '无法校验') + '">不可查</span>';
+  }
+  if (r.credit_state === 'unknown') {
+    return '<span class="credit-skip" title="' + esc(r.checked_note || '未确认') + '">未确认</span>';
+  }
+  if (!known) {
+    return '<span class="hint">未查</span>';
+  }
+  const remain = Number(r.credit_remain);
+  const size = typeof r.credit_size === 'number' ? Number(r.credit_size) : 0;
+  const pct = size > 0 ? Math.max(0, Math.min(100, (remain / size) * 100)) : 0;
+  const low = size > 0 && pct < 10 ? ' low' : '';
+  const tip = size > 0
+    ? `剩余 ${fmtNum(remain)} / 共 ${fmtNum(size)}（已用 ${fmtNum(r.credit_used || 0)}）\n查询于 ${r.checked}`
+    : `剩余 ${fmtNum(remain)}\n查询于 ${r.checked}`;
+  return `<div class="credit${low}" title="${esc(tip)}">
+      <span class="credit-num">${fmtNum(remain)}</span>
+      ${size > 0 ? `<span class="credit-bar"><i style="width:${pct.toFixed(1)}%"></i></span>` : ''}
+    </div>`;
+}
+
+/** 积分数字：整数不带小数点，小数留两位。 */
+function fmtNum(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  if (Math.abs(n - Math.round(n)) < 0.005) return String(Math.round(n));
+  return n.toFixed(2);
 }
 
 /** 同步「全选」勾选态与底部操作条。 */
@@ -511,6 +561,7 @@ function refreshSelBar() {
   });
 
   $('#sel-count').textContent = picked ? `已选 ${picked} 条` : '未选择';
+  $('#btn-sel-probe').disabled = picked === 0;
   $('#btn-sel-export').disabled = picked === 0;
   $('#btn-sel-delete').disabled = picked === 0;
   $('#btn-sel-clear').disabled = picked === 0;
@@ -533,6 +584,78 @@ function selectAll(on) {
     if (tr) tr.classList.toggle('sel', on);
   });
   refreshSelBar();
+}
+
+/**
+ * 校验选中的账号（向上游只读查询）。
+ *
+ * 只读：服务端只打计费查询接口，不刷新 token、不签到。刷新会把别处正在
+ * 用同一个账号的服务踢下线，所以这件事由用户在原系统里做，不在这里做。
+ */
+async function probeSelected() {
+  const ids = [...storeState.selected];
+  if (!ids.length) {
+    toast('先勾选要校验的账号', true);
+    return;
+  }
+  await runProbe('/api/probe', { ids }, $('#btn-sel-probe'), '校验选中');
+}
+
+/** 校验整库（按当前版本筛选）。账号多时要等一会儿。 */
+async function probeAll() {
+  if (!storeState.rows.length) {
+    toast('账户库是空的', true);
+    return;
+  }
+  const realm = storeState.realm || '';
+  const n = storeState.rows.length;
+  if (!confirm(`向上游逐个查询 ${n} 个账号的积分？\n\n只读操作，不会刷新 token，也不会影响这些账号在别处正在跑的服务。`)) {
+    return;
+  }
+  await runProbe('/api/probe/all', { realm }, $('#btn-probe-all'), '校验全部');
+}
+
+async function runProbe(url, payload, btn, label) {
+  const hint = $('#probe-hint');
+  const old = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '查询中…';
+  }
+  if (hint) {
+    hint.hidden = false;
+    hint.textContent = '正在向上游查询，请稍候…';
+  }
+  try {
+    const data = await api(url, payload);
+    const s = data.summary || {};
+    const parts = [];
+    if (s.valid) parts.push(`有效 ${s.valid}`);
+    if (s.invalid) parts.push(`失效 ${s.invalid}`);
+    if (s.unknown) parts.push(`未确认 ${s.unknown}`);
+    if (s.skipped) parts.push(`不可查 ${s.skipped}`);
+    if (s.with_credit) parts.push(`合计剩余 ${fmtNum(s.remain_total)} 积分`);
+
+    if (hint) {
+      hint.textContent = `已校验 ${data.written || 0} 个账号：${parts.join(' · ') || '无结果'}`;
+      // 全部失败时这行要显眼一点，否则用户以为查成功了
+      hint.classList.toggle('bad', !s.valid && !s.with_credit);
+    }
+    toast(parts.length ? `校验完成：${parts[0]}` : '校验完成');
+    await loadStore();
+  } catch (err) {
+    if (hint) {
+      hint.hidden = false;
+      hint.textContent = '校验失败：' + err.message;
+      hint.classList.add('bad');
+    }
+    toast(err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label || old;
+    }
+  }
 }
 
 /** 导出勾选的行：勾了就只出勾的，不再按版本过滤。 */
@@ -1045,6 +1168,8 @@ function bind() {
     box.addEventListener('change', () => selectAll(box.checked));
   });
 
+  $('#btn-sel-probe').addEventListener('click', probeSelected);
+  $('#btn-probe-all').addEventListener('click', probeAll);
   $('#btn-sel-export').addEventListener('click', exportSelected);
   $('#btn-sel-delete').addEventListener('click', deleteSelected);
   $('#btn-sel-clear').addEventListener('click', () => selectAll(false));

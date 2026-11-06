@@ -178,11 +178,13 @@
         <input type="search" id="store-search" placeholder="搜索名称 / uid / 邮箱">
       </label>
 
+      <button class="btn small" id="btn-probe-all" title="逐个向上游查询积分，只读，不刷新 token">校验全部</button>
     </div>
 
     <div class="sel-bar" id="sel-bar">
       <span class="sel-count" id="sel-count">未选择</span>
       <div class="sel-actions">
+        <button class="btn small" id="btn-sel-probe" disabled>校验选中</button>
         <button class="btn small" id="btn-sel-export" disabled>导出选中</button>
         <button class="btn small danger" id="btn-sel-delete" disabled>删除选中</button>
         <button class="link" id="btn-sel-clear" disabled>取消</button>
@@ -194,14 +196,16 @@
         <thead>
           <tr>
             <th class="col-check"><input type="checkbox" id="store-check-all" title="全选本页"></th>
-            <th>名称</th><th>版本</th><th>uid</th><th>状态</th>
-            <th>到期</th><th>AT</th><th>RT</th><th>更新</th><th></th>
+            <th>名称</th><th>版本</th><th class="col-uid">uid</th><th>状态</th>
+            <th class="col-credit">积分</th>
+            <th class="col-exp">到期</th><th class="col-at">AT</th><th class="col-rt">RT</th><th class="col-upd">更新</th><th></th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
     <p class="hint" id="store-hint"></p>
+    <p class="hint probe-hint" id="probe-hint" hidden></p>
 
     <details class="issues" id="store-history">
       <summary>导入记录 <span class="badge" id="history-count">0</span></summary>

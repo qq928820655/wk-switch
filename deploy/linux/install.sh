@@ -187,6 +187,19 @@ JSON
 }
 JSON
   fi
+
+  # 上游校验的并发与节奏。不写也能跑（代码里有同样的默认值），写上是为了
+  # 让人知道这几个旋钮存在——账号多的时候想调慢一点，改这个文件即可。
+  if [ ! -f "$HOME_DIR/config/probe.json" ]; then
+    cat > "$HOME_DIR/config/probe.json" <<JSON
+{
+  "concurrency": 4,
+  "timeout": 12.0,
+  "min_gap": 0.20,
+  "max_gap": 0.50
+}
+JSON
+  fi
 }
 
 # ---------- 服务进程 ----------

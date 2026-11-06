@@ -274,5 +274,124 @@ class BackupRestoreTests(StoreTestBase):
             store.restore_bytes(b"{}", filename="x.json", mode="wipe")
 
 
+class ProbeColumnTests(StoreTestBase):
+    """探针列（v3）：迁移、回写、与 token 变更的关系。"""
+
+    def test_upgrade_from_v2_adds_columns(self) -> None:
+        """v2 老库打开时自动补探针列。
+
+        漏了这一步，升级后每次写入都会报 "no column named credit_remain"，
+        而且是在用户点保存时才炸，比启动就炸难查得多。
+        """
+        import sqlite3
+
+        # 手搓一个 v2 结构的库（没有探针列）
+        conn = sqlite3.connect(store.DB_PATH)
+        conn.executescript("""
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL, realm TEXT NOT NULL DEFAULT 'intl',
+                name TEXT, nickname TEXT, email TEXT, phone TEXT,
+                access_token TEXT, refresh_token TEXT, device_token TEXT,
+                token_state TEXT, expires_at INTEGER DEFAULT 0,
+                domain TEXT, enterprise_id TEXT, enabled INTEGER DEFAULT 1,
+                source TEXT, payload TEXT, created_at TEXT, updated_at TEXT,
+                UNIQUE (uid, realm)
+            );
+            PRAGMA user_version = 2;
+        """)
+        conn.execute(
+            "INSERT INTO accounts (uid, realm, name, access_token, payload, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            ("u-old", "cn", "老账号", "at-old", "{}", "2026-01-01", "2026-01-01"),
+        )
+        conn.commit()
+        conn.close()
+
+        # 打开即迁移
+        rows = store.list_accounts()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["credit_remain"])
+        self.assertEqual(rows[0]["credit_state"], "")
+
+        # 迁移后能正常回写
+        written = store.update_credits([{
+            "id": rows[0]["id"], "state": "valid", "remain": 12.5,
+            "used": 7.5, "size": 20.0, "checked_at": 1790000000, "note": "",
+        }])
+        self.assertEqual(written, 1)
+        row = store.list_accounts()[0]
+        self.assertAlmostEqual(row["credit_remain"], 12.5)
+        self.assertEqual(row["credit_state"], "valid")
+        self.assertEqual(row["credit_state_label"], "有效")
+        self.assertTrue(row["checked"])
+
+    def test_update_credits_keeps_none_distinct_from_zero(self) -> None:
+        """没查到写 NULL，查到 0 写 0。两者在界面上意思相反。"""
+        store.upsert([self.acc("u-a", "甲"), self.acc("u-b", "乙", token="at-2")])
+        rows = {r["uid"]: r for r in store.list_accounts()}
+        store.update_credits([
+            {"id": rows["u-a"]["id"], "state": "valid", "remain": 0,
+             "used": 100, "size": 100, "checked_at": 1790000000},
+            {"id": rows["u-b"]["id"], "state": "unknown", "remain": None,
+             "used": None, "size": None, "checked_at": 1790000000,
+             "note": "连接超时"},
+        ])
+        after = {r["uid"]: r for r in store.list_accounts()}
+        self.assertEqual(after["u-a"]["credit_remain"], 0)
+        self.assertIsNone(after["u-b"]["credit_remain"])
+        self.assertEqual(after["u-b"]["credit_state"], "unknown")
+        self.assertEqual(after["u-b"]["checked_note"], "连接超时")
+
+    def test_token_change_clears_stale_credit(self) -> None:
+        """同一 uid 换了 token，旧积分必须作废。
+
+        留着会显示成「刚校验过」，但那个余额属于已经被替换掉的凭据。
+        """
+        store.upsert([self.acc("u-x", "某号", token="at-old")])
+        row = store.list_accounts()[0]
+        store.update_credits([{
+            "id": row["id"], "state": "valid", "remain": 88.0,
+            "used": 12.0, "size": 100.0, "checked_at": 1790000000,
+        }])
+        self.assertAlmostEqual(store.list_accounts()[0]["credit_remain"], 88.0)
+
+        # 换 token 重新导入
+        store.upsert([self.acc("u-x", "某号", token="at-new")])
+        after = store.list_accounts()[0]
+        self.assertIsNone(after["credit_remain"], "换 token 后旧积分应清空")
+        self.assertEqual(after["credit_state"], "")
+        self.assertEqual(after["checked_at"], 0)
+
+    def test_same_token_keeps_credit(self) -> None:
+        """重复导入同一份文件时保留已查到的积分，别白花一次上游查询。"""
+        store.upsert([self.acc("u-y", "某号", token="at-same")])
+        row = store.list_accounts()[0]
+        store.update_credits([{
+            "id": row["id"], "state": "valid", "remain": 42.0,
+            "used": 8.0, "size": 50.0, "checked_at": 1790000000,
+        }])
+        store.upsert([self.acc("u-y", "某号", token="at-same")])
+        self.assertAlmostEqual(store.list_accounts()[0]["credit_remain"], 42.0)
+
+    def test_load_for_probe_returns_tokens(self) -> None:
+        """探测要真 token，不能拿脱敏后的列表去发请求。"""
+        store.upsert([self.acc("u-p", "甲", token="at-full-token"),
+                      self.acc("u-q", "乙", realm="intl", token="at-intl")])
+        pairs = store.load_for_probe()
+        self.assertEqual(len(pairs), 2)
+        tokens = {acc.access_token for _, acc in pairs}
+        self.assertEqual(tokens, {"at-full-token", "at-intl"})
+
+        # 按 id 取与按 realm 筛都要能用
+        only = store.load_for_probe(realm="intl")
+        self.assertEqual(len(only), 1)
+        self.assertEqual(only[0][1].realm, "intl")
+
+        by_id = store.load_for_probe(ids=[pairs[0][0]])
+        self.assertEqual(len(by_id), 1)
+        self.assertEqual(by_id[0][0], pairs[0][0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

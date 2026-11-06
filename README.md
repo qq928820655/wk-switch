@@ -13,6 +13,7 @@
 - **备份还原**：整库打包 zip（`accounts.db` + `accounts.json`），支持合并与覆盖两种还原
 - **一键升级**：页面「升级」标签页检查制品库最新版，下载、备份、替换代码、重启；仅当制品库版本更高时标签页才标红点
 - **导出命名可辨**：文件名统一为 `<项目名>-<版本>-<时间戳>.<扩展名>`，例如 `workbuddy-manager-cn-20261103-125433.zip`，下载一堆包不会互相覆盖
+- **上游校验与积分**：选中账号后可向上游只读查询，判定凭据是否仍然有效并取回积分余额。**不刷新 token**——refresh token rotation 会让别处正在用同一账号的服务掉线，详见下文
 - **访问口令**：登录页口令换会话 cookie，默认 `qq928820655`（改 `config/auth.json`）
 
 ## 快速开始
@@ -42,6 +43,56 @@ python main.py --version    # 版本号
 
 分版本导出时文件名插版本段：`workbuddy-manager-cn-20261103-125433.zip`、`workbuddy-manager-intl-20261103-125433.zip`。
 本地库备份为 `wk-switch-backup-20261103-125433.zip`。
+
+## 上游校验与积分
+
+本地能看到的是 `expiresAt` 和 JWT 里的 `exp`——那只是签名里写的过期时间。服务端有没有封号、token 有没有被换掉、还剩多少积分，只能拿这个 token 去问一次上游。
+
+账户库里有「校验全部」和选中后的「校验选中」。跑完会在「积分」列显示余额与进度条，并把结论写回库里。
+
+**只读边界**
+
+| 会做 | 不会做 |
+|---|---|
+| `POST /billing/meter/get-user-resource-summary` | 不调用 `/v2/plugin/auth/token/refresh` |
+| `POST /billing/meter/get-user-resource` | 不签到、不触发任何写操作 |
+| `POST /v2/billing/meter/get-enterprise-user-usage`（静态 Key / 企业号） | 不改上游任何状态 |
+
+这条不是为了保守。上游用 refresh token rotation：每次 refresh 签发新 RT，旧 RT 当场作废。本工具持有的是从别处导入的副本，一旦拿 `refresh_token` 去换 `access_token`，真正管辖这个账号的那套系统（hub / manager / panel）手里的 RT 就废了，它下次刷新直接 401，正在服务的账号掉线。所以遇到 401 只记「失效」，不续命。要续期请到原系统里做。
+
+**判定口径**
+
+| 结论 | 触发条件 | 含义 |
+|---|---|---|
+| 有效 | HTTP 200 且 `code=0` | 上游认这个 token |
+| 已失效 | 401 / 403，或 `code≠0` 且提示登录过期 | 需要重新登录 |
+| 未确认 | 网络故障、超时、5xx、所有计费前缀都 404 | 不下结论，可再试 |
+| 不可校验 | 加密信封 token、空 token | 本地就能判定，不发请求 |
+
+「未确认」和「已失效」必须分开：把网络故障显示成封号，会让人去删一个好账号。
+
+**并发与节奏**
+
+默认 4 并发、每个请求前随机停 200~500ms。一批几十个账号同时打同一个上游是标准的风控触发姿势，这两个值都能在 `config/probe.json` 里调：
+
+```json
+{
+  "concurrency": 4,
+  "timeout": 12.0,
+  "min_gap": 0.20,
+  "max_gap": 0.50
+}
+```
+
+`concurrency` 会被夹在 1~16，`timeout` 夹在 3~60 秒。代理按账号自己的 `proxy` 字段走；没配就显式直连，不读 `HTTPS_PROXY`——批量校验时环境变量会把该走代理和不该走代理的账号混在一起。
+
+**会不会影响在用的服务**
+
+- 本机端口：不影响。校验是主动出站 TCP，不占本地端口，和 8765 不冲突
+- 上游账号：只读查询不掉线。唯一会掉线的是刷新 token，本工具不做
+- 频率：共用该账号的 rate limit。并发压到 4、间隔 200ms 以上就是为了不撞这条线
+
+接口路径、请求头、响应字段名照抄两个已在生产跑的项目：`ardeyouxipianyi/workbuddy2api-hub`（`wb_accounts.py:388-398`、`3081-3236`）和 `L0NE-6/WorkBuddy-Daily`（`credits_report.py:56-70`、`207-216`），没有自己发明。
 
 ## 部署
 

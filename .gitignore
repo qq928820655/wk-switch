@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
 data/
-config/
+# 配置里有口令，整体忽略；探针配置只是默认值，单独放出来当示例
+config/*
+!config/probe.json
 backups/
 dist/
 *.db

@@ -142,6 +142,17 @@ class Account:
     product: str = ""
     credits: int = 0
     tier: str = ""
+    # ---- 探针回填（见 wk/probe.py）------------------------------------
+    #: 积分三元组。用 float 是因为上游给的是 12.5 这种小数。
+    #: None 表示「没查到」，0 表示「查到了，就是 0」——两者不能混。
+    credit_remain: float | None = None
+    credit_used: float | None = None
+    credit_size: float | None = None
+    #: valid / invalid / unknown / skipped，由 probe 模块定义
+    credit_state: str = ""
+    #: 上次探测时间戳（秒）与失败原因，都只存探针写的，不跟导入字段混
+    checked_at: int = 0
+    checked_note: str = ""
     created_at: int = 0
     api_key: bool = False
     tasks_enabled: bool = True
