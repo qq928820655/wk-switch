@@ -68,9 +68,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # 直接从 raw.githubusercontent.com 拉这个脚本时占位符不会被替换，必须能自己认出来。
 resolve_repo() {
   local src
-  # 真实 owner/name 一定含斜杠；打包前的 __REPO__ 不含，据此识别"没被替换"。
-  # 用含斜杠判断而不是比对占位串，是因为打包脚本会全局替换 __REPO__，
-  # 一旦这段判断里出现该字面量，替换后逻辑本身就坏了。
+  # 真实 owner/name 一定含斜杠；打包前的占位串不含，据此识别"没被替换"。
+  # 用含斜杠判断而不是比对那个占位串本身，是因为打包脚本会全局替换它，
+  # 一旦这段判断里出现该字面量，替换后逻辑本身就坏了——注释里写全名
+  # 同样会被替换成一段读不通的话，所以这里只描述形状，不抄字面量。
   if [ -n "${REPO:-}" ] && [ "${REPO#*/}" != "$REPO" ]; then printf '%s' "$REPO"; return; fi
   if [ -n "${WK_REPO:-}" ]; then printf '%s' "$WK_REPO"; return; fi
   if [ -n "${REPO_PLACEHOLDER:-}" ] && [ "${REPO_PLACEHOLDER#*/}" != "$REPO_PLACEHOLDER" ]; then
