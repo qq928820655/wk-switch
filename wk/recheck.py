@@ -29,17 +29,29 @@
 离线复检虽然不经过池子，但一批被封号同时从同一台机器打出去，特征一样。
 所以：号与号之间固定间隔（默认 3 秒），并发度固定为 1，不给开关。
 
-## 出口 IP
+## 出口 IP：三种模式
 
-`--proxy` 一路可选。配了 mihomo 就每号换一个节点——同一个出口 IP 是当初
-触发风控的原因之一（README 5.1：同出口 IP 紧接连开，靠后的全挂），复检时
-继续用同一个 IP 敲门，等于告诉上游「还是我」。
+同一个出口 IP 是当初触发风控的原因之一（README 5.1：同出口 IP 紧接连开，
+靠后的全挂），复检时继续用同一个 IP 敲门，等于告诉上游「还是我」。但反过来
+也不是越散越好——排查看的是「封的是号还是 IP」，那就得控住变量。所以出口
+策略做成三档，由 `exit_mode` 选：
+
+| 值 | 行为 | 什么时候用 |
+|----|------|-----------|
+| `random` | 每个号从可用 mihomo 节点里随机挑一个 | 默认。尽量不撞 IP |
+| `same` | 所有号固定同一个出口，取 `exit_pin` | 验证「这个 IP 干净」，只测号本身 |
+| `custom` | 走 `exit_custom` 里手填的地址，按号顺序轮换 | 手上有一套别家的代理，或要指定地区 |
+
+`same` 且 `exit_pin` 为空时不下发代理，交给账号自带的 `proxy`，没有就直连。
+`custom` 的地址只认 http/https：urllib 的 ProxyHandler 不支持 socks5，收
+socks 进来只会在运行时抛错，所以在解析阶段就剔掉。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import threading
 import time
@@ -74,6 +86,18 @@ TRACK_LABELS = {
 #: 这里只是转出来给调用方用，避免两处各写一份然后慢慢漂移。
 BANNED_HINTS = store.BANNED_HINTS
 
+#: 出口策略。顺序就是界面上的排列顺序。
+EXIT_SAME = "same"
+EXIT_RANDOM = "random"
+EXIT_CUSTOM = "custom"
+EXIT_MODES = (EXIT_SAME, EXIT_RANDOM, EXIT_CUSTOM)
+
+EXIT_LABELS = {
+    EXIT_SAME: "同一出口",
+    EXIT_RANDOM: "随机出口",
+    EXIT_CUSTOM: "自定义出口",
+}
+
 DEFAULTS: dict[str, Any] = {
     #: 总开关。关掉后复检接口直接返回「未开启」，不做任何网络动作。
     "enabled": False,
@@ -83,7 +107,14 @@ DEFAULTS: dict[str, Any] = {
     "gap_seconds": 3.0,
     #: 单次对话请求超时。上游冷启动偶尔要 20 秒以上。
     "timeout": 25.0,
-    #: 是否按号轮换出口节点。
+    #: 出口策略：random / same / custom。见模块顶部那张表。
+    "exit_mode": "random",
+    #: same 模式固定走这个出口。空 = 不下发代理（账号自带优先，其次直连）。
+    "exit_pin": "",
+    #: custom 模式的地址表，一行一个，支持 http://host:port 或裸 host:port。
+    "exit_custom": "",
+    #: 旧字段，只为读老配置文件保留。真正的行为由 exit_mode 决定，
+    #: 保存时会跟着 exit_mode 一起写回，方便还在看这个字段的外部脚本。
     "rotate_proxy": True,
     #: 一轮最多复检几个号。名单上百个时，一轮敲太久没有意义，
     #: 而且请求越多越容易再次触发风控。
@@ -130,7 +161,19 @@ def _coerce(cfg: dict) -> dict:
     - batch_limit 太大，一轮里敲门次数过多，同样是在堆特征。
     """
     cfg["enabled"] = bool(cfg.get("enabled"))
-    cfg["rotate_proxy"] = bool(cfg.get("rotate_proxy"))
+    mode = str(cfg.get("exit_mode") or "").strip().lower()
+    if mode not in EXIT_MODES:
+        # 老配置文件只有 rotate_proxy：按它的值推一档，别让升级把设置清成默认
+        mode = EXIT_RANDOM if cfg.get("rotate_proxy", True) else EXIT_SAME
+    cfg["exit_mode"] = mode
+    # rotate_proxy 是派生字段，写回时跟 exit_mode 保持一致
+    cfg["rotate_proxy"] = mode == EXIT_RANDOM
+    cfg["exit_pin"] = normalize_url(cfg.get("exit_pin"))
+    custom = cfg.get("exit_custom")
+    if isinstance(custom, (list, tuple)):
+        # 允许前端直接传数组，存成一行一个
+        custom = "\n".join(str(x) for x in custom)
+    cfg["exit_custom"] = str(custom or "").strip()
     try:
         cfg["min_interval"] = max(600, int(cfg.get("min_interval") or DEFAULTS["min_interval"]))
     except (TypeError, ValueError):
@@ -249,6 +292,56 @@ def _proxy_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
+def normalize_url(value: Any) -> str:
+    """把用户填的一个地址收拾成 `http://host:port`。
+
+    容忍三种常见写法：`http://1.2.3.4:8080`、`1.2.3.4:8080`、`1.2.3.4:8080/`。
+    只放行 http/https——urllib 的 ProxyHandler 收到 socks5 会直接抛
+    `unknown url type`，与其运行时炸不如在这里返回空串。
+    其他协议、空值、含空白的串一律返回空串，让调用方走「没配」的分支。
+    """
+    text = str(value or "").strip()
+    if not text or any(ch.isspace() for ch in text):
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https"):
+        return ""
+    if not parts.hostname:
+        return ""
+    try:
+        port = parts.port
+    except ValueError:      # 端口不是数字
+        return ""
+    if not port or not (0 < port < 65536):
+        return ""
+    return f"{parts.scheme}://{parts.hostname}:{port}"
+
+
+def parse_urls(spec: Any) -> list[str]:
+    """自定义出口地址表 → 去重保序的 URL 列表。
+
+    分隔符吃逗号、分号、空格、换行——界面上是 textarea，用户会怎么排就怎么吃。
+    """
+    if isinstance(spec, (list, tuple)):
+        chunks = [str(x) for x in spec]
+    else:
+        text = str(spec or "").replace(",", "\n").replace(";", "\n").replace(" ", "\n")
+        chunks = text.splitlines()
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        url = normalize_url(chunk)
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out[:64]
+
+
 def _opener(proxy_url: str):
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
@@ -283,6 +376,18 @@ def probe_exit(proxy_url: str, probe_url: str, timeout: float = 10.0) -> dict:
         }
 
 
+def probe_urls(urls: Iterable[str], probe_url: str, timeout: float = 10.0) -> list[dict]:
+    """并发探一批出口地址。并发 8：十个地址串行、每个超时 10 秒会像卡死。"""
+    targets = [u for u in urls if u]
+    if not targets:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(8, len(targets)),
+                            thread_name_prefix="wk-exit") as pool:
+        return list(pool.map(lambda u: probe_exit(u, probe_url, timeout), targets))
+
+
 def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
     """扫一遍配置里的 mihomo 端口，返回可用节点。
 
@@ -309,16 +414,7 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
         return {"host": mihomo["host"], "ports": [], "probed": True,
                 "nodes": [], "ok_count": 0}
 
-    # 并发 8：十个端口串行、每个超时 10 秒，最坏要 100 秒，按钮点下去像卡死。
-    # 并发度按端口数封顶，不会把本机连接表打满。
-    from concurrent.futures import ThreadPoolExecutor
-
-    def probe(url: str) -> dict:
-        return probe_exit(url, mihomo["probe_url"], mihomo["timeout"])
-
-    with ThreadPoolExecutor(max_workers=min(8, len(urls)),
-                            thread_name_prefix="wk-node") as pool:
-        nodes = list(pool.map(probe, urls))
+    nodes = probe_urls(urls, mihomo["probe_url"], mihomo["timeout"])
 
     return {
         "host": mihomo["host"],
@@ -329,12 +425,54 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
     }
 
 
-def _pick_proxy(nodes: list[dict], index: int) -> str:
-    """按号轮换节点。节点不够就循环，一个都没通就直连。"""
-    usable = [n["url"] for n in nodes if n.get("ok")]
+def plan_exit(cfg: dict, nodes: list[dict], index: int,
+              rng: Any = None, ips: dict | None = None) -> dict:
+    """决定第 `index` 个号从哪个出口出去。
+
+    返回 {mode, mode_label, proxy, exit_ip, label}：
+      proxy     交给 urllib 的代理串，空串表示不下发（账号自带优先，其次直连）
+      exit_ip   已知的出口 IP，不知道就空串
+      label     界面上显示的一行说明
+
+    三档的分支顺序刻意这样排：custom 表为空时退化成 same，same 没 pin 时退化成
+    「节点里取第一个」，都没节点就直连。任何时候都不返回半截状态。
+    """
+    mode = str(cfg.get("exit_mode") or EXIT_RANDOM)
+    if mode not in EXIT_MODES:
+        mode = EXIT_RANDOM
+    lookup = dict(ips or {})
+    for node in nodes or []:
+        if node.get("ok") and node.get("exit_ip"):
+            lookup.setdefault(node["url"], node["exit_ip"])
+    usable = [n["url"] for n in (nodes or []) if n.get("ok")]
+
+    if mode == EXIT_CUSTOM:
+        urls = parse_urls(cfg.get("exit_custom"))
+        if urls:
+            url = urls[index % len(urls)]
+            return {"mode": mode, "mode_label": EXIT_LABELS[mode], "proxy": url,
+                    "exit_ip": lookup.get(url, ""), "label": url}
+        mode = EXIT_SAME    # 表是空的，按同一出口处理
+
+    if mode == EXIT_SAME:
+        pin = normalize_url(cfg.get("exit_pin"))
+        if pin:
+            return {"mode": mode, "mode_label": EXIT_LABELS[mode], "proxy": pin,
+                    "exit_ip": lookup.get(pin, ""), "label": pin}
+        if usable:
+            url = usable[0]
+            return {"mode": mode, "mode_label": EXIT_LABELS[mode], "proxy": url,
+                    "exit_ip": lookup.get(url, ""), "label": f"{url}（节点第一项）"}
+        return {"mode": mode, "mode_label": EXIT_LABELS[mode], "proxy": "",
+                "exit_ip": "", "label": "直连 / 账号自带"}
+
     if not usable:
-        return ""
-    return usable[index % len(usable)]
+        return {"mode": mode, "mode_label": EXIT_LABELS[mode], "proxy": "",
+                "exit_ip": "", "label": "直连（没有可用节点）"}
+    picker = rng or random
+    url = picker.choice(usable)
+    return {"mode": mode, "mode_label": EXIT_LABELS[mode], "proxy": url,
+            "exit_ip": lookup.get(url, ""), "label": url}
 
 
 # ------------------------------------------------------------------ 名单判定
@@ -352,28 +490,70 @@ def account_banned_hint(acc: Account) -> str:
 class Runner:
     """串行复检器。并发度固定 1，没有开关（理由见模块顶部）。"""
 
-    def __init__(self, cfg: dict | None = None):
+    def __init__(self, cfg: dict | None = None, rng: Any = None):
         self.cfg = cfg or load_config()
         self.nodes: list[dict] = []
+        #: url → 出口 IP。mihomo 节点由 discover_nodes 带回，自定义地址现探。
+        self._ips: dict[str, str] = {}
+        self._rng = rng
 
     def _nodes(self) -> list[dict]:
-        if not self.cfg["mihomo"]["enabled"] or not self.cfg["rotate_proxy"]:
+        if not self.cfg["mihomo"]["enabled"]:
             return []
         if not self.nodes:
             self.nodes = discover_nodes(self.cfg, probe_now=True)["nodes"]
+            for node in self.nodes:
+                if node.get("ok") and node.get("exit_ip"):
+                    self._ips[node["url"]] = node["exit_ip"]
         return self.nodes
+
+    def _warm_exits(self) -> None:
+        """给「还不知道出口 IP」的地址补探一次。
+
+        为什么要探：复检结果里要写「这个号从哪个 IP 出去的」。用户切到同一
+        出口，多半就是在验「IP 干净但号被封」；切到自定义出口，是在对照几个
+        出口谁通。不给 IP，这两条结论都没法自己核对。
+
+        random 模式的 IP 由 discover_nodes 带回，这里不重复探。
+        """
+        mode = self.cfg.get("exit_mode")
+        if mode == EXIT_CUSTOM:
+            candidates = parse_urls(self.cfg.get("exit_custom"))
+        elif mode == EXIT_SAME:
+            pin = normalize_url(self.cfg.get("exit_pin"))
+            candidates = [pin] if pin else []
+        else:
+            candidates = []
+        urls = [u for u in candidates if u not in self._ips]
+        if not urls:
+            return
+        for node in probe_urls(urls, self.cfg["mihomo"]["probe_url"],
+                               self.cfg["mihomo"]["timeout"]):
+            # 探不通也记一笔空串，避免同一批地址在下一轮重复探测
+            self._ips[node["url"]] = node.get("exit_ip") or ""
+
+    def _plan(self, index: int) -> dict:
+        mode = self.cfg.get("exit_mode")
+        # 出口已经钉死（custom 有表 / same 有 pin）时不去扫 mihomo 端口：
+        # 扫一遍是十来个网络请求，白花几十秒，结果还用不上。
+        pinned = bool(normalize_url(self.cfg.get("exit_pin")))
+        if mode == EXIT_CUSTOM or (mode == EXIT_SAME and pinned):
+            nodes: list[dict] = []
+        else:
+            nodes = self._nodes()
+        return plan_exit(self.cfg, nodes, index, rng=self._rng, ips=self._ips)
 
     def run(self, pairs: Iterable[tuple[int, Account]], force: bool = False,
             on_result: Callable[[int, Account, dict], None] | None = None) -> list[dict]:
         """跑一轮。pairs 是 [(行 id, Account)]。
 
         返回值每项：{id, verdict, detail, raw, status, endpoint, latency_ms,
-                     proxy, checked_at, skipped}
+                     proxy, proxy_ip, exit_mode, checked_at, skipped}
 
         `force=True` 跳过最小间隔检查（界面上「立即复检」按钮）。
         """
         items = list(pairs)[: self.cfg["batch_limit"]]
-        nodes = self._nodes()
+        self._warm_exits()
         now = int(time.time())
         results: list[dict] = []
 
@@ -387,7 +567,8 @@ class Runner:
                         "id": row_id, "verdict": "skipped", "skipped": True,
                         "detail": f"距上次复检不足 {self.cfg['min_interval'] // 60} 分钟（还差 {left} 分）",
                         "raw": "", "status": 0, "endpoint": "", "latency_ms": 0,
-                        "proxy": "", "checked_at": now,
+                        "proxy": "", "proxy_ip": "", "exit_mode": self.cfg["exit_mode"],
+                        "checked_at": now,
                     })
                     if on_result:
                         on_result(row_id, acc, results[-1])
@@ -397,8 +578,8 @@ class Runner:
             if index:
                 time.sleep(self.cfg["gap_seconds"])
 
-            proxy = _pick_proxy(nodes, index)
-            res = probe.chat_probe(acc, timeout=self.cfg["timeout"], proxy=proxy)
+            plan = self._plan(index)
+            res = probe.chat_probe(acc, timeout=self.cfg["timeout"], proxy=plan["proxy"])
             item = {
                 "id": row_id,
                 "verdict": res["verdict"],
@@ -408,7 +589,9 @@ class Runner:
                 "status": res["status"],
                 "endpoint": res["endpoint"],
                 "latency_ms": res["latency_ms"],
-                "proxy": proxy,
+                "proxy": plan["proxy"],
+                "proxy_ip": plan["exit_ip"],
+                "exit_mode": self.cfg["exit_mode"],
                 "checked_at": int(time.time()),
             }
             results.append(item)

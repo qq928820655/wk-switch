@@ -359,11 +359,6 @@
         <span class="rc-box"></span>
         <span class="rc-text"><b>每天自动复检</b><small>服务跑着就到点自己敲门，不用挂计划任务</small></span>
       </label>
-      <label class="rc-switch">
-        <input type="checkbox" id="rc-rotate">
-        <span class="rc-box"></span>
-        <span class="rc-text"><b>按号轮换出口节点</b><small>每个号走不同 mihomo 端口，别用同一个 IP 重复敲门</small></span>
-      </label>
     </div>
 
     <div class="rc-grid">
@@ -392,6 +387,44 @@
     <div class="export-bar">
       <button class="btn primary" id="btn-rc-save">保存设置</button>
       <span class="hint" id="rc-save-hint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>复检出口</h2>
+      <span class="hint">定死或打散出口 IP：同一个 IP 连着敲门，正是当初被封的常见原因</span>
+    </div>
+
+    <div class="seg rc-exit-seg" id="rc-exit-seg">
+      <label><input type="radio" name="rc-exit" value="same"><span>同一出口</span></label>
+      <label><input type="radio" name="rc-exit" value="random" checked><span>随机出口</span></label>
+      <label><input type="radio" name="rc-exit" value="custom"><span>自定义出口</span></label>
+    </div>
+
+    <p class="hint rc-exit-tip" id="rc-exit-tip"></p>
+
+    <div class="rc-exit-pane" data-exit="same" hidden>
+      <div class="rc-grid">
+        <label class="field">
+          <span>固定出口地址</span>
+          <input type="text" id="rc-pin" placeholder="http://127.0.0.1:7890" spellcheck="false">
+        </label>
+      </div>
+      <p class="hint">留空不下发代理：账号自带 proxy 的用自己的，剩下的直连</p>
+    </div>
+
+    <div class="rc-exit-pane" data-exit="custom" hidden>
+      <label class="field rc-wide">
+        <span>出口地址（一行一个，按号顺序轮换）</span>
+        <textarea id="rc-custom" rows="3" spellcheck="false"
+          placeholder="http://10.0.0.5:7891&#10;http://10.0.0.5:7892"></textarea>
+      </label>
+      <div class="export-bar">
+        <button class="btn small" id="btn-rc-test-custom">测试这些地址</button>
+        <span class="hint" id="rc-custom-hint">只认 http / https，socks5 不走这里</span>
+      </div>
+      <div class="node-list" id="rc-custom-nodes"></div>
     </div>
   </section>
 

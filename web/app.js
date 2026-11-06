@@ -1061,6 +1061,13 @@ async function saveSource() {
 const RECHECK_PILL = { banned: 'bad', pending: 'warn', revived: 'ok', auth: 'mute' };
 const RECHECK_TEXT = { banned: '封号中', pending: '待复检', revived: '已解封', auth: '凭据失效' };
 
+/* 三档出口策略。文案要能回答「我该选哪个」，光写名字等于没说。 */
+const EXIT_TIPS = {
+  same: '所有号从同一个出口出去。用来验证封的是号还是 IP：同一个 IP 下还有号能通，说明封在账号层。',
+  random: '每个号从上面检测到的可用节点里随机挑一个。IP 不撞车，也不成规律。',
+  custom: '按表里的顺序逐号轮换。手上有一套别家代理，或要指定地区时用这档。',
+};
+
 const recheckState = {
   cfg: null, rows: [], nodes: [], track: 'banned', q: '',
   selected: new Set(), running: false,
@@ -1091,7 +1098,12 @@ async function loadRecheckRows() {
 function fillRecheckForm(cfg, disc) {
   $('#rc-enabled').checked = !!cfg.enabled;
   $('#rc-auto').checked = !!cfg.auto;
-  $('#rc-rotate').checked = !!cfg.rotate_proxy;
+  const mode = EXIT_TIPS[cfg.exit_mode] ? cfg.exit_mode : 'random';
+  const radio = document.querySelector(`input[name="rc-exit"][value="${mode}"]`);
+  if (radio) radio.checked = true;
+  applyExitMode(mode);
+  $('#rc-pin').value = cfg.exit_pin || '';
+  $('#rc-custom').value = cfg.exit_custom || '';
   // 秒 → 分钟：库里存秒，界面上写分钟更好懂
   $('#rc-min-interval').value = Math.round((cfg.min_interval || 0) / 60);
   $('#rc-batch').value = cfg.batch_limit;
@@ -1109,13 +1121,41 @@ function fillRecheckForm(cfg, disc) {
   }
 }
 
+/* 切档：只显示当前这档要填的东西。三档同时摊开会让人以为都得填。 */
+function applyExitMode(mode) {
+  const pick = EXIT_TIPS[mode] ? mode : 'random';
+  document.querySelectorAll('.rc-exit-pane').forEach((pane) => {
+    pane.hidden = pane.dataset.exit !== pick;
+  });
+  const tip = $('#rc-exit-tip');
+  if (tip) tip.textContent = EXIT_TIPS[pick];
+}
+
+function currentExitMode() {
+  const on = document.querySelector('input[name="rc-exit"]:checked');
+  return on ? on.value : 'random';
+}
+
 function renderNodes(nodes, probed) {
   const box = $('#rc-nodes');
   if (!nodes.length) {
     box.innerHTML = '<p class="hint">没有配置端口</p>';
     return;
   }
-  box.innerHTML = nodes.map((n) => {
+  box.innerHTML = nodeRows(nodes, probed);
+}
+
+function renderCustomNodes(nodes) {
+  const box = $('#rc-custom-nodes');
+  box.innerHTML = nodes.length
+    ? nodeRows(nodes, true)
+    : '<p class="hint">没有可测的地址</p>';
+}
+
+/* 节点卡片：地址 + 出口 IP + 延迟。mihomo 和自定义出口共用这一份渲染，
+   两边显示不一致的话，用户会以为是两套不同的东西。 */
+function nodeRows(nodes, probed) {
+  return nodes.map((n) => {
     const label = n.url.replace(/^https?:\/\//, '');
     if (!probed) {
       return `<div class="node"><span class="node-url" title="${esc(label)}">${esc(label)}</span>
@@ -1192,7 +1232,9 @@ async function saveRecheckCfg() {
   const cfg = {
     enabled: $('#rc-enabled').checked,
     auto: $('#rc-auto').checked,
-    rotate_proxy: $('#rc-rotate').checked,
+    exit_mode: currentExitMode(),
+    exit_pin: $('#rc-pin').value.trim(),
+    exit_custom: $('#rc-custom').value.trim(),
     // 分钟 → 秒。后端会把小于 10 分钟的值钳回 600 秒，这里不用重复校验。
     min_interval: Math.max(10, Number($('#rc-min-interval').value) || 360) * 60,
     batch_limit: Number($('#rc-batch').value) || 20,
@@ -1235,6 +1277,27 @@ async function detectNodes() {
   }
 }
 
+async function detectCustom() {
+  const btn = $('#btn-rc-test-custom');
+  const urls = $('#rc-custom').value.trim();
+  btn.disabled = true;
+  $('#rc-custom-hint').textContent = '正在检测…';
+  try {
+    const data = await api('/api/recheck/nodes', { custom: urls });
+    const nodes = data.custom_nodes || [];
+    if (!nodes.length) {
+      $('#rc-custom-hint').textContent = '没有合法地址：一行一个 http://host:port，socks5 不收';
+      renderCustomNodes([]);
+      return;
+    }
+    $('#rc-custom-hint').textContent =
+      `可用 ${data.custom_ok} / ${nodes.length}｜出口 IP 见每行右侧`;
+    renderCustomNodes(nodes);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function runRecheck(force, ids) {
   if (recheckState.running) return;
   const cfg = recheckState.cfg;
@@ -1262,7 +1325,14 @@ async function runRecheck(force, ids) {
       `未确认 ${s.unknown || 0}`,
     ];
     if (s.skipped) bits.push(`跳过 ${s.skipped}（未到间隔）`);
-    out.textContent = `本轮 ${data.written} 个：` + bits.join(' · ');
+    // 出口 IP 一起报：判断「封的是号还是 IP」全靠这一行，翻进去看列表是看不出来的
+    const ips = [...new Set((data.results || []).map((r) => r.proxy_ip).filter(Boolean))];
+    let line = `本轮 ${data.written} 个：` + bits.join(' · ');
+    if (ips.length) {
+      const head = ips.slice(0, 4).join(' / ');
+      line += ` ｜ 出口 ${head}${ips.length > 4 ? ` 等 ${ips.length} 个` : ''}`;
+    }
+    out.textContent = line;
     if (!s.revived && (s.banned || s.unknown)) out.classList.add('bad');
     await loadRecheckRows();
   } finally {
@@ -1374,6 +1444,14 @@ function bind() {
   $('#btn-store-export').addEventListener('click', storeExport);
 
   /* --- 封号复检 --- */
+  document.querySelectorAll('input[name="rc-exit"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      if (el.checked) applyExitMode(el.value);
+    });
+  });
+  $('#btn-rc-test-custom').addEventListener('click', () => {
+    detectCustom().catch((err) => toast(err.message, true));
+  });
   $('#btn-rc-save').addEventListener('click', () => {
     saveRecheckCfg().catch((err) => toast(err.message, true));
   });

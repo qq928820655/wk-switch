@@ -327,5 +327,157 @@ class BannedHintTests(unittest.TestCase):
         self.assertEqual(store.banned_hint_of(acc()), "")
 
 
+class ExitPlanTests(unittest.TestCase):
+    """出口三档：同一 / 随机 / 自定义。
+
+    这一层错了不会报错，只会「静默地全从同一个 IP 出去」——正是被封的原因，
+    所以要逐档钉死：每档给出什么 proxy、退化路径是什么。
+    """
+
+    def _cfg(self, **kw):
+        return recheck._coerce(dict(recheck.DEFAULTS, **kw))
+
+    def test_normalize_url(self):
+        n = recheck.normalize_url
+        self.assertEqual(n("1.2.3.4:8080"), "http://1.2.3.4:8080")
+        self.assertEqual(n("http://1.2.3.4:8080"), "http://1.2.3.4:8080")
+        self.assertEqual(n("https://h.example:443/"), "https://h.example:443")
+        # 端口缺失 / 非数字 / 协议不收 / 带空白，一律当作没配
+        self.assertEqual(n("1.2.3.4"), "")
+        self.assertEqual(n("1.2.3.4:abc"), "")
+        self.assertEqual(n("socks5://1.2.3.4:1080"), "")
+        self.assertEqual(n("http://1.2.3.4:8080 extra"), "")
+        self.assertEqual(n(""), "")
+
+    def test_parse_urls_dedup_and_separators(self):
+        got = recheck.parse_urls("http://a:1, b:2;http://a:1\nc:3")
+        self.assertEqual(got, ["http://a:1", "http://b:2", "http://c:3"])
+
+    def test_legacy_rotate_flag_migrates(self):
+        on = recheck._coerce({"rotate_proxy": True})
+        off = recheck._coerce({"rotate_proxy": False})
+        self.assertEqual(on["exit_mode"], recheck.EXIT_RANDOM)
+        self.assertEqual(off["exit_mode"], recheck.EXIT_SAME)
+        # 写回时派生字段跟着 exit_mode 走
+        self.assertTrue(on["rotate_proxy"])
+        self.assertFalse(off["rotate_proxy"])
+
+    def test_explicit_mode_wins_over_legacy(self):
+        cfg = self._cfg(exit_mode="custom", rotate_proxy=True)
+        self.assertEqual(cfg["exit_mode"], recheck.EXIT_CUSTOM)
+        self.assertFalse(cfg["rotate_proxy"])
+
+    def test_same_pin(self):
+        cfg = self._cfg(exit_mode="same", exit_pin="9.9.9.9:7890")
+        plan = recheck.plan_exit(cfg, [], 3)
+        self.assertEqual(plan["proxy"], "http://9.9.9.9:7890")
+        self.assertEqual(plan["mode_label"], "同一出口")
+
+    def test_same_without_pin_uses_first_node(self):
+        cfg = self._cfg(exit_mode="same", exit_pin="")
+        nodes = [{"url": "http://n1:1", "ok": False, "exit_ip": ""},
+                 {"url": "http://n2:2", "ok": True, "exit_ip": "5.5.5.5"}]
+        plan = recheck.plan_exit(cfg, nodes, 0)
+        self.assertEqual(plan["proxy"], "http://n2:2")
+        self.assertEqual(plan["exit_ip"], "5.5.5.5")
+
+    def test_same_without_anything_is_direct(self):
+        cfg = self._cfg(exit_mode="same", exit_pin="")
+        plan = recheck.plan_exit(cfg, [], 0)
+        self.assertEqual(plan["proxy"], "")
+        self.assertIn("直连", plan["label"])
+
+    def test_random_uses_rng(self):
+        class Fixed:
+            def choice(self, seq):
+                return seq[-1]
+
+        cfg = self._cfg(exit_mode="random", mihomo={"enabled": True})
+        nodes = [{"url": "http://a:1", "ok": True, "exit_ip": "1.1.1.1"},
+                 {"url": "http://b:2", "ok": True, "exit_ip": "2.2.2.2"}]
+        plan = recheck.plan_exit(cfg, nodes, 0, rng=Fixed())
+        self.assertEqual(plan["proxy"], "http://b:2")
+        self.assertEqual(plan["exit_ip"], "2.2.2.2")
+
+    def test_random_without_nodes_is_direct(self):
+        cfg = self._cfg(exit_mode="random")
+        self.assertEqual(recheck.plan_exit(cfg, [], 0)["proxy"], "")
+
+    def test_custom_rotates_in_order(self):
+        cfg = self._cfg(exit_mode="custom",
+                        exit_custom="http://c1:1\nhttp://c2:2")
+        got = [recheck.plan_exit(cfg, [], i)["proxy"] for i in range(5)]
+        self.assertEqual(got, ["http://c1:1", "http://c2:2",
+                               "http://c1:1", "http://c2:2", "http://c1:1"])
+
+    def test_custom_empty_falls_back_to_same(self):
+        """表里一个合法地址都没有时不能谁都直连了事，要按 same 处理。"""
+        cfg = self._cfg(exit_mode="custom", exit_custom="socks5://x:1",
+                        exit_pin="7.7.7.7:1080")
+        plan = recheck.plan_exit(cfg, [], 0)
+        self.assertEqual(plan["proxy"], "http://7.7.7.7:1080")
+        self.assertEqual(plan["mode"], recheck.EXIT_SAME)
+
+
+class RunnerExitTests(unittest.TestCase):
+    """Runner 真的把 plan 算出来的代理传下去了没有。"""
+
+    def _cfg(self, **kw):
+        return recheck._coerce(dict(recheck.DEFAULTS, enabled=True, gap_seconds=1.0, **kw))
+
+    def test_custom_passes_url_to_chat_probe(self):
+        cfg = self._cfg(exit_mode="custom", exit_custom="http://p1:1")
+        runner = recheck.Runner(cfg)
+        seen = []
+
+        def fake(acc_, timeout=0, proxy=""):
+            seen.append(proxy)
+            return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
+                    "status": 200, "endpoint": "", "latency_ms": 1}
+
+        with mock.patch.object(probe, "chat_probe", fake), \
+             mock.patch.object(recheck.Runner, "_warm_exits", lambda self: None):
+            results = runner.run([(1, acc())], force=True)
+        self.assertEqual(seen, ["http://p1:1"])
+        self.assertEqual(results[0]["proxy"], "http://p1:1")
+        self.assertEqual(results[0]["exit_mode"], recheck.EXIT_CUSTOM)
+
+    def test_same_sends_same_proxy_for_every_row(self):
+        cfg = self._cfg(exit_mode="same", exit_pin="http://pin:9")
+        runner = recheck.Runner(cfg)
+        seen = []
+
+        def fake(acc_, timeout=0, proxy=""):
+            seen.append(proxy)
+            return {"verdict": probe.RECHECK_BANNED, "detail": "", "raw": "",
+                    "status": 403, "endpoint": "", "latency_ms": 1}
+
+        with mock.patch.object(probe, "chat_probe", fake):
+            runner.run([(1, acc(uid="a")), (2, acc(uid="b"))], force=True)
+        self.assertEqual(seen, ["http://pin:9", "http://pin:9"])
+
+    def test_warm_fills_exit_ip_for_custom(self):
+        cfg = self._cfg(exit_mode="custom", exit_custom="http://p1:1")
+        runner = recheck.Runner(cfg)
+        with mock.patch.object(recheck, "probe_exit",
+                               lambda url, pu, to: {"url": url, "ok": True,
+                                                    "exit_ip": "8.8.8.8",
+                                                    "latency_ms": 1, "error": ""}):
+            runner._warm_exits()
+        self.assertEqual(runner._ips["http://p1:1"], "8.8.8.8")
+
+    def test_warm_fills_exit_ip_for_pinned_same(self):
+        """同一出口也要报 IP——这档的全部意义就是确认「那个 IP 是谁」。"""
+        cfg = self._cfg(exit_mode="same", exit_pin="http://pin:9")
+        runner = recheck.Runner(cfg)
+        with mock.patch.object(recheck, "probe_exit",
+                               lambda url, pu, to: {"url": url, "ok": True,
+                                                    "exit_ip": "6.6.6.6",
+                                                    "latency_ms": 1, "error": ""}):
+            runner._warm_exits()
+        self.assertEqual(runner._ips["http://pin:9"], "6.6.6.6")
+        self.assertEqual(runner._plan(0)["exit_ip"], "6.6.6.6")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

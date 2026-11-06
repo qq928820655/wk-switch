@@ -727,6 +727,9 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True,
             "config": cfg,
             "nodes": recheck.discover_nodes(cfg, probe_now=False),
+            "exit_modes": [{"value": m, "label": recheck.EXIT_LABELS[m]}
+                           for m in recheck.EXIT_MODES],
+            "custom_urls": recheck.parse_urls(cfg.get("exit_custom")),
             "stats": store.recheck_stats(),
             "track_labels": store.RECHECK_LABELS,
         })
@@ -793,6 +796,8 @@ class Handler(BaseHTTPRequestHandler):
                     "status": item["status"],
                     "latency_ms": item["latency_ms"],
                     "proxy": item["proxy"],
+                    "proxy_ip": item.get("proxy_ip", ""),
+                    "exit_mode": item.get("exit_mode", ""),
                     "skipped": item.get("skipped", False),
                 }
                 for item in results
@@ -811,6 +816,9 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True,
             "config": cfg,
             "nodes": recheck.discover_nodes(cfg, probe_now=False),
+            "exit_modes": [{"value": m, "label": recheck.EXIT_LABELS[m]}
+                           for m in recheck.EXIT_MODES],
+            "custom_urls": recheck.parse_urls(cfg.get("exit_custom")),
             "stats": store.recheck_stats(),
         })
 
@@ -827,7 +835,16 @@ class Handler(BaseHTTPRequestHandler):
             cfg["mihomo"] = {**cfg["mihomo"], **patch}
             cfg["mihomo"]["timeout"] = recheck._float(
                 cfg["mihomo"].get("timeout"), 10.0, 3.0, 60.0)
-        self._json(200, {"ok": True, **recheck.discover_nodes(cfg, probe_now=True)})
+        data = recheck.discover_nodes(cfg, probe_now=True)
+        # 自定义出口栏填着东西时一并测，页面上一次点击就能看到两边的出口 IP
+        custom = payload.get("custom")
+        if custom:
+            urls = recheck.parse_urls(custom)
+            nodes = recheck.probe_urls(urls, cfg["mihomo"]["probe_url"],
+                                       cfg["mihomo"]["timeout"])
+            data["custom_nodes"] = nodes
+            data["custom_ok"] = sum(1 for n in nodes if n.get("ok"))
+        self._json(200, {"ok": True, **data})
 
     def _recheck_track(self, payload: dict) -> None:
         """手工加进 / 移出名单。state 为空串表示移出。"""

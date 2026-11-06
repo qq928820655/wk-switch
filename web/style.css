@@ -1233,6 +1233,49 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 .col-rc-count { width: 58px; }
 .col-rc-at { width: 84px; }
 
+/* ---------- 复检出口 ---------- */
+.rc-exit-seg { margin: 2px 0 10px; }
+.rc-exit-tip {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--ink-3);
+  line-height: 1.55;
+}
+.rc-exit-pane {
+  padding: 12px 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 11px;
+  background: #fbfcff;
+}
+.rc-exit-pane .rc-grid { padding: 0; }
+.rc-exit-pane .hint { margin: 8px 0 0; }
+.rc-exit-pane .export-bar { margin-top: 10px; }
+.rc-wide { display: block; }
+.rc-wide > span {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+#rc-custom {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  resize: vertical;
+}
+#rc-custom:focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, .1);
+}
+#rc-pin { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
 @media (max-width: 720px) {
   /* 窄屏收掉次要列：名单要能一屏看完「谁被封、什么时候查的」 */
   #rc-table .col-rc-count,

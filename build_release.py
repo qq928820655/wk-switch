@@ -42,6 +42,19 @@ EXCLUDE_EXT = {".pyc", ".pyo", ".db", ".log"}
 
 
 def read_version() -> str:
+    """VERSION 文件优先，回退到 wk/version.py 的常量。
+
+    和 `wk.version.version()` 同一套优先级。只读常量的话，在线升级把新版本号
+    写进 VERSION 之后，再打包出来的包名还停在常量上——包名和包内容对不上。
+    """
+    path = os.path.join(ROOT, "VERSION")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        if text:
+            return text
+    except OSError:
+        pass
     path = os.path.join(ROOT, "wk", "version.py")
     with open(path, "r", encoding="utf-8") as f:
         match = re.search(r'^VERSION\s*=\s*"([^"]+)"', f.read(), re.M)
