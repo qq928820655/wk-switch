@@ -966,6 +966,11 @@ class Handler(BaseHTTPRequestHandler):
             cfg["mihomo"]["api"] = recheck.normalize_url(
                 str(cfg["mihomo"].get("api") or "").strip())
             cfg["mihomo"]["secret"] = str(cfg["mihomo"].get("secret") or "").strip()
+            # 池面板同 host 不同端口，地址同样只收 http/https
+            cfg["mihomo"]["pool"] = recheck.normalize_url(
+                str(cfg["mihomo"].get("pool") or "").strip())
+            cfg["mihomo"]["pool_token"] = str(
+                cfg["mihomo"].get("pool_token") or "").strip()
         data = recheck.discover_nodes(cfg, probe_now=True)
         # 自定义出口栏填着东西时一并测，页面上一次点击就能看到两边的出口 IP
         custom = payload.get("custom")

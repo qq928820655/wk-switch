@@ -142,6 +142,13 @@ DEFAULTS: dict[str, Any] = {
         "api": "",
         #: external-controller 的 secret，没设就留空。
         "secret": "",
+        #: mihomo-pool 的管理面板（默认 8006）。这个池子把「节点 → 独享端口」
+        #: 全表放在 `GET /api/v1/nodes` 里，一次请求就能对上名字，不用为三十个
+        #: 端口各开一条隧道再去 /connections 反查。留空按 host 推 8006。
+        "pool": "",
+        #: 面板 Token（`.env` 的 `MPOOL_TOKEN`）。跟 9090 的 secret 是两码事，
+        #: 只是长得很像，填混了就是一次 401。留空时会拿 secret 再试一次。
+        "pool_token": "",
     },
 }
 
@@ -217,6 +224,8 @@ def _coerce(cfg: dict) -> dict:
         "timeout": _float(mihomo.get("timeout"), DEFAULTS["mihomo"]["timeout"], 3.0, 60.0),
         "api": normalize_url(str(mihomo.get("api") or "").strip()),
         "secret": str(mihomo.get("secret") or "").strip(),
+        "pool": normalize_url(str(mihomo.get("pool") or "").strip()),
+        "pool_token": str(mihomo.get("pool_token") or "").strip(),
     }
     return cfg
 
@@ -353,7 +362,7 @@ def _api_get(base: str, path: str, headers: dict,
 
 def _explain_status(base: str, path: str, code: int) -> str:
     if code in (401, 403):
-        return f"{base} 返回 {code}，需要填 secret（或 secret 不对）"
+        return f"{base} 返回 {code}，secret 不对或没填"
     if code == 404:
         return f"{base}{path} 返回 404"
     return f"{base}{path} 返回 HTTP {code}"
@@ -378,6 +387,83 @@ def _listener_map(items: Any) -> dict[int, dict]:
     return out
 
 
+def _pool_base(mihomo: dict) -> str:
+    """mihomo-pool 面板地址。填了就用，没填按代理主机推 8006。
+
+    为什么可以推：池子的 `server.py` 监听 `0.0.0.0:8006`，内核的 9090 只绑
+    127.0.0.1，两个进程在同一台机器上，主机名照抄就行。
+    """
+    pool = normalize_url(str(mihomo.get("pool") or "").strip())
+    if pool:
+        return pool.rstrip("/")
+    host = _host_only(str(mihomo.get("host") or ""))
+    if not host:
+        return ""
+    return f"http://{host}:8006"
+
+
+def _pool_map(items: Any) -> dict[int, dict]:
+    """把池子 `/api/v1/nodes` 的节点表折成 `{端口: {name, proxy, type}}`。
+
+    `listener_port` 是池子分配给该节点的独享端口，没分到的节点这里是
+    `None`——那批节点不进表，界面按端口显示本来也用不上它们。
+    `name` 和 `proxy` 都写成节点名：池子给 listener 起的是 `HUB-E01` 这种
+    序号，节点名只出现在 `proxy` 上，但两者在这里是同一个东西，前端
+    不用分情况取。
+    """
+    out: dict[int, dict] = {}
+    for item in (items or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            port = int(item.get("listener_port") or 0)
+        except (TypeError, ValueError):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not (0 < port < 65536) or not name:
+            continue
+        out[port] = {
+            "name": name,
+            "proxy": name,
+            "type": str(item.get("type") or "").strip(),
+        }
+    return out
+
+
+def _fetch_pool_nodes(mihomo: dict, base: str,
+                      timeout: float) -> tuple[dict[int, dict], str]:
+    """问 mihomo-pool 面板要「节点 → 独享端口」全表。
+
+    这是这个池子的原生接口（`GET /api/v1/nodes`），返回里 `listener_port`
+    就是 listener 端口、`name` 就是节点名。比 `/connections` 反查便宜一个
+    数量级：一次 HTTP，不用为三十个端口各挂一条隧道，也不需要 9090 的
+    secret（池子只把 9090 绑在 127.0.0.1，跨容器时根本够不着）。
+
+    Token 填混是常态（面板 Token 和内核 secret 长得一模一样），所以
+    `pool_token` 空着时拿 `secret` 当面板 Token 再试一次。
+    """
+    token = str(mihomo.get("pool_token") or "").strip() \
+        or str(mihomo.get("secret") or "").strip()
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-Token"] = token
+    data, code, err = _api_get(base, "/api/v1/nodes", headers, timeout)
+    if code == 200 and isinstance(data, dict):
+        out = _pool_map(data.get("nodes"))
+        if out:
+            return out, ""
+        return {}, (f"{base}/api/v1/nodes 里没有已分配端口的节点"
+                    "（池子刚重载完，或端口还没排）")
+    if code in (401, 403):
+        return {}, (f"{base} 返回 {code}：池面板 Token 不对"
+                    "（是 .env 里的 MPOOL_TOKEN）")
+    if code == 0:
+        # 面板没开 / 端口不是 8006：这不是错，只是这条路走不通，不许它
+        # 污染「控制器未通」那条主错因
+        return {}, ""
+    return {}, ""
+
+
 def _fetch_listeners(cfg: dict, ports: Iterable[int] | None = None,
                      timeout: float = 2.5,
                      deep: bool = True) -> tuple[dict[int, dict], str]:
@@ -387,29 +473,37 @@ def _fetch_listeners(cfg: dict, ports: Iterable[int] | None = None,
     AS 的相邻段，甚至直接共用出口，卡片上两格都是 `103.41.4.26`，看起来
     像同一个槽位检测了两遍。节点名才是用户在找的东西。
 
-    **两条路**（顺序不能反）：
+    **三条路**，按代价从低到高：
 
     1. `GET /listeners` —— 直接给出端口、监听名、钉死的出站节点。可惜
        官方 mihomo 的 API 里**没有这个端点**（`hub/route/server.go` 的
        路由表里没有 listener 相关项），只有部分面板 / fork 加了。所以它
        命中是意外，404 才是常态。
-    2. `GET /connections` 反查 —— 每条连接都带 `inboundPort`（从哪个监听
+    2. mihomo-pool 面板的 `GET /api/v1/nodes` —— 池子自己维护着
+       「节点 → 独享端口」的映射，一次请求全拿到，还带节点类型。前提是
+       用户在跑这个池子（地址 8006，Token 是 `.env` 的 `MPOOL_TOKEN`）。
+    3. `GET /connections` 反查 —— 每条连接都带 `inboundPort`（从哪个监听
        进来）和 `chains`（出站链路，`chains[0]` 是真正用的节点）。对着每个
        端口开一条 CONNECT 隧道并**先别关**，再读一次 `/connections`，就能
        把端口和节点名对上。贵一点（N 条长连接），所以只在 `deep=True`
        （用户点了「自动检测」）时才走。
 
-    拿不到时**必须把原因带出去**：界面上只写「控制器未通」，用户不知道该
+    三条都断时**必须把原因带出去**：界面上只写「控制器未通」，用户不知道该
     改地址、补 secret，还是去给 mihomo 开 external-controller——这几种情况
     的处置完全不同。
     """
     base = api_base(cfg["mihomo"])
     if not base:
         return {}, "没填控制器地址，也没能从代理主机推出来（主机为空）"
+    mihomo = cfg["mihomo"]
     headers = {"Accept": "application/json"}
-    secret = str(cfg["mihomo"].get("secret") or "").strip()
+    secret = str(mihomo.get("secret") or "").strip()
     if secret:
         headers["Authorization"] = "Bearer " + secret
+
+    # 逐条攒失败原因，最后合成一句。只留最后一条会丢掉真正的线索：
+    # 比如 9090 要 secret 而 8006 没开，用户需要知道的是前者。
+    why: list[str] = []
 
     data, code, err = _api_get(base, "/listeners", headers, timeout)
     if code == 200:
@@ -421,19 +515,43 @@ def _fetch_listeners(cfg: dict, ports: Iterable[int] | None = None,
         return {}, (f"{base}/listeners 是空的：端口不是用 listeners 段开的，"
                     "一个端口对应一个节点这件事在这里不成立")
     if code in (401, 403):
-        # 鉴权失败时别的端点也一样过不去，不用再试
-        return {}, err
-    if code == 0:
-        # 连不上 / 超时：地址本身有问题，反查也没有意义
-        return {}, err
+        why.append(f"{base} 返回 {code}：9090 的 secret 不对"
+                   "（mihomo-pool 的在 runtime/secret，32 位十六进制，不是面板 Token）")
+    elif code == 0:
+        why.append(err)
+
+    # 池子面板：一次请求就能把三十个端口全对上，比开隧道反查划算得多，
+    # 所以排在 /connections 前面。
+    pool_base = _pool_base(mihomo)
+    if pool_base:
+        got, pool_why = _fetch_pool_nodes(mihomo, pool_base, min(timeout, 2.0))
+        if got:
+            return got, ""
+        if pool_why:
+            why.append(pool_why)
 
     if not deep:
-        return {}, f"{base} 没有 /listeners（官方 mihomo 不带这个端点），点「自动检测」再按连接反查"
+        # 打开页面这一趟没点「自动检测」，反查还没跑过。把错因和下一步
+        # 一起给：只报错用户不知道该点哪里，只说「点检测」又掩盖了错因。
+        why.append("点「自动检测」再按连接反查节点名")
+        return {}, "；".join(why)
 
-    got, why = _map_by_connections(cfg, list(ports or []), base, headers, timeout)
-    if got:
-        return got, ""
-    return {}, f"{base} 没有 /listeners（官方 mihomo 不带这个端点）；{why}"
+    # 已经确定是鉴权失败 / 地址不通时，再开 N 条隧道反查没有意义：
+    # /connections 走的是同一个 secret、同一个地址，必然还是 401 / 连不上。
+    # 省掉这一步，用户看到的原因也不会被「隧道一条都没开起来」盖住。
+    if code not in (0, 401, 403):
+        got, conn_why = _map_by_connections(cfg, list(ports or []), base,
+                                           headers, timeout)
+        if got:
+            return got, ""
+        if conn_why:
+            why.append(conn_why)
+
+    # 「没有 /listeners」只在 404 时成立。401 / 连不上时这么写是错的：
+    # 用户会跑去查端点，而真正要改的是 secret 或地址。
+    if code == 404:
+        why.insert(0, f"{base} 没有 /listeners（官方 mihomo 不带这个端点）")
+    return {}, "；".join(why)
 
 
 def _probe_host(probe_url: str) -> str:
@@ -634,7 +752,9 @@ def _why_unreachable(reason: Any, timeout: float) -> str:
 
 def fetch_listeners(cfg: dict, timeout: float = 2.5) -> dict[int, dict]:
     """只需要名单时的薄封装。错误原因走 `_fetch_listeners`。"""
-    return _fetch_listeners(cfg, timeout)[0]
+    # 必须按关键字传：`_fetch_listeners` 第二个位置参数是 ports，位置传参
+    # 会把超时当成端口列表。
+    return _fetch_listeners(cfg, timeout=timeout)[0]
 
 
 def port_of(url: str) -> int:

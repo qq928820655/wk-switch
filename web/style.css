@@ -444,6 +444,16 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   margin-top: 18px;
   padding-top: 16px;
   border-top: 1px solid var(--line-2);
+  /* 检测失败时这里会拼两三条原因（9090 要 secret、8006 Token 不对…），
+     一行放不下就换行，别把按钮挤扁或让文字溢出卡片 */
+  flex-wrap: wrap;
+}
+
+.export-bar .hint {
+  flex: 1 1 260px;
+  min-width: 0;
+  line-height: 1.5;
+  word-break: break-word;
 }
 
 .btn {

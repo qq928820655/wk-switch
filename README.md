@@ -196,7 +196,9 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
     "probe_url": "https://api.ipify.org",
     "timeout": 10.0,
     "api": "http://cli-proxy-mihomo:9090",
-    "secret": ""
+    "secret": "",
+    "pool": "http://cli-proxy-mihomo:8006",
+    "pool_token": ""
   }
 }
 ```
@@ -205,24 +207,39 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
 
 `api` 是 mihomo 的 external-controller，填了才能显示**节点名**。出口 IP 分不出线路——同一订阅里两个节点出口落在同一段是常事，卡片上两格数字一模一样，看着像同一个槽测了两遍。留空时按 `host` 推 `http://<host>:9090`；控制器设了 secret 就填进 `secret`。
 
+**跑 mihomo-pool 的话，`pool` + `pool_token` 是更短的一条路。** 那个池子自己维护「节点 → 独享端口」的映射，`GET /api/v1/nodes` 一次就全拿到，还带节点类型：
+
+```bash
+curl -s "http://127.0.0.1:8006/api/v1/nodes" -H "X-Token: $(grep MPOOL_TOKEN .env | cut -d= -f2)" | jq '.nodes[0]'
+# {"name":"香港住宅01","type":"vmess","delay_ms":210,"tested":true,
+#  "listener_port":17950,"pinned":false,"quality":{...},"match":true}
+```
+
+`pool` 留空按 `host` 推 `8006`（面板和内核在同一台机器上）；`pool_token` 是 `.env` 里的 `MPOOL_TOKEN`。**这和 9090 的 `secret` 是两个东西**：前者是面板登录用的，后者是池子写在 `runtime/secret` 里的 32 位十六进制。两个填混会各得一个 401，`pool_token` 留空时程序会拿 `secret` 再当面板 Token 试一次，所以只填一个也可能通。
+
 **节点名是怎么拿到的**（官方 mihomo 的 API 里其实没有「列出所有监听端口」这个端点，`hub/route/server.go` 的路由表里没有）：
 
 1. 先试 `GET /listeners` —— 一步到位，但要面板 / fork 才有，官方 404 是常态。
-2. 404 就退到 `GET /connections` 反查 —— mihomo 每条连接带 `inboundPort`（从哪个监听进来的）和 `chains`（出站链路，第一个是真正用的节点）。于是对着每个端口各开一条隧道**先别关**（HTTP CONNECT 不通就试 SOCKS5，listener 的 type 从外面看不出来），再读一次连接表，端口和节点名就对上了。连接一断记录就没了，所以必须挂着读。
+2. 再问 mihomo-pool 面板的 `GET /api/v1/nodes` —— 一次 HTTP 拿到全部端口和节点名，代价最低，所以排在反查前面。
+3. 前两条都不行，才退到 `GET /connections` 反查 —— mihomo 每条连接带 `inboundPort`（从哪个监听进来的）和 `chains`（出站链路，第一个是真正用的节点）。于是对着每个端口各开一条隧道**先别关**（HTTP CONNECT 不通就试 SOCKS5，listener 的 type 从外面看不出来），再读一次连接表，端口和节点名就对上了。连接一断记录就没了，所以必须挂着读。
 
-第 2 步要开 N 条长连接，所以只在点「自动检测」时走；打开页面那一趟只问 `/listeners`。
+第 3 步要开 N 条长连接，所以只在点「自动检测」时走；打开页面那一趟只问前两步。
+
+池子的 listener 名是 `HUB-E01` 这种按端口升序编的序号（重排就变），节点名只在 `proxy` 字段上——所以卡片上的名字来自 `proxy`，不要拿 listener 名去反推节点。
 
 每张卡片一行四段：**端口 → 节点名 → 类型 → 延迟**。端口不写全 `127.0.0.1:17901` —— 十张卡片这串前缀一模一样，占掉十几个字符却分不出任何东西，留五位数就够认。类型（住宅 / 机房 / 代理）按节点名推断，名字里没写就不标：同一个订阅里机房 IP 和住宅 IP 混着，这两三个字是唯一能分辨的地方，猜错比不标更误导。出口 IP 退到鼠标悬停的提示里。
 
-控制器拿不到名单时不写「未通」了事 —— 地址错、缺 secret、端点不存在三种情况的处置完全不同，所以分开报：
+控制器拿不到名单时不写「未通」了事 —— 地址错、缺 secret、端点不存在三种情况的处置完全不同，所以分开报（多条原因用「；」拼在一起，不互相冲掉）：
 
 | 现象 | 提示 |
 |---|---|
-| 401 / 403 | secret 不对或没填 |
+| 9090 返回 401 / 403 | secret 不对或没填，并指明 mihomo-pool 的在 `runtime/secret`（32 位十六进制，不是面板 Token） |
+| 8006 返回 401 / 403 | 面板 Token 不对，并指明是 `.env` 的 `MPOOL_TOKEN` |
 | 连接被拒绝 | 控制器没开，或端口不对 |
 | 域名解析不到 | 跨容器要写服务名，宿主机上要写 127.0.0.1 |
 | `/listeners` 404 且反查也没结果 | 说清是「官方不带这个端点」+ 反查卡在哪一步 |
 | 通了但 `listeners` 为空 | 端口不是用 `listeners` 段开的，一个端口一个节点这件事不成立 |
+| 8006 连不上 | 不报错（面板没开只是这条捷径走不通，不冒充成控制器故障） |
 
 已经配过 hub 的机器直接就能复用，也可以用环境变量 `WB_PROXY_DISCOVER_HOST` / `WB_PROXY_DISCOVER_PORTS` 覆盖。
 

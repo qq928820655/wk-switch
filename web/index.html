@@ -501,7 +501,18 @@
       </label>
       <label class="field">
         <span>控制器 secret</span>
-        <input type="password" id="rc-secret" placeholder="没设就留空" spellcheck="false">
+        <input type="password" id="rc-secret" placeholder="9090 的 secret（runtime/secret）" spellcheck="false">
+      </label>
+    </div>
+
+    <div class="rc-grid">
+      <label class="field">
+        <span>池面板地址（可选）</span>
+        <input type="text" id="rc-pool" placeholder="留空按主机推 8006" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>面板 Token（可选）</span>
+        <input type="password" id="rc-pool-token" placeholder=".env 里的 MPOOL_TOKEN" spellcheck="false">
       </label>
     </div>
 

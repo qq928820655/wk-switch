@@ -939,5 +939,213 @@ class NodeKindTests(unittest.TestCase):
         self.assertEqual(got[1]["kind"], "")
 
 
+class PoolPanelTests(unittest.TestCase):
+    """mihomo-pool 面板：一次 GET 拿到「节点 → 独享端口」全表。
+
+    池子的 listeners 名字是 `HUB-E01` 这种序号（端口升序编号，重排就变），
+    节点名只在 `proxy` 上。所以既不能拿 listener 名当节点名，也不该为了
+    名字去开三十条隧道——面板自己就维护着这张表。
+    """
+
+    def _fake_pool(self, nodes: list, token: str = ""):
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):  # noqa: N802
+                seen["path"] = self.path
+                seen["token"] = self.headers.get("X-Token") or ""
+                if self.path != "/api/v1/nodes":
+                    self.send_error(404)
+                    return
+                if token and seen["token"] != token:
+                    self.send_error(401)
+                    return
+                body = json.dumps({"ok": True, "nodes": nodes}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1], seen
+
+    def _nodes(self):
+        return [
+            {"name": "香港住宅01", "type": "vmess", "delay_ms": 210,
+             "listener_port": 17950, "match": True},
+            {"name": "新加坡机房-02", "type": "ss", "delay_ms": 380,
+             "listener_port": 17951, "match": False},
+            # 没分到端口的节点不进表
+            {"name": "日本-未分配", "type": "trojan", "listener_port": None},
+            {"name": "", "type": "ss", "listener_port": 17952},
+        ]
+
+    def test_base_derives_8006(self):
+        self.assertEqual(recheck._pool_base({"host": "127.0.0.1", "pool": ""}),
+                         "http://127.0.0.1:8006")
+
+    def test_base_keeps_explicit(self):
+        self.assertEqual(
+            recheck._pool_base({"host": "127.0.0.1", "pool": "http://10.0.0.2:8080/"}),
+            "http://10.0.0.2:8080")
+
+    def test_base_blank_without_host(self):
+        self.assertEqual(recheck._pool_base({"host": "", "pool": ""}), "")
+
+    def test_map_skips_unassigned(self):
+        got = recheck._pool_map(self._nodes())
+        self.assertEqual(set(got), {17950, 17951})
+        self.assertEqual(got[17950]["name"], "香港住宅01")
+        self.assertEqual(got[17950]["proxy"], "香港住宅01")
+        self.assertEqual(got[17950]["type"], "vmess")
+
+    def test_map_tolerates_string_port(self):
+        got = recheck._pool_map([{"name": "x", "listener_port": "17953"}])
+        self.assertEqual(got[17953]["name"], "x")
+
+    def test_fetch_returns_table(self):
+        port, seen = self._fake_pool(self._nodes(), token="tok-1")
+        got, why = recheck._fetch_pool_nodes(
+            {"pool_token": "tok-1", "secret": ""}, f"http://127.0.0.1:{port}", 2.0)
+        self.assertEqual(why, "")
+        self.assertEqual(got[17951]["name"], "新加坡机房-02")
+        self.assertEqual(seen["path"], "/api/v1/nodes")
+        self.assertEqual(seen["token"], "tok-1")
+
+    def test_fetch_falls_back_to_secret(self):
+        """面板 Token 和内核 secret 长得一样，填混是常态，拿 secret 再试一次。"""
+        port, seen = self._fake_pool(self._nodes(), token="same-words")
+        got, why = recheck._fetch_pool_nodes(
+            {"pool_token": "", "secret": "same-words"}, f"http://127.0.0.1:{port}", 2.0)
+        self.assertEqual(why, "")
+        self.assertTrue(got)
+        self.assertEqual(seen["token"], "same-words")
+
+    def test_fetch_401_names_env_var(self):
+        port, _ = self._fake_pool(self._nodes(), token="right")
+        got, why = recheck._fetch_pool_nodes(
+            {"pool_token": "wrong", "secret": ""}, f"http://127.0.0.1:{port}", 2.0)
+        self.assertEqual(got, {})
+        self.assertIn("MPOOL_TOKEN", why)
+
+    def test_fetch_dead_panel_is_silent(self):
+        """8006 没开只是这条路走不通，不许它冒充「控制器未通」。"""
+        got, why = recheck._fetch_pool_nodes(
+            {"pool_token": "", "secret": ""}, "http://127.0.0.1:1", 0.5)
+        self.assertEqual(got, {})
+        self.assertEqual(why, "")
+
+    def test_listeners_falls_through_to_panel(self):
+        """9090 没 /listeners（官方内核常态）时，名字由面板给出。"""
+        panel, _ = self._fake_pool(self._nodes(), token="tok-1")
+
+        class Ctrl(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):  # noqa: N802
+                self.send_error(404)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Ctrl)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+
+        cfg = {"mihomo": {
+            "host": "127.0.0.1",
+            "ports": "17950-17951",
+            "probe_url": "https://api.ipify.org",
+            "timeout": 2.0,
+            "api": f"http://127.0.0.1:{srv.server_address[1]}",
+            "secret": "",
+            "pool": f"http://127.0.0.1:{panel}",
+            "pool_token": "tok-1",
+            "enabled": True,
+        }}
+        got, why = recheck._fetch_listeners(cfg, ports=[17950, 17951],
+                                           timeout=1.5, deep=True)
+        self.assertEqual(why, "")
+        self.assertEqual(got[17950]["name"], "香港住宅01")
+
+    def test_both_401_explains_both_secrets(self):
+        """两条路都 401 时，两个 Token 的出处都要写清楚，否则用户只会来回改。"""
+
+        class Ctrl(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):  # noqa: N802
+                self.send_error(401)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Ctrl)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        panel, _ = self._fake_pool(self._nodes(), token="right")
+
+        cfg = {"mihomo": {
+            "host": "127.0.0.1",
+            "ports": "17950",
+            "probe_url": "https://api.ipify.org",
+            "timeout": 1.5,
+            "api": f"http://127.0.0.1:{srv.server_address[1]}",
+            "secret": "wrong",
+            "pool": f"http://127.0.0.1:{panel}",
+            "pool_token": "wrong",
+            "enabled": True,
+        }}
+        _, why = recheck._fetch_listeners(cfg, ports=[17950], timeout=1.0, deep=False)
+        self.assertIn("runtime/secret", why)
+        self.assertIn("MPOOL_TOKEN", why)
+
+
+    def test_discover_nodes_paints_names_from_panel(self):
+        """整条链路：面板给的端口表要落到卡片的 name/kind 上。"""
+        panel, _ = self._fake_pool(self._nodes(), token="tok-1")
+        cfg = {"mihomo": {
+            "host": "127.0.0.1",
+            "ports": "17950-17951",
+            "probe_url": "https://api.ipify.org",
+            "timeout": 1.0,
+            "api": "http://127.0.0.1:1",     # 控制器故意连不上
+            "secret": "",
+            "pool": f"http://127.0.0.1:{panel}",
+            "pool_token": "tok-1",
+            "enabled": True,
+        }}
+        rows = [
+            {"url": "http://127.0.0.1:17950", "ok": True, "exit_ip": "1.1.1.1",
+             "latency_ms": 120, "error": ""},
+            {"url": "http://127.0.0.1:17951", "ok": True, "exit_ip": "2.2.2.2",
+             "latency_ms": 300, "error": ""},
+        ]
+        with mock.patch.object(recheck, "probe_urls", return_value=rows):
+            data = recheck.discover_nodes(cfg, probe_now=True)
+        self.assertTrue(data["named"])
+        self.assertEqual(data["nodes"][0]["name"], "香港住宅01")
+        self.assertEqual(data["nodes"][0]["kind"], "住宅")
+        self.assertEqual(data["nodes"][1]["kind"], "机房")
+        self.assertEqual(data["api_error"], "")
+
+    def test_coerce_keeps_pool_fields(self):
+        cfg = recheck._coerce({"mihomo": {"host": "127.0.0.1", "pool": "http://h:8006/",
+                                          "pool_token": " abc "}})
+        self.assertEqual(cfg["mihomo"]["pool"], "http://h:8006")
+        self.assertEqual(cfg["mihomo"]["pool_token"], "abc")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

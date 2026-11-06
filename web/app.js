@@ -1388,6 +1388,10 @@ function fillRecheckForm(cfg, disc) {
   $('#rc-ports').value = mihomo.ports || '';
   $('#rc-api').value = mihomo.api || '';
   $('#rc-secret').value = mihomo.secret || '';
+  // 这两个是 mihomo-pool 专用的：面板的 /api/v1/nodes 一次给出全部端口→
+  // 节点名，比开三十条隧道反查便宜。留空也能用，后端按主机推 8006。
+  $('#rc-pool').value = mihomo.pool || '';
+  $('#rc-pool-token').value = mihomo.pool_token || '';
   if (disc) {
     // 打开页面就把控制器状态说清楚：只弹端口号的时候，用户第一反应是
     // 「功能没做」，而不是「地址没填对」，得先把原因摆出来。
@@ -1549,6 +1553,8 @@ async function saveRecheckCfg() {
       // 控制器地址留空时后端按 host 推 9090；secret 只在设了才发
       api: $('#rc-api').value.trim(),
       secret: $('#rc-secret').value.trim(),
+      pool: $('#rc-pool').value.trim(),
+      pool_token: $('#rc-pool-token').value.trim(),
     },
   };
   const data = await api('/api/recheck/config', { config: cfg });
@@ -1573,6 +1579,8 @@ async function detectNodes() {
         ports: $('#rc-ports').value.trim(),
         api: $('#rc-api').value.trim(),
         secret: $('#rc-secret').value.trim(),
+        pool: $('#rc-pool').value.trim(),
+        pool_token: $('#rc-pool-token').value.trim(),
       },
     });
     if (!data.ok) throw new Error(data.error || '检测失败');
@@ -1607,7 +1615,11 @@ async function detectNodes() {
 function shortApiError(text) {
   const raw = String(text || '').trim();
   if (!raw) return '没拿到节点名，只显示端口';
-  return raw.replace(/^https?:\/\/\S+\s*/, '') || raw;
+  // 以前这里会剥掉开头的 URL 省宽度。但现在提示是多条原因拼起来的
+  //（9090 要 secret / 8006 Token 不对 / 反查卡在哪一步），剥掉第一段的
+  // 地址就只剩「返回 401：…」，看不出是哪一步断的。换成 flex 换行后
+  // 宽度不再是问题，原样显示。
+  return raw;
 }
 
 async function detectCustom() {
