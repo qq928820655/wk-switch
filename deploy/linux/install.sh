@@ -200,6 +200,32 @@ JSON
 }
 JSON
   fi
+
+  # 封号复检。默认关闭——它会真的往上游发对话请求，一次一点额度，
+  # 不该在用户还没看过说明的时候自己开跑。要用就在页面上打开总开关。
+  # mihomo 的 host/ports 可以留空让环境变量接管（WB_PROXY_DISCOVER_HOST /
+  # WB_PROXY_DISCOVER_PORTS），这里写的是 hub 那份的默认值。
+  if [ ! -f "$HOME_DIR/config/recheck.json" ]; then
+    cat > "$HOME_DIR/config/recheck.json" <<JSON
+{
+  "enabled": false,
+  "auto": true,
+  "auto_hour": 3,
+  "min_interval": 21600,
+  "gap_seconds": 3.0,
+  "timeout": 25.0,
+  "rotate_proxy": true,
+  "batch_limit": 20,
+  "mihomo": {
+    "enabled": true,
+    "host": "cli-proxy-mihomo",
+    "ports": "17901-17910",
+    "probe_url": "https://api.ipify.org",
+    "timeout": 10.0
+  }
+}
+JSON
+  fi
 }
 
 # ---------- 服务进程 ----------

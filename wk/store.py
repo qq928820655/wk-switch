@@ -33,7 +33,8 @@ DB_PATH = os.path.join(DATA_DIR, "accounts.db")
 #: 表结构版本。
 #: 2 = 唯一键从 (name, realm) 改成 (uid, realm)
 #: 3 = 加探针列（积分三元组 / 校验状态 / 校验时间），见 wk/probe.py
-SCHEMA_VERSION = 3
+#: 4 = 加封号复检列（名单状态 / 次数 / 时间 / 结论），见 wk/recheck.py
+SCHEMA_VERSION = 4
 
 #: 探针状态的中文名。与 wk/probe.py 的 STATE_* 常量一一对应，
 #: 界面上不再自己拼字符串。
@@ -43,6 +44,33 @@ PROBE_LABELS = {
     "unknown": "未确认",
     "skipped": "不可校验",
 }
+
+#: 复检名单状态的中文名。与 wk/recheck.py 的 TRACK_* 常量一一对应。
+RECHECK_LABELS = {
+    "pending": "待复检",
+    "banned": "封号中",
+    "revived": "已解封",
+    "auth": "凭据失效",
+    "unknown": "未确认",
+}
+
+#: 导入时自动进复检名单的文本特征。
+#:
+#: 对齐 banned-retry.mjs 的「扫 /status 自动识别」那条路径：来源系统（hub /
+#: manager / panel）把禁用原因写成 "banned by upstream" 的，导进来就该进名单。
+#:
+#: 只收风控措辞，绝不能把 "manual disable" 也扫进来——那是用户自己手动停用的
+#: 健康号，拖去敲门既浪费一次真实请求，也可能给它招新的风控。banned-retry
+#: 特意维护独立名单就是为了避开这个坑，这里用特征词达成同样效果。
+BANNED_HINTS = (
+    "banned by upstream",
+    "request illegal",
+    "11140",
+    "账号存在异常行为",
+    "请求被拦截",
+    "account has been restricted",
+    "unusual activity",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -74,6 +102,13 @@ CREATE TABLE IF NOT EXISTS accounts (
     credit_state  TEXT,
     checked_at    INTEGER DEFAULT 0,
     checked_note  TEXT,
+    -- 封号复检（见 wk/recheck.py）。recheck_state 为空串 = 不在名单里。
+    -- 判据与探针分开：一个号可以积分正常（credit_state=valid）但对话被
+    -- 风控拦掉，那种号只有这里能标出来。
+    recheck_state TEXT DEFAULT '',
+    recheck_count INTEGER DEFAULT 0,
+    recheck_at    INTEGER DEFAULT 0,
+    recheck_note  TEXT,
     UNIQUE (uid, realm)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_realm ON accounts(realm);
@@ -131,6 +166,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "credit_state": "TEXT",
         "checked_at": "INTEGER DEFAULT 0",
         "checked_note": "TEXT",
+        # ---- v3 → v4：封号复检 ----
+        # recheck_state 的默认值给空串而不是 NULL：查询里到处是
+        # `WHERE recheck_state = 'banned'`，NULL 参与比较永远是假，会让
+        # 老库里那些没复检过的号彻底查不出来。
+        "recheck_state": "TEXT DEFAULT ''",
+        "recheck_count": "INTEGER DEFAULT 0",
+        "recheck_at": "INTEGER DEFAULT 0",
+        "recheck_note": "TEXT",
     }
     current = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
     for name, decl in extra_cols.items():
@@ -187,6 +230,32 @@ def account_name(acc: Account) -> str:
     return "未命名"
 
 
+def banned_hint_of(acc: Account) -> str:
+    """从导入字段里找「来源系统已经把它标成封号」的证据。
+
+    字段名各家不同（reason / disabled_reason / note / 整个 payload），按名字
+    猜一定会漏，所以直接把这几处拼起来扫特征词，命中就把关键词附近挖出来
+    给界面显示——不把整份 payload 塞进提示里。
+    """
+    chunks: list[str] = []
+    for value in (acc.note, acc.extra.get("reason") if isinstance(acc.extra, dict) else "",
+                  acc.extra.get("disabled_reason") if isinstance(acc.extra, dict) else ""):
+        if value:
+            chunks.append(str(value))
+    if isinstance(acc.extra, dict):
+        raw = acc.extra.get("_raw")
+        if isinstance(raw, str):
+            chunks.append(raw)
+    text = " ".join(chunks)
+    low = text.lower()
+    for hint in BANNED_HINTS:
+        pos = low.find(hint.lower())
+        if pos >= 0:
+            start = max(0, pos - 20)
+            return text[start:pos + len(hint) + 30].strip()
+    return ""
+
+
 def identity_of(acc: Account) -> str:
     """唯一身份 = uid。uid 缺失时用 token 指纹兜底，保证仍然能落地。
 
@@ -235,9 +304,13 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
             name = account_name(acc)
             state = tok.token_state(acc.access_token, acc.expires_at, acc.refresh_token)
             payload = json.dumps(acc.to_dict(), ensure_ascii=False)
+            # 来源系统已经把它标成封号的，导进来就直接进复检名单。
+            # 这就是 banned-retry 的「扫 /status 自动识别」那条路径，
+            # 只是换成在入库时判一次，不用每轮去扫。
+            hint = banned_hint_of(acc)
 
             row = conn.execute(
-                "SELECT id, access_token FROM accounts WHERE uid = ? AND realm = ?",
+                "SELECT id, access_token, recheck_state FROM accounts WHERE uid = ? AND realm = ?",
                 (uid, realm),
             ).fetchone()
 
@@ -246,16 +319,23 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
                     """INSERT INTO accounts
                        (uid, realm, name, nickname, email, phone, access_token, refresh_token,
                         device_token, token_state, expires_at, domain, enterprise_id, enabled,
-                        source, payload, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        source, payload, created_at, updated_at,
+                        recheck_state, recheck_count, recheck_at, recheck_note)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (uid, realm, name, acc.nickname, acc.email, acc.phone,
                      acc.access_token, acc.refresh_token, acc.device_token, state,
                      acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
-                     source or acc.source, payload, now, now),
+                     source or acc.source, payload, now, now,
+                     "banned" if hint else "", 0, 0, hint[:200] or None),
                 )
                 stats["inserted"] += 1
                 action = "inserted"
             else:
+                # 「已在名单里」的判定：已有状态优先，没有才按这次的 hint 补。
+                # 不能反过来——复检结果（revived / auth）比导入字段新，
+                # 用导入字段覆盖会把刚解封的号重新打回 banned。
+                current_track = (row["recheck_state"] or "") if "recheck_state" in row.keys() else ""
+                new_track = current_track or ("banned" if hint else "")
                 # token 换了就作废旧的校验结果：同一 uid 重新扫码后拿到的是新
                 # 凭据，旧积分属于上一个 token，留着会让人以为「刚校验过」。
                 # token 没变（重复导入同一份文件）则保留，省一次上游查询。
@@ -265,12 +345,14 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
                         """UPDATE accounts SET
                              name=?, nickname=?, email=?, phone=?, access_token=?, refresh_token=?,
                              device_token=?, token_state=?, expires_at=?, domain=?, enterprise_id=?,
-                             enabled=?, source=?, payload=?, updated_at=?
+                             enabled=?, source=?, payload=?, updated_at=?,
+                             recheck_state=?, recheck_note=COALESCE(recheck_note, ?)
                            WHERE id=?""",
                         (name, acc.nickname, acc.email, acc.phone,
                          acc.access_token, acc.refresh_token, acc.device_token, state,
                          acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
-                         source or acc.source, payload, now, row["id"]),
+                         source or acc.source, payload, now,
+                         new_track, hint[:200] or None, row["id"]),
                     )
                 else:
                     conn.execute(
@@ -279,12 +361,14 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
                              device_token=?, token_state=?, expires_at=?, domain=?, enterprise_id=?,
                              enabled=?, source=?, payload=?, updated_at=?,
                              credit_remain=NULL, credit_used=NULL, credit_size=NULL,
-                             credit_state=NULL, checked_at=0, checked_note=NULL
+                             credit_state=NULL, checked_at=0, checked_note=NULL,
+                             recheck_state=?, recheck_note=COALESCE(recheck_note, ?)
                            WHERE id=?""",
                         (name, acc.nickname, acc.email, acc.phone,
                          acc.access_token, acc.refresh_token, acc.device_token, state,
                          acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
-                         source or acc.source, payload, now, row["id"]),
+                         source or acc.source, payload, now,
+                         new_track, hint[:200] or None, row["id"]),
                     )
                 stats["updated"] += 1
                 action = "updated"
@@ -307,13 +391,24 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
     return stats
 
 
-def list_accounts(realm: str = "", query: str = "", limit: int = 500) -> list[dict]:
-    """按版本筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。"""
+def list_accounts(realm: str = "", query: str = "", limit: int = 500,
+                  track: str = "") -> list[dict]:
+    """按版本筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。
+
+    `track` 按复检名单状态筛：传 "banned" 就是「封号复检」标签页要的那批。
+    用参数而不是另写一个查询，是为了让排序、脱敏、字段组装只有一份实现——
+    两份实现迟早会漂移，界面上就会出现某个字段在这里有、那里没有。
+    """
     sql = "SELECT * FROM accounts WHERE 1=1"
     args: list[Any] = []
     if realm in ("cn", "intl"):
         sql += " AND realm = ?"
         args.append(realm)
+    if track:
+        # 老库刚打开、ALTER 还没跑到时没有这列，用 IFNULL 也救不了；
+        # 那种情况由 _migrate 负责，这里只管正常路径。
+        sql += " AND IFNULL(recheck_state,'') = ?"
+        args.append(track)
     if query:
         sql += " AND (name LIKE ? OR uid LIKE ? OR nickname LIKE ? OR email LIKE ?)"
         like = f"%{query}%"
@@ -334,6 +429,9 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500) -> list[di
         keys = row.keys()
         credit_state = (row["credit_state"] if "credit_state" in keys else "") or ""
         checked_at = int((row["checked_at"] if "checked_at" in keys else 0) or 0)
+        recheck_state = (row["recheck_state"] if "recheck_state" in keys else "") or ""
+        recheck_count = int((row["recheck_count"] if "recheck_count" in keys else 0) or 0)
+        recheck_at = int((row["recheck_at"] if "recheck_at" in keys else 0) or 0)
         out.append({
             "id": row["id"],
             "name": row["name"],
@@ -363,6 +461,14 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500) -> list[di
             "checked": time.strftime("%m-%d %H:%M", time.localtime(checked_at))
                        if checked_at else "",
             "checked_note": (row["checked_note"] if "checked_note" in keys else "") or "",
+            # ---- 封号复检 ----
+            "recheck_state": recheck_state,
+            "recheck_label": RECHECK_LABELS.get(recheck_state, ""),
+            "recheck_count": recheck_count,
+            "recheck_at": recheck_at,
+            "recheck": time.strftime("%m-%d %H:%M", time.localtime(recheck_at))
+                       if recheck_at else "",
+            "recheck_note": (row["recheck_note"] if "recheck_note" in keys else "") or "",
         })
     return out
 
@@ -408,6 +514,20 @@ def stats() -> dict[str, Any]:
         ],
         "db_path": DB_PATH,
     }
+
+
+def recheck_stats() -> dict[str, Any]:
+    """复检名单的计数。标签页徽章与设置卡片用。"""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT IFNULL(recheck_state,'') AS s, COUNT(*) AS n FROM accounts GROUP BY s"
+        ).fetchall()
+    counts = {key: 0 for key in ("pending", "banned", "revived", "auth")}
+    for row in rows:
+        key = row["s"] or ""
+        if key in counts:
+            counts[key] = row["n"]
+    return {**counts, "tracked": sum(counts.values())}
 
 
 def load_for_export(realm: str = "", ids: list[int] | None = None) -> list[Account]:
@@ -481,7 +601,9 @@ def load_for_probe(ids: list[int] | None = None, realm: str = "") -> list[tuple[
     和 load_for_export 的区别是它要回填结果，所以必须知道每一条对应哪一行。
     ids 为空表示「库里全部」（可按 realm 再筛一层），界面上「校验全部」走这条。
     """
-    sql = "SELECT id, payload FROM accounts WHERE 1=1"
+    sql = "SELECT id, payload, IFNULL(recheck_state,'') AS recheck_state, "
+    sql += "IFNULL(recheck_count,0) AS recheck_count, IFNULL(recheck_at,0) AS recheck_at "
+    sql += "FROM accounts WHERE 1=1"
     args: list[Any] = []
     if ids:
         sql += " AND id IN (%s)" % ",".join("?" * len(ids))
@@ -497,7 +619,13 @@ def load_for_probe(ids: list[int] | None = None, realm: str = "") -> list[tuple[
                 data = json.loads(row["payload"] or "{}")
             except ValueError:
                 continue
-            out.append((int(row["id"]), _account_from_payload(data)))
+            acc = _account_from_payload(data)
+            # 复检状态只活在库里，不在 payload 里（payload 是导入时的快照，
+            # 我们后写的状态不该混进去，否则导出的文件会带上本机的复检记录）。
+            acc.recheck_state = row["recheck_state"] or ""
+            acc.recheck_count = int(row["recheck_count"] or 0)
+            acc.recheck_at = int(row["recheck_at"] or 0)
+            out.append((int(row["id"]), acc))
     return out
 
 
@@ -534,6 +662,73 @@ def update_credits(results: list[dict[str, Any]]) -> int:
             )
             written += 1
     return written
+
+
+def update_recheck(results: list[dict[str, Any]]) -> int:
+    """把复检结论写回库。
+
+    results 里每条：{id, verdict, detail, raw, checked_at, skipped}
+
+    `skipped`（被最小间隔挡下）不写：它没有产生新的结论，写进去会把
+    recheck_count 刷高，下一次判断间隔时就失真了。
+    """
+    if not results:
+        return 0
+    from . import recheck as recheck_mod
+
+    written = 0
+    with connect() as conn:
+        for item in results:
+            row_id = item.get("id")
+            if row_id is None or item.get("skipped"):
+                continue
+            verdict = str(item.get("verdict") or "")
+            row = conn.execute(
+                "SELECT IFNULL(recheck_state,'') AS s, IFNULL(recheck_count,0) AS n "
+                "FROM accounts WHERE id = ?", (int(row_id),)
+            ).fetchone()
+            if row is None:
+                continue
+            state = recheck_mod.next_track(row["s"] or "", verdict)
+            note = str(item.get("detail") or item.get("raw") or "")[:200] or None
+            conn.execute(
+                """UPDATE accounts SET
+                     recheck_state = ?, recheck_count = ?, recheck_at = ?, recheck_note = ?
+                   WHERE id = ?""",
+                (state, int(row["n"] or 0) + 1,
+                 int(item.get("checked_at") or time.time()), note, int(row_id)),
+            )
+            written += 1
+    return written
+
+
+def set_track(ids: list[int], state: str, note: str = "") -> int:
+    """手工把账号加进 / 移出复检名单。
+
+    `state=""` 表示移出名单（健康号归位）。这里不校验账号是否真的被封——
+    用户手工加进来的号就是要敲门，判断留给复检本身去做。
+    """
+    if not ids:
+        return 0
+    if state and state not in RECHECK_LABELS:
+        raise ValueError(f"未知的名单状态：{state}")
+    placeholders = ",".join("?" * len(ids))
+    with connect() as conn:
+        if state:
+            cur = conn.execute(
+                f"UPDATE accounts SET recheck_state = ?, recheck_note = COALESCE(?, recheck_note) "
+                f"WHERE id IN ({placeholders})",
+                [state, (note[:200] or None)] + [int(i) for i in ids],
+            )
+        else:
+            # 移出名单时把计数和时间一起清掉：留着会让下一次加入时
+            # 立刻被最小间隔挡住，用户会以为按钮没生效。
+            cur = conn.execute(
+                f"UPDATE accounts SET recheck_state = '', recheck_count = 0, "
+                f"recheck_at = 0, recheck_note = NULL WHERE id IN ({placeholders})",
+                [int(i) for i in ids],
+            )
+        return cur.rowcount or 0
 
 
 def delete(ids: list[int]) -> int:

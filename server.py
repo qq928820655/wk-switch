@@ -18,7 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from wk import auth, formats, pipeline, probe, store, update as updater, version
+from wk import (auth, formats, pipeline, probe, recheck, store,
+                update as updater, version)
 from wk.model import Account
 
 ROOT = Path(__file__).resolve().parent
@@ -186,6 +187,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/probe/config":
             self._json(200, {"ok": True, "config": probe_config()})
             return
+        if path == "/api/recheck/config":
+            self._recheck_config_get()
+            return
+        if path == "/api/recheck/list":
+            self._recheck_list()
+            return
         if path.startswith("/api/download/"):
             self._download(path[len("/api/download/"):])
             return
@@ -235,6 +242,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._probe(payload)
             elif path == "/api/probe/all":
                 self._probe_all(payload)
+            elif path == "/api/recheck/run":
+                self._recheck_run(payload)
+            elif path == "/api/recheck/config":
+                self._recheck_config_set(payload)
+            elif path == "/api/recheck/nodes":
+                self._recheck_nodes(payload)
+            elif path == "/api/recheck/track":
+                self._recheck_track(payload)
             elif path == "/api/update/apply":
                 self._update_apply()
             elif path == "/api/update/local":
@@ -704,6 +719,135 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("库里没有账号")
         self._json(200, self._run_probe(pairs))
 
+    # ---- 封号复检 -------------------------------------------------
+    def _recheck_config_get(self) -> None:
+        """读设置。节点只列地址不探测——打开页面就发十个请求太重。"""
+        cfg = recheck.load_config()
+        self._json(200, {
+            "ok": True,
+            "config": cfg,
+            "nodes": recheck.discover_nodes(cfg, probe_now=False),
+            "stats": store.recheck_stats(),
+            "track_labels": store.RECHECK_LABELS,
+        })
+
+    def _recheck_list(self) -> None:
+        """名单行。默认只出 banned——「封号复检」页要的就是这一批。"""
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlparse(self.path).query)
+        realm = (query.get("realm") or [""])[0]
+        keyword = (query.get("q") or [""])[0]
+        track = (query.get("track") or ["banned"])[0]
+        allowed = ("banned", "pending", "revived", "auth")
+        rows = store.list_accounts(
+            realm=realm if realm in ("cn", "intl") else "",
+            query=keyword,
+            track=track if track in allowed else "banned",
+        )
+        self._json(200, {
+            "ok": True,
+            "track": track if track in allowed else "banned",
+            "rows": rows,
+            "stats": store.recheck_stats(),
+            "config": recheck.load_config(),
+        })
+
+    def _recheck_run(self, payload: dict) -> None:
+        """跑一轮复检。
+
+        没有 `ids` 就跑名单里那一档（默认 banned）；给了 `ids` 就只测这几个。
+        `force` 跳过最小间隔——界面上「立即复检」用的就是它。
+        """
+        cfg = recheck.load_config()
+        if not cfg["enabled"]:
+            raise ValueError("封号复检没开启：先在设置里打开总开关")
+
+        ids = payload.get("ids") or []
+        if ids:
+            pairs = store.load_for_probe(ids=[int(i) for i in ids if str(i).isdigit()])
+        else:
+            track = str(payload.get("track") or "banned")
+            if track not in ("banned", "pending", "revived", "auth"):
+                track = "banned"
+            rows = store.list_accounts(track=track, limit=cfg["batch_limit"])
+            pairs = store.load_for_probe(ids=[r["id"] for r in rows])
+
+        if not pairs:
+            raise ValueError("名单里没有账号，无需复检")
+
+        runner = recheck.Runner(cfg)
+        results = runner.run(pairs, force=bool(payload.get("force")))
+        written = store.update_recheck(results)
+
+        self._json(200, {
+            "ok": True,
+            "written": written,
+            "summary": recheck.summarize(results),
+            "results": [
+                {
+                    "id": item["id"],
+                    "verdict": item["verdict"],
+                    "detail": item["detail"],
+                    "raw": item["raw"],
+                    "status": item["status"],
+                    "latency_ms": item["latency_ms"],
+                    "proxy": item["proxy"],
+                    "skipped": item.get("skipped", False),
+                }
+                for item in results
+            ],
+            "stats": store.recheck_stats(),
+            "rows": store.list_accounts(track="banned"),
+        })
+
+    def _recheck_config_set(self, payload: dict) -> None:
+        """保存设置。`config` 里可以只带要改的字段。"""
+        patch = payload.get("config")
+        if not isinstance(patch, dict):
+            patch = payload
+        cfg = recheck.save_config(patch)
+        self._json(200, {
+            "ok": True,
+            "config": cfg,
+            "nodes": recheck.discover_nodes(cfg, probe_now=False),
+            "stats": store.recheck_stats(),
+        })
+
+    def _recheck_nodes(self, payload: dict) -> None:
+        """自动检测 mihomo 节点。
+
+        允许在 body 里临时给 host/ports 试一下（不保存）：用户手上有两三套
+        mihomo，得先确认哪套能用再决定写不写配置。
+        """
+        cfg = recheck.load_config()
+        patch = payload.get("mihomo") if isinstance(payload.get("mihomo"), dict) else None
+        if patch:
+            cfg = dict(cfg)
+            cfg["mihomo"] = {**cfg["mihomo"], **patch}
+            cfg["mihomo"]["timeout"] = recheck._float(
+                cfg["mihomo"].get("timeout"), 10.0, 3.0, 60.0)
+        self._json(200, {"ok": True, **recheck.discover_nodes(cfg, probe_now=True)})
+
+    def _recheck_track(self, payload: dict) -> None:
+        """手工加进 / 移出名单。state 为空串表示移出。"""
+        ids = payload.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("没有选中账号")
+        state = str(payload.get("state") or "")
+        note = str(payload.get("note") or "")
+        changed = store.set_track(
+            [int(i) for i in ids if str(i).isdigit()],
+            state if state in store.RECHECK_LABELS else "",
+            note,
+        )
+        self._json(200, {
+            "ok": True,
+            "changed": changed,
+            "stats": store.recheck_stats(),
+            "rows": store.list_accounts(track="banned"),
+        })
+
     def _run_probe(self, pairs: list) -> dict:
         """跑探针 + 回写 + 返回汇总。两条路由共用这一份。"""
         cfg = probe_config()
@@ -805,9 +949,68 @@ def _guess_type(path: Path) -> str:
     }.get(path.suffix.lower(), "application/octet-stream")
 
 
+#: 自动复检上一次跑的时间戳。只在进程内记：重启后最多多跑一次，
+#: 比往库里塞一张「调度表」简单，也不会跟用户手工点击抢锁。
+_auto_state = {"last_day": ""}
+_auto_lock = threading.Lock()
+
+
+def _auto_recheck_once() -> None:
+    """到点就跑一轮。由 `_auto_recheck_loop` 每分钟调一次。"""
+    cfg = recheck.load_config()
+    if not cfg["enabled"] or not cfg["auto"]:
+        return
+
+    now = time.localtime()
+    today = time.strftime("%Y-%m-%d", now)
+    if now.tm_hour < cfg["auto_hour"]:
+        return
+    with _auto_lock:
+        if _auto_state["last_day"] == today:
+            return
+        _auto_state["last_day"] = today  # 先占位：跑挂了也不该每分钟重试
+
+    try:
+        rows = store.list_accounts(track="banned", limit=cfg["batch_limit"])
+        if not rows:
+            return
+        pairs = store.load_for_probe(ids=[r["id"] for r in rows])
+        results = recheck.Runner(cfg).run(pairs)
+        written = store.update_recheck(results)
+        stats = recheck.summarize(results)
+        print(f"[auto-recheck] {today} 复检 {written} 个，"
+              f"解封 {stats.get('revived', 0)}，仍封 {stats.get('banned', 0)}")
+    except Exception as exc:  # noqa: BLE001 — 定时任务不能把服务带崩
+        print(f"[auto-recheck] 失败：{type(exc).__name__}: {exc}")
+
+
+def _auto_recheck_loop() -> None:
+    """守护线程：每分钟看一眼该不该跑。
+
+    为什么不用 Timer / 计划任务：这个服务在容器里跑，没有 cron，也不能
+    假定 systemd；一个 daemon 线程是唯一在所有部署形态下都成立的做法。
+    """
+    while True:
+        try:
+            _auto_recheck_once()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(60)
+
+
+def start_auto_recheck() -> None:
+    """起自动复检线程。重复调用安全（只起一次）。"""
+    if getattr(start_auto_recheck, "_started", False):
+        return
+    start_auto_recheck._started = True
+    t = threading.Thread(target=_auto_recheck_loop, name="wk-auto-recheck", daemon=True)
+    t.start()
+
+
 def serve(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
+    start_auto_recheck()
     return httpd
 
 

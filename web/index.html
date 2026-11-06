@@ -19,6 +19,7 @@
   <nav class="tabs" id="tabs">
     <button class="tab active" data-view="convert">导入转换</button>
     <button class="tab" data-view="store">账户库 <span class="tab-count" id="store-count">0</span></button>
+    <button class="tab" data-view="recheck">封号复检 <span class="tab-dot" id="recheck-dot" hidden></span></button>
     <button class="tab" data-view="update">升级 <span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
 
@@ -337,6 +338,154 @@
   </section>
 
 </div><!-- /view-update -->
+
+<!-- ============ 封号复检 ============ -->
+<div id="view-recheck" class="hidden">
+
+  <section class="card">
+    <div class="card-head">
+      <h2>封号复检</h2>
+      <span class="hint">对风控报错的账号发一次最小对话（max_tokens=5），200 就算解封</span>
+    </div>
+
+    <div class="rc-switches">
+      <label class="rc-switch">
+        <input type="checkbox" id="rc-enabled">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>开启封号复检</b><small>关掉后复检按钮不生效，名单只做归档</small></span>
+      </label>
+      <label class="rc-switch">
+        <input type="checkbox" id="rc-auto">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>每天自动复检</b><small>服务跑着就到点自己敲门，不用挂计划任务</small></span>
+      </label>
+      <label class="rc-switch">
+        <input type="checkbox" id="rc-rotate">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>按号轮换出口节点</b><small>每个号走不同 mihomo 端口，别用同一个 IP 重复敲门</small></span>
+      </label>
+    </div>
+
+    <div class="rc-grid">
+      <label class="field">
+        <span>同号最短间隔（分钟）</span>
+        <input type="number" id="rc-min-interval" min="10" step="10">
+      </label>
+      <label class="field">
+        <span>每轮最多复检（个）</span>
+        <input type="number" id="rc-batch" min="1" max="200" step="1">
+      </label>
+      <label class="field">
+        <span>号与号之间间隔（秒）</span>
+        <input type="number" id="rc-gap" min="1" max="60" step="1">
+      </label>
+      <label class="field">
+        <span>单次请求超时（秒）</span>
+        <input type="number" id="rc-timeout" min="5" max="120" step="5">
+      </label>
+      <label class="field">
+        <span>每日自动复检时间（点）</span>
+        <input type="number" id="rc-auto-hour" min="0" max="23" step="1">
+      </label>
+    </div>
+
+    <div class="export-bar">
+      <button class="btn primary" id="btn-rc-save">保存设置</button>
+      <span class="hint" id="rc-save-hint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>mihomo 节点</h2>
+      <span class="hint">一个端口 = 一个固定出口，能出网就算可用</span>
+    </div>
+
+    <div class="rc-grid">
+      <label class="field">
+        <span>主机名 / 地址</span>
+        <input type="text" id="rc-host" placeholder="cli-proxy-mihomo" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>端口（区间或逗号分隔）</span>
+        <input type="text" id="rc-ports" placeholder="17901-17910" spellcheck="false">
+      </label>
+    </div>
+
+    <div class="export-bar">
+      <button class="btn" id="btn-rc-detect">自动检测</button>
+      <span class="hint" id="rc-detect-hint">环境变量 WB_PROXY_DISCOVER_HOST / WB_PROXY_DISCOVER_PORTS 优先于这两栏</span>
+    </div>
+
+    <div class="node-list" id="rc-nodes"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>复检名单 <span class="badge" id="rc-tracked">0</span></h2>
+      <div class="head-right">
+        <button class="btn small" id="btn-rc-run" title="按最小间隔检查，到点的才敲">开始复检</button>
+        <button class="btn small" id="btn-rc-force" title="无视最小间隔，立刻敲一次">立即复检</button>
+      </div>
+    </div>
+
+    <div class="store-toolbar">
+      <div class="seg" id="rc-track-seg">
+        <label><input type="radio" name="rc-track" value="banned" checked><span>封号中</span></label>
+        <label><input type="radio" name="rc-track" value="pending"><span>待复检</span></label>
+        <label><input type="radio" name="rc-track" value="revived"><span>已解封</span></label>
+        <label><input type="radio" name="rc-track" value="auth"><span>凭据失效</span></label>
+      </div>
+
+      <label class="search-box">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
+        </svg>
+        <input type="search" id="rc-search" placeholder="搜索名称 / uid / 邮箱">
+      </label>
+    </div>
+
+    <div class="sel-bar" id="rc-sel-bar">
+      <span class="sel-count" id="rc-sel-count">未选择</span>
+      <div class="sel-actions">
+        <button class="btn small" id="btn-rc-sel-probe" disabled>复检选中</button>
+        <button class="btn small" id="btn-rc-sel-remove" disabled>移出名单</button>
+        <button class="link" id="btn-rc-sel-clear" disabled>取消</button>
+      </div>
+    </div>
+
+    <div class="table-wrap tall">
+      <table class="grid" id="rc-table">
+        <thead>
+          <tr>
+            <th class="col-check"><input type="checkbox" id="rc-check-all" title="全选本页"></th>
+            <th>名称</th><th class="col-rc-realm">版本</th><th class="col-rc-state">复检</th>
+            <th class="col-credit">积分</th>
+            <th class="col-rc-count">次数</th><th class="col-rc-at">上次复检</th>
+            <th>结论</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="hint" id="rc-hint"></p>
+    <p class="hint probe-hint" id="rc-result" hidden></p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>把账号加进名单</h2>
+      <span class="hint">导入时带了风控原因的会自动进来；这里补手工的</span>
+    </div>
+    <div class="export-bar">
+      <select id="rc-add-select" class="rc-pick">
+        <option value="">从账户库里选一个账号…</option>
+      </select>
+      <button class="btn" id="btn-rc-add">加入复检名单</button>
+    </div>
+  </section>
+
+</div><!-- /view-recheck -->
 
 </main>
 

@@ -645,3 +645,214 @@ def summarize(results: Iterable[dict]) -> dict:
         "remain_total": round(remain, 2),
         "with_credit": known_remain,
     }
+
+
+# ======================================================================
+# 对话探测：给「封号复检」用
+# ======================================================================
+# 为什么不能用上面的计费接口判定封号：
+#   实测（GenLiya/workbuddy-registration-notes README 5.2）账号被风控后，
+#   计费接口照样返回 code=0、积分照样查得到——封的是「对话」这条链路。
+#   所以想验证「解封了没有」，唯一有效的动作是发一次真实的对话请求。
+#
+# 为什么不能刷新 token：
+#   见模块顶部。复检只用现有 access_token，401 就认了。
+
+#: 对话端点。国内版和国际版的 base 与计费不是一套：
+#:   计费 cn 走 www.codebuddy.cn，对话 cn 走 copilot.tencent.com；
+#:   www.workbuddy.cn 是同一个后端的另一个入口，海外出口连 copilot 会被
+#:   复位 TLS（hub 的 wb_identity 里记着这条），所以留作备用。
+CHAT_BASES_CN = ("https://copilot.tencent.com", "https://www.workbuddy.cn")
+CHAT_BASES_INTL = ("https://www.workbuddy.ai",)
+
+#: 上游对话路径。hub 的 `CHAT_PATH = "/v2/chat/completions"`（wb_proxy.py:303），
+#: 不带前缀的版本在部分边缘节点也认，按 404 自动切换。
+CHAT_PATHS = ("/v2/chat/completions", "/chat/completions")
+
+#: 探测模型。面板侧写 `cn:hy3` / `global:hy3`，那个前缀是面板自己用来分池的，
+#: 转发到上游时被剥掉——上游认得的是裸 `hy3`。送带前缀的名字会拿到
+#: 11133 model_param_invalid，把「还封着」误报成「参数错误」。
+CHAT_MODEL = "hy3"
+
+#: 账号级风控的特征。
+#: 实测正文（两套措辞都来自生产）：
+#:   {"code":11140,"msg":"request illegal",
+#:    "displayMsg":{"zh":"账号存在异常行为，已被限制使用"}}
+#:   {"msg":"request illegal","displayMsg":{"zh":"请求被拦截，请重新发送"}}
+#: 只收实测出现的措辞，不猜同义词——多收一个词就会把内容审核的 403 判成封号。
+RESTRICT_CODE = "11140"
+RESTRICT_MARKERS = (
+    "request illegal",
+    "请求被拦截",
+    "账号存在异常行为",
+    "已被限制",
+    "unusual activity",
+    "account has been restricted",
+    "account is restricted",
+)
+
+#: 复检结论。和 STATE_* 分开：这里问的是「账号还能不能用对话」，
+#: 不是「token 还有没有效」。一个号可以 token 有效但对话被封。
+RECHECK_REVIVED = "revived"    # 对话通了 —— 风控已解除
+RECHECK_BANNED = "banned"      # 仍被风控拦（11140 一类）
+RECHECK_AUTH = "auth"          # 凭据本身失效（401），与封号无关
+RECHECK_UNKNOWN = "unknown"    # 网络故障 / 限流 / 无法判定
+RECHECK_SKIPPED = "skipped"    # 本地就知道测不了（无 token / 加密信封 / 静态 Key）
+
+
+def _chat_bases(acc: Account) -> tuple[str, ...]:
+    return CHAT_BASES_CN if (acc.realm or "").lower() == "cn" else CHAT_BASES_INTL
+
+
+def looks_restricted(text: str) -> bool:
+    """正文里有没有账号级风控的特征。
+
+    单独立成函数是为了让测试能直接打它：这条判据错了，整套复检的结论
+    就全反了（把「封着」判成「解封」会让人把废号重新导回生产）。
+    """
+    low = str(text or "").lower()
+    if RESTRICT_CODE in low:
+        return True
+    return any(marker.lower() in low for marker in RESTRICT_MARKERS)
+
+
+def _body_text(body: Any) -> str:
+    """把响应体压成一段可搜索的文本。
+
+    上游把关键信息分散在 msg / displayMsg.{zh,en} / error.message 里，
+    有的版本还会把整个 JSON 再套一层字符串。全部拼起来搜，比逐字段试稳。
+    """
+    if isinstance(body, str):
+        return body
+    if not isinstance(body, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("msg", "message", "error", "code", "detail", "displayMsg"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            parts.extend(str(v) for v in value.values())
+        elif value is not None:
+            parts.append(str(value))
+    raw = body.get("_raw")
+    if isinstance(raw, str):
+        parts.append(raw)
+    return " ".join(parts)
+
+
+def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "") -> dict:
+    """发一次最小对话请求，判断这个号的对话链路还能不能用。
+
+    返回：
+      verdict    revived / banned / auth / unknown / skipped
+      detail     一句话结论（给界面显示）
+      raw       上游原话（截断 200 字，排查用）
+      status    HTTP 状态码
+      endpoint  实际打通的地址
+      latency_ms
+
+    成本：max_tokens=5、单轮、不流式。这个请求会真扣一点点额度，所以复检
+    频率必须由调用方控制——本函数不做节流，`wk/recheck.py` 负责。
+    """
+    started = time.time()
+    out: dict[str, Any] = {
+        "verdict": RECHECK_UNKNOWN,
+        "detail": "",
+        "raw": "",
+        "status": 0,
+        "endpoint": "",
+        "latency_ms": 0,
+    }
+
+    token = str(acc.access_token or "").strip()
+    if not token:
+        out.update(verdict=RECHECK_SKIPPED, detail="没有 access token")
+        return out
+    if acc.is_envelope:
+        out.update(verdict=RECHECK_SKIPPED, detail="token 为加密信封，无法探测")
+        return out
+    if acc.is_api_key:
+        # 静态 Key 不走 OAuth 对话链路，复检对它没有意义
+        out.update(verdict=RECHECK_SKIPPED, detail="静态 API Key 不适用封号复检")
+        return out
+
+    headers = _headers(acc)
+    headers["Accept"] = "application/json"
+    body = {
+        "model": CHAT_MODEL,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 5,
+        "stream": False,
+    }
+    proxy = proxy or acc.proxy
+
+    last_error = ""
+    for base in _chat_bases(acc):
+        for path in CHAT_PATHS:
+            url = base + path
+            try:
+                status, payload = _post_json(url, body, headers, timeout, proxy)
+            except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                status, payload = 0, {}
+                break  # 这个 base 连不通，换下一个
+            if status == 404:
+                continue  # 路径不对，试另一个前缀
+            return _read_chat_reply(status, payload, url, started)
+
+        if status == 0:
+            continue
+
+    out.update(detail="所有对话端点都不可达" if not last_error else "上游不可达",
+               raw=last_error[:200])
+    out["latency_ms"] = int((time.time() - started) * 1000)
+    return out
+
+
+def _read_chat_reply(status: int, payload: Any, url: str, started: float) -> dict:
+    """把一次对话响应翻成复检结论。
+
+    判定顺序不能换：先看风控特征，再看 401/403，最后才认 200。
+    理由是上游偶尔在「被限制」时也回 200 + 一段业务错误体（网关降级），
+    先认 200 会把封着的号判成解封。
+    """
+    text = _body_text(payload)
+    out = {
+        "status": status,
+        "endpoint": url,
+        "raw": text[:200],
+        "latency_ms": int((time.time() - started) * 1000),
+    }
+
+    if looks_restricted(text):
+        out.update(verdict=RECHECK_BANNED,
+                   detail="仍被风控拦截（账号级限制，等上游自动解除）")
+        return out
+
+    if status == 401:
+        # 401 只可能是凭据本身不认了（网关鉴权层直接拒，正文常常是空白
+        # HTML，没有业务提示词可搜）。判 auth 而不是 unknown：这个号确实
+        # 不该再敲门，等用户重新导入。
+        out.update(verdict=RECHECK_AUTH, detail="凭据失效（401），需要重新登录")
+        return out
+
+    if status == 403:
+        # 风控分支在上面已经 return 了，走到这里说明 403 不是风控措辞——
+        # 多半是内容审核或权限，不能算「仍被封」，也不能算解封。
+        out.update(verdict=RECHECK_UNKNOWN,
+                   detail="HTTP 403，但正文没有风控特征，无法判定")
+        return out
+
+    if status == 429:
+        out.update(verdict=RECHECK_UNKNOWN, detail="上游限流，复检结果不可信")
+        return out
+
+    if status == 200:
+        out.update(verdict=RECHECK_REVIVED, detail="对话已通，风控解除")
+        return out
+
+    if status == 0:
+        out.update(verdict=RECHECK_UNKNOWN, detail="连接失败")
+        return out
+
+    out.update(verdict=RECHECK_UNKNOWN, detail=f"HTTP {status}，未确认")
+    return out

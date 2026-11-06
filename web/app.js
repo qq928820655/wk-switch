@@ -1054,6 +1054,248 @@ async function saveSource() {
   }
 }
 
+/* ---------- 封号复检 ---------- */
+
+/* 名单状态 → 胶囊颜色。banned 用红（要处理），revived 用绿（已恢复），
+   auth 用灰（不是封号，不该跟封号抢注意力）。 */
+const RECHECK_PILL = { banned: 'bad', pending: 'warn', revived: 'ok', auth: 'mute' };
+const RECHECK_TEXT = { banned: '封号中', pending: '待复检', revived: '已解封', auth: '凭据失效' };
+
+const recheckState = {
+  cfg: null, rows: [], nodes: [], track: 'banned', q: '',
+  selected: new Set(), running: false,
+};
+
+async function loadRecheck() {
+  const data = await apiGet('/api/recheck/config');
+  if (!data.ok) throw new Error(data.error || '读取复检设置失败');
+  recheckState.cfg = data.config;
+  fillRecheckForm(data.config, data.nodes);
+  renderTrackCounts(data.stats);
+  await loadRecheckRows();
+  loadRecheckPicker();
+}
+
+async function loadRecheckRows() {
+  const params = new URLSearchParams();
+  if (recheckState.track) params.set('track', recheckState.track);
+  if (recheckState.q) params.set('q', recheckState.q);
+  const data = await apiGet('/api/recheck/list?' + params.toString());
+  if (!data.ok) throw new Error(data.error || '读取名单失败');
+  recheckState.rows = data.rows || [];
+  recheckState.selected.clear();
+  renderRecheckTable();
+  renderTrackCounts(data.stats);
+}
+
+function fillRecheckForm(cfg, disc) {
+  $('#rc-enabled').checked = !!cfg.enabled;
+  $('#rc-auto').checked = !!cfg.auto;
+  $('#rc-rotate').checked = !!cfg.rotate_proxy;
+  // 秒 → 分钟：库里存秒，界面上写分钟更好懂
+  $('#rc-min-interval').value = Math.round((cfg.min_interval || 0) / 60);
+  $('#rc-batch').value = cfg.batch_limit;
+  $('#rc-gap').value = Math.round(cfg.gap_seconds || 3);
+  $('#rc-timeout').value = Math.round(cfg.timeout || 25);
+  $('#rc-auto-hour').value = cfg.auto_hour ?? 3;
+  const mihomo = cfg.mihomo || {};
+  $('#rc-host').value = mihomo.host || '';
+  $('#rc-ports').value = mihomo.ports || '';
+  if (disc) {
+    $('#rc-detect-hint').textContent = disc.probed
+      ? `检测到 ${disc.ok_count} / ${(disc.ports || []).length} 个可用出口`
+      : '环境变量 WB_PROXY_DISCOVER_HOST / WB_PROXY_DISCOVER_PORTS 优先于这两栏';
+    renderNodes(disc.nodes || [], disc.probed);
+  }
+}
+
+function renderNodes(nodes, probed) {
+  const box = $('#rc-nodes');
+  if (!nodes.length) {
+    box.innerHTML = '<p class="hint">没有配置端口</p>';
+    return;
+  }
+  box.innerHTML = nodes.map((n) => {
+    const label = n.url.replace(/^https?:\/\//, '');
+    if (!probed) {
+      return `<div class="node"><span class="node-url" title="${esc(label)}">${esc(label)}</span>
+        <span class="node-tail hint">未检测</span></div>`;
+    }
+    if (n.ok) {
+      return `<div class="node ok"><span class="node-url" title="${esc(label)}">${esc(label)}</span>
+        <span class="node-ip mono">${esc(n.exit_ip || '')}</span>
+        <span class="node-tail">${n.latency_ms} ms</span></div>`;
+    }
+    return `<div class="node bad"><span class="node-url" title="${esc(label)}">${esc(label)}</span>
+      <span class="node-tail" title="${esc(n.error || '')}">不可用</span></div>`;
+  }).join('');
+}
+
+function renderTrackCounts(stats) {
+  const banned = (stats && stats.banned) || 0;
+  // 徽章跟当前档位走，不显示 tracked 总数：切到「已解封」却看到 3 个
+  // 而表里只有 1 行，会让人以为分页丢了数据
+  const badge = $('#rc-tracked');
+  if (badge) badge.textContent = String(recheckState.rows.length);
+  // 标签页红点只在「有封号」时亮——它是个待办信号，不是装饰
+  const dot = $('#recheck-dot');
+  if (dot) dot.hidden = banned === 0;
+}
+
+function renderRecheckTable() {
+  const body = $('#rc-table tbody');
+  if (!recheckState.rows.length) {
+    body.innerHTML = '<tr><td colspan="9" class="empty-cell">这一档没有账号。导入带风控原因的账号会自动进名单。</td></tr>';
+    $('#rc-hint').textContent = '';
+    syncRecheckSelection();
+    return;
+  }
+
+  const sel = recheckState.selected;
+  body.innerHTML = recheckState.rows.map((r) => {
+    const state = r.recheck_state || '';
+    const pill = RECHECK_PILL[state] || 'mute';
+    const text = RECHECK_TEXT[state] || r.recheck_label || '—';
+    return `
+    <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}">
+      <td class="col-check"><input type="checkbox" class="rc-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
+      <td><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
+      <td class="col-rc-realm"><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
+      <td class="col-rc-state"><span class="pill ${pill}">${esc(text)}</span></td>
+      <td class="col-credit">${creditCell(r)}</td>
+      <td class="mono col-rc-count">${r.recheck_count || 0}</td>
+      <td class="mono col-rc-at">${esc(r.recheck) || '—'}</td>
+      <td class="rc-note" title="${esc(r.recheck_note || '')}">${esc(trimNote(r.recheck_note)) || '<span class="hint">—</span>'}</td>
+      <td class="row-actions"><button class="link danger" data-act="untrack">移出</button></td>
+    </tr>`;
+  }).join('');
+
+  $('#rc-hint').textContent = `共 ${recheckState.rows.length} 条`;
+  syncRecheckSelection();
+}
+
+/* 结论原文可能很长（上游原话），表格里只留前半段，完整内容挂 title */
+function trimNote(text) {
+  const s = String(text || '').trim();
+  return s.length > 46 ? s.slice(0, 46) + '…' : s;
+}
+
+function syncRecheckSelection() {
+  const n = recheckState.selected.size;
+  $('#rc-sel-count').textContent = n ? `已选 ${n} 条` : '未选择';
+  ['#btn-rc-sel-probe', '#btn-rc-sel-remove', '#btn-rc-sel-clear'].forEach((k) => {
+    $(k).disabled = n === 0;
+  });
+}
+
+async function saveRecheckCfg() {
+  const cfg = {
+    enabled: $('#rc-enabled').checked,
+    auto: $('#rc-auto').checked,
+    rotate_proxy: $('#rc-rotate').checked,
+    // 分钟 → 秒。后端会把小于 10 分钟的值钳回 600 秒，这里不用重复校验。
+    min_interval: Math.max(10, Number($('#rc-min-interval').value) || 360) * 60,
+    batch_limit: Number($('#rc-batch').value) || 20,
+    gap_seconds: Number($('#rc-gap').value) || 3,
+    timeout: Number($('#rc-timeout').value) || 25,
+    auto_hour: Number($('#rc-auto-hour').value) || 0,
+    mihomo: {
+      host: $('#rc-host').value.trim(),
+      ports: $('#rc-ports').value.trim(),
+    },
+  };
+  const data = await api('/api/recheck/config', { config: cfg });
+  recheckState.cfg = data.config;
+  fillRecheckForm(data.config, data.nodes);
+  renderTrackCounts(data.stats);
+  $('#rc-save-hint').textContent = `已保存 · ${new Date().toLocaleTimeString('zh-CN')}`;
+  toast('复检设置已保存');
+}
+
+async function detectNodes() {
+  const btn = $('#btn-rc-detect');
+  btn.disabled = true;
+  $('#rc-detect-hint').textContent = '正在检测…';
+  try {
+    const data = await api('/api/recheck/nodes', {
+      mihomo: {
+        host: $('#rc-host').value.trim(),
+        ports: $('#rc-ports').value.trim(),
+      },
+    });
+    if (!data.ok) throw new Error(data.error || '检测失败');
+    $('#rc-detect-hint').textContent = `检测到 ${data.ok_count} / ${(data.ports || []).length} 个可用出口`;
+    renderNodes(data.nodes || [], true);
+    if (!data.ok_count) {
+      $('#rc-detect-hint').textContent =
+        '一个都没通。确认 mihomo 在跑、端口对、本机能访问这个主机名';
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runRecheck(force, ids) {
+  if (recheckState.running) return;
+  const cfg = recheckState.cfg;
+  if (cfg && !cfg.enabled) {
+    toast('封号复检没开启，先打开上面的总开关', true);
+    return;
+  }
+  recheckState.running = true;
+  const out = $('#rc-result');
+  out.hidden = false;
+  out.classList.remove('bad');
+  out.textContent = force ? '正在复检（无视间隔）…' : '正在复检…';
+
+  const payload = { force: !!force };
+  if (ids && ids.length) payload.ids = ids;
+  else payload.track = recheckState.track;
+
+  try {
+    const data = await api('/api/recheck/run', payload);
+    const s = data.summary || {};
+    const bits = [
+      `解封 ${s.revived || 0}`,
+      `仍封 ${s.banned || 0}`,
+      `凭据失效 ${s.auth || 0}`,
+      `未确认 ${s.unknown || 0}`,
+    ];
+    if (s.skipped) bits.push(`跳过 ${s.skipped}（未到间隔）`);
+    out.textContent = `本轮 ${data.written} 个：` + bits.join(' · ');
+    if (!s.revived && (s.banned || s.unknown)) out.classList.add('bad');
+    await loadRecheckRows();
+  } finally {
+    recheckState.running = false;
+  }
+}
+
+async function trackSelected(state) {
+  const ids = [...recheckState.selected];
+  if (!ids.length) return;
+  const data = await api('/api/recheck/track', { ids, state });
+  recheckState.selected.clear();
+  renderTrackCounts(data.stats);
+  await loadRecheckRows();
+  toast(state ? `已加入名单：${data.changed} 条` : `已移出名单：${data.changed} 条`);
+}
+
+/* 手工把某个号拖进名单：下拉里列出全部账号，选一个加 */
+async function loadRecheckPicker() {
+  const select = $('#rc-add-select');
+  try {
+    const data = await apiGet('/api/store/list?');
+    if (!data.ok) return;
+    const rows = (data.rows || []).filter((r) => !r.recheck_state);
+    const keep = select.value;
+    select.innerHTML = '<option value="">从账户库里选一个账号…</option>'
+      + rows.map((r) => `<option value="${r.id}">${esc(r.name)} · ${esc(r.realm_label || '')}</option>`).join('');
+    if (keep) select.value = keep;
+  } catch (err) {
+    // 选人列表拿不到不影响主流程，静默
+  }
+}
+
 /* ---------- 视图切换 ---------- */
 
 function switchView(view) {
@@ -1062,10 +1304,14 @@ function switchView(view) {
   });
   $('#view-convert').classList.toggle('hidden', view !== 'convert');
   $('#view-store').classList.toggle('hidden', view !== 'store');
+  $('#view-recheck').classList.toggle('hidden', view !== 'recheck');
   $('#view-update').classList.toggle('hidden', view !== 'update');
   if (view === 'store') {
     loadStore().catch((err) => toast(err.message, true));
     loadStoreProfiles();
+  }
+  if (view === 'recheck') {
+    loadRecheck().catch((err) => toast(err.message, true));
   }
   if (view === 'update') {
     loadVersion().catch((err) => toast(err.message, true));
@@ -1126,6 +1372,88 @@ function bind() {
     storeRestore(file);
   });
   $('#btn-store-export').addEventListener('click', storeExport);
+
+  /* --- 封号复检 --- */
+  $('#btn-rc-save').addEventListener('click', () => {
+    saveRecheckCfg().catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-detect').addEventListener('click', () => {
+    detectNodes().catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-run').addEventListener('click', () => {
+    runRecheck(false).catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-force').addEventListener('click', () => {
+    runRecheck(true).catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-sel-probe').addEventListener('click', () => {
+    runRecheck(true, [...recheckState.selected]).catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-sel-remove').addEventListener('click', () => {
+    trackSelected('').catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-sel-clear').addEventListener('click', () => {
+    recheckState.selected.clear();
+    renderRecheckTable();
+  });
+  $('#btn-rc-add').addEventListener('click', () => {
+    const id = Number($('#rc-add-select').value);
+    if (!id) {
+      toast('先选一个账号', true);
+      return;
+    }
+    api('/api/recheck/track', { ids: [id], state: 'pending', note: '手工加入' })
+      .then((data) => {
+        $('#rc-add-select').value = '';
+        renderTrackCounts(data.stats);
+        return loadRecheckRows();
+      })
+      .then(() => toast('已加入复检名单'))
+      .catch((err) => toast(err.message, true));
+  });
+
+  // 名单档位切换与搜索：切了立刻重查
+  document.querySelectorAll('input[name="rc-track"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      if (!el.checked) return;
+      recheckState.track = el.value;
+      loadRecheckRows().catch((err) => toast(err.message, true));
+    });
+  });
+  let rcTimer = null;
+  $('#rc-search').addEventListener('input', (e) => {
+    clearTimeout(rcTimer);
+    rcTimer = setTimeout(() => {
+      recheckState.q = e.target.value.trim();
+      loadRecheckRows().catch((err) => toast(err.message, true));
+    }, 220);
+  });
+
+  // 表格里勾选与行内操作
+  $('#rc-check-all').addEventListener('change', (e) => {
+    const on = e.target.checked;
+    recheckState.selected.clear();
+    if (on) recheckState.rows.forEach((r) => recheckState.selected.add(r.id));
+    renderRecheckTable();
+  });
+  $('#rc-table').addEventListener('change', (e) => {
+    const box = e.target.closest('.rc-check');
+    if (!box) return;
+    const id = Number(box.dataset.id);
+    if (box.checked) recheckState.selected.add(id);
+    else recheckState.selected.delete(id);
+    const tr = box.closest('tr');
+    if (tr) tr.classList.toggle('sel', box.checked);
+    syncRecheckSelection();
+  });
+  $('#rc-table').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-act="untrack"]');
+    if (!btn) return;
+    const id = Number(btn.closest('tr').dataset.id);
+    recheckState.selected.clear();
+    recheckState.selected.add(id);
+    trackSelected('').catch((err) => toast(err.message, true));
+  });
 
   // 版本筛选与搜索：切换即重查，不用点按钮
   document.querySelectorAll('input[name="store-realm"]').forEach((el) => {

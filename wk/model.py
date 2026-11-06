@@ -153,6 +153,15 @@ class Account:
     #: 上次探测时间戳（秒）与失败原因，都只存探针写的，不跟导入字段混
     checked_at: int = 0
     checked_note: str = ""
+    # ---- 封号复检（见 wk/recheck.py）----------------------------------
+    #: 名单状态：空 / pending / banned / revived / auth。
+    #: 只有 banned 会进「封号复检」标签页。
+    recheck_state: str = ""
+    #: 复检次数与上次复检时间戳。min_interval 靠它判断能不能再敲一次。
+    recheck_count: int = 0
+    recheck_at: int = 0
+    #: 上次复检的结论原文（上游原话），排查用
+    recheck_note: str = ""
     created_at: int = 0
     api_key: bool = False
     tasks_enabled: bool = True

@@ -538,7 +538,10 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 
 /* ---------- 视图切换 ---------- */
 /* 三个视图各是一条规则：漏一个就会让上个视图的内容留在下面 */
-#view-convert.hidden, #view-store.hidden, #view-update.hidden { display: none; }
+/* 每个视图都要单独列：作者样式里的 display 会盖掉 UA 的 [hidden]，
+   漏一个就会出现「切走了还露在下面」——升级页踩过这个坑 */
+#view-convert.hidden, #view-store.hidden, #view-recheck.hidden,
+#view-update.hidden { display: none; }
 
 .tabs { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: var(--line-2); }
 
@@ -1082,4 +1085,169 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   #store-table .col-rt,
   #store-table .col-upd,
   #store-table .col-exp { display: none; }
+}
+
+/* ---------- 封号复检 ---------- */
+/* 三个开关横排，窄屏自动落成竖排。开关本身用滑块而不是原生 checkbox：
+   这三项都是「长期生效」的设置，不是一次性勾选，滑块能让当前状态一眼可见 */
+.rc-switches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 28px;
+  padding: 4px 0 16px;
+}
+
+.rc-switch {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  max-width: 300px;
+}
+.rc-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+.rc-box {
+  flex: none;
+  width: 36px;
+  height: 20px;
+  margin-top: 2px;
+  border-radius: 10px;
+  background: #d8dce8;
+  position: relative;
+  transition: background .18s ease;
+}
+.rc-box::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(16, 24, 40, .22);
+  transition: transform .18s ease;
+}
+.rc-switch input:checked + .rc-box { background: var(--brand); }
+.rc-switch input:checked + .rc-box::after { transform: translateX(16px); }
+.rc-switch input:focus-visible + .rc-box { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+.rc-text { display: flex; flex-direction: column; gap: 2px; }
+.rc-text b { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rc-text small { font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+
+.rc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 14px 18px;
+  padding: 4px 0 6px;
+}
+.rc-grid input {
+  width: 100%;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+}
+.rc-grid input:focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, .1);
+}
+/* 端口和主机名是给手填的地址，等宽字体读起来不容易串行 */
+#rc-host, #rc-ports { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+.node-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: #fbfcff;
+  font-size: 12.5px;
+  min-width: 0;
+}
+.node.ok { border-color: #c9ecda; background: #f7fdf9; }
+.node.bad { background: #fdfafa; }
+.node-url {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-ip {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--ok);
+  font-weight: 600;
+}
+.node-tail {
+  margin-left: auto;
+  flex: none;
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.node-ip + .node-tail { margin-left: 0; }
+.node.bad .node-tail { color: var(--bad); }
+
+/* 结论列：上游原话可能一长串，一行截断，全文挂在 title 上 */
+.rc-note {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.rc-pick {
+  width: min(360px, 100%);
+  padding: 8px 30px 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background-color: #fff;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.col-rc-state { width: 92px; }
+.col-rc-count { width: 58px; }
+.col-rc-at { width: 84px; }
+
+@media (max-width: 720px) {
+  /* 窄屏收掉次要列：名单要能一屏看完「谁被封、什么时候查的」 */
+  #rc-table .col-rc-count,
+  #rc-table .col-rc-at,
+  #rc-table .col-rc-realm { display: none; }
+  .rc-note { max-width: 120px; }
+  .rc-switches { gap: 12px 0; }
+  .rc-switch { max-width: none; }
+  /* 设置项走两列：一列排五行会把设置卡片拉成一屏半高，
+     而这五项都是小数字，两列放得下 */
+  .rc-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 12px; }
+  /* 节点走一列：两列时 `cli-proxy-mihomo:17901` 会被截成同一个前缀，
+     十个格子看起来一模一样，等于没显示 */
+  .node-list { grid-template-columns: 1fr; gap: 6px; }
+  .node { padding: 7px 9px; font-size: 11.5px; }
+  .node-url { font-size: 11px; }
+  .node-ip, .node-tail { font-size: 10.5px; }
 }
