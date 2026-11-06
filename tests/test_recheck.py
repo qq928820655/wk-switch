@@ -565,9 +565,9 @@ class ListenerNameTests(unittest.TestCase):
             {"url": "http://127.0.0.1:17902", "ok": True, "exit_ip": "2.2.2.2",
              "latency_ms": 20, "error": ""},
         ]
-        with mock.patch.object(recheck, "fetch_listeners",
-                               return_value={17901: {"name": "listener-1", "proxy": "香港01"},
-                                             17902: {"name": "listener-2", "proxy": ""}}), \
+        with mock.patch.object(recheck, "_fetch_listeners",
+                               return_value=({17901: {"name": "listener-1", "proxy": "香港01"},
+                                              17902: {"name": "listener-2", "proxy": ""}}, "")), \
              mock.patch.object(recheck, "probe_urls", return_value=nodes):
             data = recheck.discover_nodes(cfg, probe_now=True)
         self.assertEqual([n["name"] for n in data["nodes"]], ["香港01", "listener-2"])
@@ -577,7 +577,7 @@ class ListenerNameTests(unittest.TestCase):
     def test_discover_nodes_falls_back_to_address(self):
         """控制器不通时 name 是空串，前端退回显示地址。"""
         cfg = self._cfg("")
-        with mock.patch.object(recheck, "fetch_listeners", return_value={}), \
+        with mock.patch.object(recheck, "_fetch_listeners", return_value=({}, "连不上")), \
              mock.patch.object(recheck, "probe_urls",
                                return_value=[{"url": "http://127.0.0.1:17901",
                                               "ok": True, "exit_ip": "1.1.1.1",
@@ -590,6 +590,111 @@ class ListenerNameTests(unittest.TestCase):
         self.assertEqual(recheck.port_of("http://127.0.0.1:17901"), 17901)
         self.assertEqual(recheck.port_of(""), 0)
         self.assertEqual(recheck.port_of("不对"), 0)
+
+
+class ControllerErrorTests(unittest.TestCase):
+    """控制器拿不到名单时，原因必须能照着改。
+
+    界面上只写「控制器未通」等于没给信息：地址错、缺 secret、端点不存在，
+    三种处置完全不同。这里逐条钉住返回的文案。
+    """
+
+    def _fake(self, code: int = 200, payload: dict | None = None):
+        body = json.dumps(payload or {"listeners": []}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):  # noqa: N802
+                if code != 200:
+                    self.send_error(code)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _cfg(self, api: str) -> dict:
+        return {"mihomo": {"host": "127.0.0.1", "ports": "17901",
+                           "probe_url": "https://api.ipify.org", "timeout": 2.0,
+                           "api": api, "secret": "", "enabled": True}}
+
+    def test_401_says_need_secret(self):
+        port = self._fake(401)
+        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), 2.0)
+        self.assertEqual(names, {})
+        self.assertIn("secret", err)
+
+    def test_404_says_endpoint_missing(self):
+        port = self._fake(404)
+        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), 2.0)
+        self.assertEqual(names, {})
+        self.assertIn("/listeners", err)
+        self.assertIn("404", err)
+
+    def test_empty_listeners_is_reported(self):
+        """mihomo 通了但一个 listener 都没有，也得说清楚，不能当成「连上了」。"""
+        port = self._fake(200, {"listeners": []})
+        names, err = recheck._fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"), 2.0)
+        self.assertEqual(names, {})
+        self.assertIn("空", err)
+
+    def test_no_host_no_api_reports(self):
+        names, err = recheck._fetch_listeners(
+            {"mihomo": {"host": "", "api": "", "secret": ""}}, 1.0)
+        self.assertEqual(names, {})
+        self.assertIn("控制器", err)
+
+    def test_unreachable_never_raises(self):
+        names, err = recheck._fetch_listeners(self._cfg("http://127.0.0.1:1"), 1.0)
+        self.assertEqual(names, {})
+        self.assertTrue(err)
+
+
+class NodeKindTests(unittest.TestCase):
+    """类型标签只按名字推断，名字里没写就不标。"""
+
+    def test_residential(self):
+        for name in ("香港住宅01", "家庭宽带-广州", "HK Residential 03"):
+            self.assertEqual(recheck.node_kind(name), "住宅", name)
+
+    def test_datacenter(self):
+        for name in ("US-Datacenter-02", "IDC-新加坡", "台湾-机房-专线"):
+            self.assertEqual(recheck.node_kind(name), "机房", name)
+
+    def test_proxy(self):
+        for name in ("日本-代理-01", "socks5-入口"):
+            self.assertEqual(recheck.node_kind(name), "代理", name)
+
+    def test_residential_wins_over_proxy(self):
+        """「住宅代理」算住宅——那才是它的用处。"""
+        self.assertEqual(recheck.node_kind("德国-住宅代理"), "住宅")
+
+    def test_unknown_name_is_blank(self):
+        for name in ("节点A", "", "node-01"):
+            self.assertEqual(recheck.node_kind(name), "", name)
+
+    def test_label_nodes_fills_port_name_and_kind(self):
+        nodes = [{"url": "http://127.0.0.1:17950"}, {"url": "http://127.0.0.1:17951"}]
+        names = {17950: {"name": "mixed-in-1", "proxy": "香港住宅01"},
+                 17951: {"name": "mixed-in-2", "proxy": ""}}
+        got = recheck._label_nodes(nodes, names)
+        self.assertEqual(got[0]["port"], 17950)
+        self.assertEqual(got[0]["name"], "香港住宅01")
+        self.assertEqual(got[0]["kind"], "住宅")
+        # proxy 空就退到 listener 名，仍然不是地址
+        self.assertEqual(got[1]["name"], "mixed-in-2")
+        self.assertEqual(got[1]["kind"], "")
 
 
 if __name__ == "__main__":

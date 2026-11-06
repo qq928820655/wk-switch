@@ -1389,9 +1389,16 @@ function fillRecheckForm(cfg, disc) {
   $('#rc-api').value = mihomo.api || '';
   $('#rc-secret').value = mihomo.secret || '';
   if (disc) {
-    $('#rc-detect-hint').textContent = disc.probed
+    // 打开页面就把控制器状态说清楚：只弹端口号的时候，用户第一反应是
+    // 「功能没做」，而不是「地址没填对」，得先把原因摆出来。
+    let line = disc.probed
       ? `检测到 ${disc.ok_count} / ${(disc.ports || []).length} 个可用出口`
       : '环境变量 WB_PROXY_DISCOVER_HOST / WB_PROXY_DISCOVER_PORTS 优先于这两栏';
+    if (!disc.named) {
+      line += disc.api_error ? `｜${disc.api_error}` : '｜控制器未通，只显示端口';
+    }
+    $('#rc-detect-hint').textContent = line;
+    $('#rc-detect-hint').classList.toggle('bad', !disc.named);
     renderNodes(disc.nodes || [], disc.probed);
   }
 }
@@ -1427,31 +1434,40 @@ function renderCustomNodes(nodes) {
     : '<p class="hint">没有可测的地址</p>';
 }
 
-/* 节点卡片：节点名 + 出口 IP + 延迟。mihomo 和自定义出口共用这一份渲染，
-   两边显示不一致的话，用户会以为是两套不同的东西。
+/* 节点卡片：端口 + 节点名 + 类型 + 延迟。
 
-   显示优先级是「节点名 > 地址」。出口 IP 分不出线路——同一订阅里两个节点
-   出口落在同一段是常事，卡片上两格数字一模一样，看着像同一个槽测了两遍。
-   mihomo 的 listener 里带着出站节点名，那才是「我在用哪条线」的答案。
-   地址放 title 里，要核对端口的时候鼠标一悬停就有。 */
+   显示优先级是「节点名 > 端口号」，地址整串不占位。`127.0.0.1:` 这十一位
+   对每一张卡片都一样，纯占地方；真正要分辨的是「哪个槽」——那五位端口
+   就够了，名字有了之后连端口都只是配角。
+
+   出口 IP 挪进 title：判断两个槽是不是同一条出口还得看它，但那是核对时
+   才需要的东西，不该常驻在每张卡片上抢节点名的宽度。 */
 function nodeRows(nodes, probed) {
   return nodes.map((n) => {
     const addr = String(n.url || '').replace(/^https?:\/\//, '');
+    const port = String(n.port || addr.split(':').pop() || addr);
     const name = n.name || n.listener || '';
-    const text = name || addr;
-    const cls = name ? 'node-name' : 'node-url';
-    const tip = name ? `${name}（${addr}）` : addr;
-    const head = `<span class="${cls}" title="${esc(tip)}">${esc(text)}</span>`;
+    const kind = String(n.kind || '');
+    const kindCls = { '住宅': 'resi', '机房': 'dc', '代理': 'proxy' }[kind] || '';
+    const tip = [name, addr, n.exit_ip ? `出口 ${n.exit_ip}` : '']
+      .filter(Boolean).join(' · ');
+
+    const portCell = `<span class="node-port mono">${esc(port)}</span>`;
+    const nameCell = name
+      ? `<span class="node-name" title="${esc(tip)}">${esc(name)}</span>`
+      : `<span class="node-name none" title="${esc(tip)}">—</span>`;
+    const kindCell = kind
+      ? `<span class="node-kind ${kindCls}">${esc(kind)}</span>` : '';
+
     if (!probed) {
-      return `<div class="node">${head}
+      return `<div class="node" title="${esc(tip)}">${portCell}${nameCell}${kindCell}
         <span class="node-tail hint">未检测</span></div>`;
     }
     if (n.ok) {
-      return `<div class="node ok">${head}
-        <span class="node-ip mono">${esc(n.exit_ip || '')}</span>
+      return `<div class="node ok" title="${esc(tip)}">${portCell}${nameCell}${kindCell}
         <span class="node-tail">${n.latency_ms} ms</span></div>`;
     }
-    return `<div class="node bad">${head}
+    return `<div class="node bad" title="${esc(tip)}">${portCell}${nameCell}${kindCell}
       <span class="node-tail" title="${esc(n.error || '')}">不可用</span></div>`;
   }).join('');
 }
@@ -1556,11 +1572,14 @@ async function detectNodes() {
       },
     });
     if (!data.ok) throw new Error(data.error || '检测失败');
-    // 拿到节点名就说「检测到 N 个」，拿不到额外提一句控制器没通——
-    // 否则用户只会看到一串 IP，不知道自己填的控制器地址有没有生效
-    const named = data.named ? '' : '（控制器未通，只显示地址）';
-    $('#rc-detect-hint').textContent =
-      `检测到 ${data.ok_count} / ${(data.ports || []).length} 个可用出口${named}`;
+    // 拿不到节点名就把控制器的具体错因贴出来：地址错、要 secret、
+    // 端点不存在，三种处置完全不同，只说「未通」等于让人自己猜。
+    let line = `检测到 ${data.ok_count} / ${(data.ports || []).length} 个可用出口`;
+    if (!data.named) {
+      line += data.api_error ? `｜${data.api_error}` : '｜控制器未通，只显示端口';
+    }
+    $('#rc-detect-hint').textContent = line;
+    $('#rc-detect-hint').classList.toggle('bad', !data.named);
     renderNodes(data.nodes || [], true);
     if (!data.ok_count) {
       $('#rc-detect-hint').textContent =

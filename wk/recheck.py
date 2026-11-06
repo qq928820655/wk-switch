@@ -49,6 +49,7 @@ socks 进来只会在运行时抛错，所以在解析阶段就剔掉。
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import random
@@ -320,19 +321,21 @@ def api_base(mihomo: dict) -> str:
     return normalize_url(f"http://{host}:9090")
 
 
-def fetch_listeners(cfg: dict, timeout: float = 2.5) -> dict[int, dict]:
-    """问 mihomo 「这些端口各走哪个节点」，返回 {端口: {name, proxy}}。
+def _fetch_listeners(cfg: dict, timeout: float = 2.5) -> tuple[dict[int, dict], str]:
+    """问 mihomo 「这些端口各走哪个节点」，返回 ({端口: {name, proxy}}, 错误说明)。
 
     为什么要这一步：出口 IP 分不出线路。同一条订阅里两个节点落在同一个
     AS 的相邻段，甚至直接共用出口，卡片上两格都是 `103.41.4.26`，看起来
     像同一个槽位检测了两遍。mihomo 的 `/listeners` 里每个 listener 带
     `proxy` 字段（这个端口钉死的出站节点名），那才是用户在找的东西。
 
-    Clash 原版没有这个端点，mihomo 有；拿不到就返回空，前端退回显示地址。
+    Clash 原版没有这个端点，mihomo 有。拿不到时**必须把原因带出去**：
+    界面上只写「控制器未通」，用户不知道该改地址、补 secret，还是去给
+    mihomo 开 external-controller——这几种情况的处置完全不同。
     """
     base = api_base(cfg["mihomo"])
     if not base:
-        return {}
+        return {}, "没填控制器地址，也没能从代理主机推出来（主机为空）"
     headers = {"Accept": "application/json"}
     secret = str(cfg["mihomo"].get("secret") or "").strip()
     if secret:
@@ -343,11 +346,25 @@ def fetch_listeners(cfg: dict, timeout: float = 2.5) -> dict[int, dict]:
     req = urllib.request.Request(base + "/listeners", headers=headers)
     try:
         with opener.open(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
-        return {}
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return {}, f"{base} 返回 401，需要填 secret"
+        if exc.code == 404:
+            return {}, f"{base} 返回 404，没有 /listeners（版本太老或不是 mihomo）"
+        return {}, f"{base} 返回 HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return {}, f"{base} {_why_unreachable(exc.reason, timeout)}"
+    except TimeoutError:
+        return {}, f"{base} 超时 {timeout:g}s，地址不通"
+    except OSError as exc:
+        return {}, f"{base} {_why_unreachable(exc, timeout)}"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}, f"{base}/listeners 返回的不是 JSON"
     if not isinstance(data, dict):
-        return {}
+        return {}, f"{base}/listeners 返回的不是对象"
 
     out: dict[int, dict] = {}
     for item in (data.get("listeners") or []):
@@ -363,7 +380,44 @@ def fetch_listeners(cfg: dict, timeout: float = 2.5) -> dict[int, dict]:
             "name": str(item.get("name") or "").strip(),
             "proxy": str(item.get("proxy") or "").strip(),
         }
-    return out
+    if not out:
+        return {}, f"{base}/listeners 是空的，mihomo 里没有 listener"
+    return out, ""
+
+
+def _why_unreachable(reason: Any, timeout: float) -> str:
+    """把 socket 层的异常翻成一句能照着改的话。
+
+    `Connection refused` 和「域名解析不到」在用户眼里都是「连不上」，但
+    一个要改端口、一个要改主机名（或者把容器端口映射出来）。
+
+    不能只看英文文本：Windows 上 `str(ConnectionRefusedError(10061, ...))`
+    是「由于目标计算机积极拒绝，无法连接。」，一个 refused 都没有。所以
+    errno 先判，文本只做兜底。
+    """
+    code = getattr(reason, "errno", None)
+    if code in (errno.ECONNREFUSED, 10061):
+        return "连接被拒绝：控制器没开，或端口不对"
+    text = str(reason or "").lower()
+    if "refused" in text or "积极拒绝" in text or "拒绝" in text:
+        return "连接被拒绝：控制器没开，或端口不对"
+    if "name or service not known" in text or "nodename nor servname" in text \
+            or "getaddrinfo" in text or "temporary failure in name resolution" in text \
+            or "解析" in text or "11001" in text:
+        return "主机名解析不到：跨容器要写服务名，宿主机上要写 127.0.0.1"
+    if "timed out" in text or "timeout" in text or "超时" in text:
+        # Windows 上连本地没开的端口也是报 timeout 而不是 refused（
+        # 系统层不立刻回 RST），所以两种可能都摆出来，不断言是哪一种。
+        return f"超时 {timeout:g}s：端口没开，或被防火墙吞了"
+    if "network is unreachable" in text or "no route to host" in text \
+            or "不可达" in text:
+        return "网络不可达：检查控制器是否 bind 在 0.0.0.0"
+    return f"连不上（{reason or '原因未知'}）"
+
+
+def fetch_listeners(cfg: dict, timeout: float = 2.5) -> dict[int, dict]:
+    """只需要名单时的薄封装。错误原因走 `_fetch_listeners`。"""
+    return _fetch_listeners(cfg, timeout)[0]
 
 
 def port_of(url: str) -> int:
@@ -486,7 +540,9 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
     urls = [_proxy_url(mihomo["host"], port) for port in ports]
     # 问一次名单很轻（本地一个 HTTP），但 api 不通时会卡到超时。列表页
     # 给 1 秒，点「自动检测」给 2.5 秒——那时候用户已经在等结果了。
-    names = fetch_listeners(cfg, timeout=2.5 if probe_now else 1.0)
+    # 名单和失败原因一起拿：拿不到名字时界面要能说清是哪一步断的
+    # （地址错 / 要 secret / 端点不存在），只说「未通」等于没给信息。
+    names, api_error = _fetch_listeners(cfg, timeout=2.5 if probe_now else 1.0)
 
     if not probe_now:
         nodes = [{"url": u, "ok": False, "exit_ip": "", "latency_ms": 0,
@@ -498,13 +554,15 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
             "nodes": _label_nodes(nodes, names),
             "ok_count": 0,
             "api": api_base(mihomo),
+            "api_error": api_error,
             "named": bool(names),
         }
 
     if not urls:
         return {"host": mihomo["host"], "ports": [], "probed": True,
                 "nodes": [], "ok_count": 0,
-                "api": api_base(mihomo), "named": bool(names)}
+                "api": api_base(mihomo), "api_error": api_error,
+                "named": bool(names)}
 
     nodes = _label_nodes(probe_urls(urls, mihomo["probe_url"], mihomo["timeout"]), names)
 
@@ -515,12 +573,39 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
         "nodes": nodes,
         "ok_count": sum(1 for n in nodes if n.get("ok")),
         "api": api_base(mihomo),
+        "api_error": api_error,
         "named": bool(names),
     }
 
 
+#: 节点类型关键词，从节点名反推。顺序即优先级：名字里同时出现
+#: 「住宅」和「代理」的（比如「港-住宅代理-01」）算住宅——那才是它的用处。
+#: 只按名字猜，不查 IP 归属库：没有离线库就不编一个出来，猜错比不标更糟。
+KIND_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("住宅", ("住宅", "家宽", "家庭宽带", "家庭", "residential", "resi")),
+    ("机房", ("机房", "数据中心", "datacenter", "data center", "data-center",
+              "idc", "hosting", "服务器", "专线", "bgp")),
+    ("代理", ("代理", "proxy", "socks", "隧道", "tunnel", "vpn")),
+)
+
+
+def node_kind(name: str) -> str:
+    """从节点名推断这一条是住宅 / 机房 / 还是代理。推断不出返回空串。
+
+    用户看节点列表时真正关心的是「这条线像不像真人家宽」——同一个订阅里
+    机房 IP 和住宅 IP 混着，只能靠名字里那两个字分辨。名字没写就不猜。
+    """
+    text = str(name or "").strip().lower()
+    if not text:
+        return ""
+    for label, words in KIND_HINTS:
+        if any(word in text for word in words):
+            return label
+    return ""
+
+
 def _label_nodes(nodes: list[dict], names: dict[int, dict]) -> list[dict]:
-    """把「端口 → 节点名」贴到探测结果上。查不到就留空，前端退回显示地址。"""
+    """把「端口 → 节点名」贴到探测结果上。查不到就留空，前端退回显示端口。"""
     for node in nodes:
         port = port_of(str(node.get("url") or ""))
         meta = names.get(port) or {}
@@ -529,6 +614,7 @@ def _label_nodes(nodes: list[dict], names: dict[int, dict]) -> list[dict]:
         # proxy 是出站节点名（用户订阅里看到的那串），比 listener 名有用；
         # 有的版本只填其中一个，两个都留着让前端挑。
         node["name"] = meta.get("proxy") or meta.get("name", "")
+        node["kind"] = node_kind(node["name"])
     return nodes
 
 

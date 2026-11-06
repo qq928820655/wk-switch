@@ -1248,16 +1248,18 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 }
 .node.ok { border-color: #c9ecda; background: #f7fdf9; }
 .node.bad { background: #fdfafa; }
-.node-url {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12px;
-  color: var(--ink-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+/* 端口号：固定宽度，五位数一列对齐。它是卡片上唯一不会变长的东西，
+   所以拿它当左锚点；地址整串（127.0.0.1:）不显示——每张卡片都一样，
+   占掉十几位却分不出任何东西。 */
+.node-port {
+  flex: none;
+  width: 44px;
+  font-size: 11px;
+  color: var(--ink-3);
+  letter-spacing: -.2px;
 }
 /* 节点名：占满剩余宽度，长了截断。名字来自订阅，长度完全不可控，
-   不给 flex 约束会把出口 IP 和延迟挤出卡片。 */
+   不给 flex 约束会把类型和延迟挤出卡片。 */
 .node-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -1268,19 +1270,27 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   font-weight: 500;
   color: var(--ink);
 }
-.node-ip {
-  margin-left: auto;
-  font-size: 11.5px;
-  color: var(--ok);
-  font-weight: 600;
+.node-name.none { color: var(--ink-3); font-weight: 400; }
+/* 类型胶囊：住宅 / 机房 / 代理，颜色分开。名字里没写就不显示，
+   宁可空着也不猜——标错了比不标更误导。 */
+.node-kind {
+  flex: none;
+  font-size: 10.5px;
+  line-height: 1.6;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: #eef2ff;
+  color: #4f46e5;
 }
+.node-kind.resi { background: #ecfdf5; color: #059669; }
+.node-kind.dc   { background: #f1f5f9; color: #64748b; }
+.node-kind.proxy { background: #eff6ff; color: #2563eb; }
 .node-tail {
   margin-left: auto;
   flex: none;
   font-size: 11.5px;
   color: var(--ink-3);
 }
-.node-ip + .node-tail { margin-left: 0; }
 .node.bad .node-tail { color: var(--bad); }
 
 /* 结论列：上游原话可能一长串，一行截断，全文挂在 title 上 */
@@ -1366,8 +1376,9 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
      十个格子看起来一模一样，等于没显示 */
   .node-list { grid-template-columns: 1fr; gap: 6px; }
   .node { padding: 7px 9px; font-size: 11.5px; }
-  .node-url { font-size: 11px; }
-  .node-ip, .node-tail { font-size: 10.5px; }
+  .node-port { width: 40px; font-size: 10.5px; }
+  .node-tail { font-size: 10.5px; }
+  .node-kind { font-size: 10px; padding: 0 4px; }
 }
 
 /* ---------- 批次列与风控标记 ---------- */
