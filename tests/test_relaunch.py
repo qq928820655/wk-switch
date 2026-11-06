@@ -110,7 +110,7 @@ class PortTests(unittest.TestCase):
         srv.bind(("127.0.0.1", port))
         srv.listen(1)
         try:
-            self.assertFalse(relaunch._wait_port(port, "127.0.0.1", 0.6))
+            self.assertEqual(relaunch._wait_port(port, "127.0.0.1", 0.6), "busy")
         finally:
             srv.close()
 
@@ -232,7 +232,7 @@ class SuperviseTests(unittest.TestCase):
             p.stop()
 
     def test_happy_path(self):
-        with mock.patch.object(relaunch, "_wait_port", return_value=True), \
+        with mock.patch.object(relaunch, "_wait_port", return_value="ok"), \
              mock.patch.object(relaunch, "_launch", return_value=(None, "main.py")), \
              mock.patch.object(relaunch, "_wait_alive",
                                return_value=(True, {"ok": True, "version": "1.4.0", "pid": 2})):
@@ -242,14 +242,32 @@ class SuperviseTests(unittest.TestCase):
         self.assertEqual(data["ready_version"], "1.4.0")
 
     def test_port_never_frees(self):
-        with mock.patch.object(relaunch, "_wait_port", return_value=False), \
+        with mock.patch.object(relaunch, "_wait_port", return_value="busy"), \
              mock.patch.object(relaunch, "_terminate") as term:
             self.assertEqual(relaunch.supervise(), 1)
         self.assertTrue(term.called)
         self.assertEqual(relaunch._read()["state"], "failed")
 
+    def test_time_wait_does_not_abort_restart(self):
+        """旧进程已死、端口只是 TIME_WAIT：必须继续拉起，不能报「旧进程没退出」。
+
+        这就是 Linux 容器里那次事故：旧进程 0.5 秒前就 os._exit(0) 了，
+        裸 socket 探测因为 TIME_WAIT 一直 EADDRINUSE，监督进程等满 45 秒
+        后判失败，服务从此没人拉起。
+        """
+        with mock.patch.object(relaunch, "_wait_port", return_value="dead"), \
+             mock.patch.object(relaunch, "_launch",
+                               return_value=(None, "main.py")) as launch, \
+             mock.patch.object(relaunch, "_terminate") as term, \
+             mock.patch.object(relaunch, "_wait_alive",
+                               return_value=(True, {"ok": True, "version": "1.4.0"})):
+            self.assertEqual(relaunch.supervise(), 0)
+        launch.assert_called_once()
+        term.assert_not_called()
+        self.assertEqual(relaunch._read()["state"], "ok")
+
     def test_rollback_when_new_build_dies(self):
-        with mock.patch.object(relaunch, "_wait_port", return_value=True), \
+        with mock.patch.object(relaunch, "_wait_port", return_value="ok"), \
              mock.patch.object(relaunch, "_launch", return_value=(None, "main.py")), \
              mock.patch.object(relaunch, "_wait_alive",
                                side_effect=[(False, {}), (True, {"ok": True, "version": "1.3.0"})]), \
@@ -263,7 +281,7 @@ class SuperviseTests(unittest.TestCase):
         self.assertTrue(data.get("rolled_back"))
 
     def test_failed_when_nothing_to_roll_back_to(self):
-        with mock.patch.object(relaunch, "_wait_port", return_value=True), \
+        with mock.patch.object(relaunch, "_wait_port", return_value="ok"), \
              mock.patch.object(relaunch, "_launch", return_value=(None, "main.py")), \
              mock.patch.object(relaunch, "_wait_alive", return_value=(False, {})), \
              mock.patch.object(relaunch, "_rollback", return_value=False):
@@ -323,6 +341,349 @@ class SessionPersistTests(unittest.TestCase):
             auth._loaded = False
         self.assertFalse(auth.check_session("whatever"))
         self.assertTrue(auth.issue_session())
+
+
+class DeployModeTests(unittest.TestCase):
+    """Linux 两种部署方式的重启路径完全不同，判错就是全盘失败。"""
+
+    def setUp(self):
+        relaunch.reset_deploy_cache()
+        self.tmp = tempfile.mkdtemp()
+        # Linux 的两条分支（systemd / nohup）在 Windows 上跑不到，用这个开关
+        # 把平台判断掰成 posix，逻辑本身仍然是同一份。
+        self.posix = mock.patch.object(relaunch, "_posix", return_value=True)
+        self.posix.start()
+
+    def tearDown(self):
+        self.posix.stop()
+        relaunch.reset_deploy_cache()
+
+    def test_plain_when_nothing_detected(self):
+        with mock.patch.object(relaunch, "ROOT", self.tmp), \
+             mock.patch.object(relaunch, "START_SH", os.path.join(self.tmp, "start.sh")), \
+             mock.patch.object(relaunch, "DEPLOY_LOG", os.path.join(self.tmp, "logs", "wk-switch.log")), \
+             mock.patch.object(relaunch, "find_unit", return_value=""):
+            dep = relaunch.deploy_mode()
+        self.assertEqual(dep["mode"], "plain")
+
+    def test_nohup_when_start_sh_present(self):
+        """有 logs/ 和 start.sh 就是 nohup 部署，日志要写 logs/wk-switch.log。"""
+        os.makedirs(os.path.join(self.tmp, "logs"))
+        start = os.path.join(self.tmp, "start.sh")
+        open(start, "w").close()
+        with mock.patch.object(relaunch, "ROOT", self.tmp), \
+             mock.patch.object(relaunch, "START_SH", start), \
+             mock.patch.object(relaunch, "DEPLOY_LOG", os.path.join(self.tmp, "logs", "wk-switch.log")), \
+             mock.patch.object(relaunch, "find_unit", return_value=""):
+            dep = relaunch.deploy_mode()
+        self.assertEqual(dep["mode"], "nohup")
+        self.assertEqual(os.path.normpath(dep["log"]),
+                         os.path.normpath(os.path.join(self.tmp, "logs", "wk-switch.log")))
+
+    def test_systemd_wins_over_start_sh(self):
+        """systemd 部署同样会生成 start.sh 当应急手柄，但重启必须走 systemctl。"""
+        os.makedirs(os.path.join(self.tmp, "logs"))
+        start = os.path.join(self.tmp, "start.sh")
+        open(start, "w").close()
+        with mock.patch.object(relaunch, "ROOT", self.tmp), \
+             mock.patch.object(relaunch, "START_SH", start), \
+             mock.patch.object(relaunch, "DEPLOY_LOG", os.path.join(self.tmp, "logs", "wk-switch.log")), \
+             mock.patch.object(relaunch, "find_unit", return_value="wk-switch"), \
+             mock.patch.object(relaunch, "systemd_active", return_value=True):
+            dep = relaunch.deploy_mode()
+        self.assertEqual(dep["mode"], "systemd")
+        self.assertEqual(dep["unit"], "wk-switch")
+
+    def test_unit_found_by_working_directory(self):
+        """按 WorkingDirectory 认 unit，不写死服务名。"""
+        unit_dir = os.path.join(self.tmp, "units")
+        os.makedirs(unit_dir)
+        with open(os.path.join(unit_dir, "other.service"), "w") as f:
+            f.write("[Service]\nWorkingDirectory=/srv/other\nExecStart=/usr/bin/python3 /srv/other/main.py\n")
+        with open(os.path.join(unit_dir, "mine.service"), "w") as f:
+            f.write(f"[Service]\nWorkingDirectory={relaunch.ROOT}\nExecStart=/usr/bin/python3 x\n")
+        with mock.patch.object(relaunch, "_UNIT_DIRS", (unit_dir,)):
+            self.assertEqual(relaunch.find_unit(), "mine")
+
+    def test_launch_systemd_calls_systemctl_not_popen(self):
+        """systemd 模式下自己 Popen 会让 is-active 变 inactive，端口却在服务。"""
+        state = {"port": 8765, "host": "127.0.0.1", "unit": "wk-switch"}
+        done = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(relaunch, "_posix", return_value=True), \
+             mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "systemd", "unit": "wk-switch",
+                                             "log": "x"}), \
+             mock.patch.object(relaunch.subprocess, "run", return_value=done) as run, \
+             mock.patch.object(relaunch.subprocess, "Popen") as popen:
+            proc, how = relaunch._launch(state)
+        self.assertIsNone(proc)
+        self.assertIn("systemctl", how)
+        self.assertEqual(run.call_args[0][0][:3], ["systemctl", "--no-block", "restart"])
+        self.assertEqual(run.call_args[0][0][3], "wk-switch")
+        popen.assert_not_called()
+
+    def test_launch_systemd_failure_raises(self):
+        state = {"port": 8765, "host": "127.0.0.1", "unit": "wk-switch"}
+        done = mock.Mock(returncode=1, stdout=b"", stderr=b"Unit not found.")
+        with mock.patch.object(relaunch, "_posix", return_value=True), \
+             mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "systemd", "unit": "wk-switch",
+                                             "log": "x"}), \
+             mock.patch.object(relaunch.subprocess, "run", return_value=done):
+            with self.assertRaises(OSError) as ctx:
+                relaunch._launch(state)
+        self.assertIn("Unit not found", str(ctx.exception))
+
+
+class WaitAliveTests(unittest.TestCase):
+    """探活判据。原先「子进程一退就只再等 1 秒」在 Linux 上百分百误判。"""
+
+    def test_wrapped_child_exit_does_not_fail_early(self):
+        """包装进程已退出、真进程稍后才应答，不能立刻判死。
+
+        这就是 Linux 上的真实时序：`nohup ... &` 的 bash 秒退，python 还在
+        import。旧逻辑给 1 秒，必然判失败 → 每一轮升级都触发回滚。
+        """
+        port = _free_port()
+        proc = mock.Mock()
+        proc.poll.return_value = 0          # 包装进程已经退了
+
+        calls = {"n": 0}
+
+        def fake_ping(p, timeout=2.0):
+            calls["n"] += 1
+            # 前 4 次不通（约 1.6 秒），之后才通 —— 正好越过旧的 1 秒窗口
+            if calls["n"] > 4:
+                return {"ok": True, "version": "1.5.0"}
+            return {}
+
+        with mock.patch.object(relaunch, "_ping", side_effect=fake_ping):
+            ok, info = relaunch._wait_alive(port, "1.5.0", timeout=15, proc=proc, grace=8.0)
+        self.assertTrue(ok, "过了 1 秒窗口还在等，不应该判失败")
+        self.assertEqual(info["version"], "1.5.0")
+
+    def test_dead_child_with_wrong_version_fails(self):
+        """进程退干净、端口通但版本不对，仍算失败（否则会把旧代码当新版）。"""
+        port = _free_port()
+        proc = mock.Mock()
+        proc.poll.return_value = 1
+        with mock.patch.object(relaunch, "_ping",
+                               return_value={"ok": True, "version": "1.0.0"}):
+            ok, _ = relaunch._wait_alive(port, "1.5.0", timeout=3, proc=proc, grace=0.5)
+        self.assertFalse(ok)
+
+    def test_no_proc_still_waits_full_timeout(self):
+        """systemd 模式没有子进程可看，只能靠 ping，别提前返回。"""
+        port = _free_port()
+        with mock.patch.object(relaunch, "_ping", return_value={}):
+            started = time.time()
+            ok, _ = relaunch._wait_alive(port, "", timeout=1.5, proc=None)
+        self.assertFalse(ok)
+        self.assertGreaterEqual(time.time() - started, 1.4)
+
+
+class SelfcheckTests(unittest.TestCase):
+    def test_current_tree_passes(self):
+        self.assertEqual(relaunch.selfcheck(), "")
+
+    def test_syntax_error_is_reported(self):
+        """临时把 server.py 换成一个语法错的版本，自检必须拦住。"""
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "wk"))
+        with open(os.path.join(root, "server.py"), "w", encoding="utf-8") as f:
+            f.write("def broken(:\n")
+        with open(os.path.join(root, "wk", "__init__.py"), "w", encoding="utf-8") as f:
+            f.write("")
+        with open(os.path.join(root, "wk", "version.py"), "w", encoding="utf-8") as f:
+            f.write("VERSION = '0.0.1'\ndef version():\n    return VERSION\n")
+        with mock.patch.object(relaunch, "ROOT", root):
+            problem = relaunch.selfcheck()
+        self.assertTrue(problem)
+        self.assertIn("SyntaxError", problem)
+
+
+class WaitPortTests(unittest.TestCase):
+    """三态返回值。判错就会把 TIME_WAIT 当「旧进程没退出」。"""
+
+    def test_bindable_returns_ok(self):
+        with mock.patch.object(relaunch, "_bindable", return_value=True):
+            self.assertEqual(relaunch._wait_port(1, "127.0.0.1", 1), "ok")
+
+    def test_dead_process_returns_dead_without_waiting_full_timeout(self):
+        """旧进程没了就立刻返回 dead，别把 45 秒耗完。"""
+        with mock.patch.object(relaunch, "_bindable", return_value=False), \
+             mock.patch.object(relaunch, "_alive", return_value=False):
+            started = time.time()
+            got = relaunch._wait_port(1, "127.0.0.1", 30, dead_pid=4242)
+        self.assertEqual(got, "dead")
+        self.assertLess(time.time() - started, 2.0)
+
+    def test_live_process_returns_busy(self):
+        with mock.patch.object(relaunch, "_bindable", return_value=False), \
+             mock.patch.object(relaunch, "_alive", return_value=True):
+            got = relaunch._wait_port(1, "127.0.0.1", 0.6, dead_pid=4242)
+        self.assertEqual(got, "busy")
+
+    def test_no_pid_falls_back_to_timeout(self):
+        """state 里没记 pid 时不能靠存活判断，只能等满。"""
+        with mock.patch.object(relaunch, "_bindable", return_value=False):
+            got = relaunch._wait_port(1, "127.0.0.1", 0.5, dead_pid=0)
+        self.assertEqual(got, "busy")
+
+    def test_bindable_sets_reuseaddr_on_posix(self):
+        """POSIX 上探测必须和真服务的 allow_reuse_address 对齐。"""
+        with mock.patch.object(relaunch, "_posix", return_value=True), \
+             mock.patch.object(relaunch.socket, "socket") as factory:
+            sock = factory.return_value.__enter__.return_value
+            relaunch._bindable(12345, "127.0.0.1")
+        sock.setsockopt.assert_called_once_with(
+            relaunch.socket.SOL_SOCKET, relaunch.socket.SO_REUSEADDR, 1)
+
+    def test_bindable_skips_reuseaddr_on_windows(self):
+        """Windows 上设了会放过 LISTEN 端口，判据直接失效。"""
+        with mock.patch.object(relaunch, "_posix", return_value=False), \
+             mock.patch.object(relaunch.socket, "socket") as factory:
+            sock = factory.return_value.__enter__.return_value
+            relaunch._bindable(12345, "127.0.0.1")
+        sock.setsockopt.assert_not_called()
+
+    def test_alive_is_false_for_zero_and_self(self):
+        self.assertFalse(relaunch._alive(0))
+        self.assertFalse(relaunch._alive(-1))
+        self.assertFalse(relaunch._alive(os.getpid()))
+
+
+class TerminateTests(unittest.TestCase):
+    def test_pids_on_port_returns_empty_for_zero(self):
+        with mock.patch.object(relaunch, "_posix", return_value=True):
+            self.assertEqual(relaunch._pids_on_port(0), [])
+
+    def test_terminate_ignores_own_pid(self):
+        """杀自己的 pid 会让监督进程在半路消失，回滚再也跑不到。"""
+        with mock.patch.object(relaunch.subprocess, "run") as run:
+            relaunch._terminate(os.getpid(), 0)
+        run.assert_not_called()
+
+
+class SpawnTests(unittest.TestCase):
+    """监督进程怎么起，决定它能不能活过服务重启。"""
+
+    def setUp(self):
+        relaunch.reset_deploy_cache()
+        self.tmp = tempfile.mkdtemp()
+        self.patches = [
+            mock.patch.object(relaunch, "STATE_PATH", os.path.join(self.tmp, "restart.json")),
+            mock.patch.object(relaunch, "DATA_DIR", self.tmp),
+            mock.patch.object(relaunch, "LOG_DIR", os.path.join(self.tmp, "logs")),
+            mock.patch.object(relaunch, "LOG_PATH", os.path.join(self.tmp, "logs", "r.log")),
+            mock.patch.object(relaunch, "_posix", return_value=True),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        relaunch.reset_deploy_cache()
+
+    def test_systemd_uses_systemd_run_for_independent_cgroup(self):
+        with mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "systemd", "unit": "wk-switch", "log": "x"}), \
+             mock.patch.object(relaunch.shutil, "which", return_value="/bin/systemd-run"), \
+             mock.patch.object(relaunch, "_spawn_systemd_run",
+                               return_value={"ok": True, "via": "systemd-run",
+                                             "unit": "wk-relaunch-1"}) as run, \
+             mock.patch.object(relaunch.subprocess, "Popen") as popen:
+            got = relaunch.spawn(8765, "127.0.0.1", target_version="1.5.2")
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["via"], "systemd-run")
+        run.assert_called_once()
+        popen.assert_not_called()
+
+    def test_systemd_without_systemd_run_degrades(self):
+        """拿不到独立 cgroup 时不能起一个注定被杀的监督进程。"""
+        with mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "systemd", "unit": "wk-switch", "log": "x"}), \
+             mock.patch.object(relaunch.shutil, "which", return_value=None), \
+             mock.patch.object(relaunch.subprocess, "Popen") as popen:
+            got = relaunch.spawn(8765, "127.0.0.1")
+        self.assertTrue(got["ok"])
+        self.assertTrue(got["degraded"])
+        self.assertEqual(got["unit"], "wk-switch")
+        popen.assert_not_called()
+
+    def test_nohup_uses_plain_popen(self):
+        with mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "nohup", "unit": "", "log": "x"}), \
+             mock.patch.object(relaunch.subprocess, "Popen") as popen:
+            got = relaunch.spawn(8765, "127.0.0.1")
+        self.assertEqual(got["via"], "popen")
+        self.assertFalse(got.get("degraded"))
+        popen.assert_called_once()
+
+    def test_state_records_mode_and_unit(self):
+        with mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "systemd", "unit": "wk-switch",
+                                             "log": "x"}), \
+             mock.patch.object(relaunch.shutil, "which", return_value=None):
+            relaunch.spawn(8765, "127.0.0.1")
+        state = relaunch._read()
+        self.assertEqual(state["mode"], "systemd")
+        self.assertEqual(state["unit"], "wk-switch")
+        self.assertEqual(state["port"], 8765)
+
+
+class SuperviseSystemdTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.patches = [
+            mock.patch.object(relaunch, "STATE_PATH", os.path.join(self.tmp, "restart.json")),
+            mock.patch.object(relaunch, "DATA_DIR", self.tmp),
+            mock.patch.object(relaunch, "LOG_DIR", os.path.join(self.tmp, "logs")),
+            mock.patch.object(relaunch, "LOG_PATH", os.path.join(self.tmp, "logs", "r.log")),
+        ]
+        for p in self.patches:
+            p.start()
+        relaunch._write({"port": 8765, "host": "127.0.0.1", "to": "1.5.2",
+                         "pid": 999999, "started": time.time(), "steps": []})
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def test_does_not_fight_systemd_restart_policy(self):
+        """systemd 模式下不能自己等端口：会跟 Restart= 抢，死循环到 failed。"""
+        with mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "systemd", "unit": "wk-switch", "log": "x"}), \
+             mock.patch.object(relaunch, "_wait_port") as wait, \
+             mock.patch.object(relaunch, "_launch", return_value=(None, "systemctl restart wk-switch")), \
+             mock.patch.object(relaunch, "_wait_alive",
+                               return_value=(True, {"version": "1.5.2", "pid": 1})):
+            code = relaunch.supervise()
+        self.assertEqual(code, 0)
+        wait.assert_not_called()
+
+    def test_nohup_still_waits_for_port(self):
+        with mock.patch.object(relaunch, "deploy_mode",
+                               return_value={"mode": "nohup", "unit": "", "log": "x"}), \
+             mock.patch.object(relaunch, "_wait_port", return_value="ok") as wait, \
+             mock.patch.object(relaunch, "_launch", return_value=(mock.Mock(pid=1), "main.py")), \
+             mock.patch.object(relaunch, "_wait_alive",
+                               return_value=(True, {"version": "1.5.2", "pid": 1})):
+            code = relaunch.supervise()
+        self.assertEqual(code, 0)
+        wait.assert_called_once()
+
+
+class RevertTests(unittest.TestCase):
+    def test_revert_marks_bad_backup_broken(self):
+        """换回旧版时，_install_zip 会把坏代码也备份一份，得标掉。"""
+        with mock.patch.object(relaunch, "_rollback", return_value=True) as roll, \
+             mock.patch.object(relaunch, "_mark_broken") as mark:
+            got = relaunch.revert("9.9.9", "code-1.5.1-x.zip", "1.5.1")
+        self.assertTrue(got["ok"])
+        mark.assert_called_once_with("9.9.9")
+        self.assertEqual(roll.call_args[0][0]["to"], "9.9.9")
 
 
 class VersionPinTests(unittest.TestCase):

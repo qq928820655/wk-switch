@@ -135,6 +135,12 @@ DEFAULTS: dict[str, Any] = {
         #: 探出口 IP 用。hub 的 `probe_proxy_exit` 也是打这个地址。
         "probe_url": "https://api.ipify.org",
         "timeout": 10.0,
+        #: mihomo 的 external-controller。留空按 host 推 `http://<host>:9090`。
+        #: 只有它能给出「这个端口走的是哪个节点」——出口 IP 分不出线路
+        #: （同一订阅里两个节点出口 IP 常常一模一样）。
+        "api": "",
+        #: external-controller 的 secret，没设就留空。
+        "secret": "",
     },
 }
 
@@ -208,6 +214,8 @@ def _coerce(cfg: dict) -> dict:
         "ports": ports or DEFAULTS["mihomo"]["ports"],
         "probe_url": str(mihomo.get("probe_url") or DEFAULTS["mihomo"]["probe_url"]).strip(),
         "timeout": _float(mihomo.get("timeout"), DEFAULTS["mihomo"]["timeout"], 3.0, 60.0),
+        "api": normalize_url(str(mihomo.get("api") or "").strip()),
+        "secret": str(mihomo.get("secret") or "").strip(),
     }
     return cfg
 
@@ -290,6 +298,79 @@ def parse_ports(spec: str) -> list[int]:
 
 def _proxy_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
+
+
+def api_base(mihomo: dict) -> str:
+    """mihomo 的 external-controller 地址。
+
+    没配就按代理主机推 `http://<host>:9090`——hub 那套部署里 mihomo 跑在
+    同一个 docker 网络，`cli-proxy-mihomo:9090` 是默认解。推不出来就返回空，
+    调用方据此跳过，不硬编一个大概率连不上的地址去等超时。
+    """
+    api = normalize_url(str(mihomo.get("api") or "").strip())
+    if api:
+        return api.rstrip("/")
+    host = str(mihomo.get("host") or "").strip()
+    if not host:
+        return ""
+    if "://" in host:
+        return normalize_url(host.rstrip("/"))
+    if ":" in host:                      # host:port 形式，端口已经给全
+        return normalize_url("http://" + host)
+    return normalize_url(f"http://{host}:9090")
+
+
+def fetch_listeners(cfg: dict, timeout: float = 2.5) -> dict[int, dict]:
+    """问 mihomo 「这些端口各走哪个节点」，返回 {端口: {name, proxy}}。
+
+    为什么要这一步：出口 IP 分不出线路。同一条订阅里两个节点落在同一个
+    AS 的相邻段，甚至直接共用出口，卡片上两格都是 `103.41.4.26`，看起来
+    像同一个槽位检测了两遍。mihomo 的 `/listeners` 里每个 listener 带
+    `proxy` 字段（这个端口钉死的出站节点名），那才是用户在找的东西。
+
+    Clash 原版没有这个端点，mihomo 有；拿不到就返回空，前端退回显示地址。
+    """
+    base = api_base(cfg["mihomo"])
+    if not base:
+        return {}
+    headers = {"Accept": "application/json"}
+    secret = str(cfg["mihomo"].get("secret") or "").strip()
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+    # 强制直连：环境里 HTTPS_PROXY 指向本地代理时，urllib 会把 127.0.0.1
+    # 也塞给代理，问一次要绕一圈还可能直接失败。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(base + "/listeners", headers=headers)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    out: dict[int, dict] = {}
+    for item in (data.get("listeners") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            port = int(item.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not (0 < port < 65536):
+            continue
+        out[port] = {
+            "name": str(item.get("name") or "").strip(),
+            "proxy": str(item.get("proxy") or "").strip(),
+        }
+    return out
+
+
+def port_of(url: str) -> int:
+    try:
+        return int(urllib.parse.urlsplit(url).port or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def normalize_url(value: Any) -> str:
@@ -394,27 +475,38 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
     对齐 hub 的 `discover_proxy_slots()`：端口即槽位，能出网就算可用。
     `probe_now=False` 只列地址不测——页面上「自动检测」按钮才需要真测，
     打开页面时不该替用户发十个请求。
+
+    每个节点带上 `name`（mihomo 里的出站节点名）。纯 IP 列表看不出是哪条线：
+    同一订阅里两个节点出口 IP 一样是常事，卡片上两格数字一模一样，用户
+    根本分不清自己配了两个槽还是一个。
     """
     cfg = cfg or load_config()
     mihomo = cfg["mihomo"]
     ports = parse_ports(mihomo["ports"])
     urls = [_proxy_url(mihomo["host"], port) for port in ports]
+    # 问一次名单很轻（本地一个 HTTP），但 api 不通时会卡到超时。列表页
+    # 给 1 秒，点「自动检测」给 2.5 秒——那时候用户已经在等结果了。
+    names = fetch_listeners(cfg, timeout=2.5 if probe_now else 1.0)
 
     if not probe_now:
+        nodes = [{"url": u, "ok": False, "exit_ip": "", "latency_ms": 0,
+                  "error": ""} for u in urls]
         return {
             "host": mihomo["host"],
             "ports": ports,
             "probed": False,
-            "nodes": [{"url": u, "ok": False, "exit_ip": "", "latency_ms": 0, "error": ""}
-                      for u in urls],
+            "nodes": _label_nodes(nodes, names),
             "ok_count": 0,
+            "api": api_base(mihomo),
+            "named": bool(names),
         }
 
     if not urls:
         return {"host": mihomo["host"], "ports": [], "probed": True,
-                "nodes": [], "ok_count": 0}
+                "nodes": [], "ok_count": 0,
+                "api": api_base(mihomo), "named": bool(names)}
 
-    nodes = probe_urls(urls, mihomo["probe_url"], mihomo["timeout"])
+    nodes = _label_nodes(probe_urls(urls, mihomo["probe_url"], mihomo["timeout"]), names)
 
     return {
         "host": mihomo["host"],
@@ -422,7 +514,22 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
         "probed": True,
         "nodes": nodes,
         "ok_count": sum(1 for n in nodes if n.get("ok")),
+        "api": api_base(mihomo),
+        "named": bool(names),
     }
+
+
+def _label_nodes(nodes: list[dict], names: dict[int, dict]) -> list[dict]:
+    """把「端口 → 节点名」贴到探测结果上。查不到就留空，前端退回显示地址。"""
+    for node in nodes:
+        port = port_of(str(node.get("url") or ""))
+        meta = names.get(port) or {}
+        node["port"] = port
+        node["listener"] = meta.get("name", "")
+        # proxy 是出站节点名（用户订阅里看到的那串），比 listener 名有用；
+        # 有的版本只填其中一个，两个都留着让前端挑。
+        node["name"] = meta.get("proxy") or meta.get("name", "")
+    return nodes
 
 
 def plan_exit(cfg: dict, nodes: list[dict], index: int,

@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
+from . import clock
 from . import version
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -204,7 +205,7 @@ def check() -> dict:
         "up_to_date": not newer,
         "release": latest,
         "repo": cfg.get("repo") or "",
-        "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "checked_at": clock.stamp(),
     }
 
 
@@ -292,7 +293,7 @@ def _install_zip(blob: bytes, target_version: str, say) -> dict:
 
     # 先备份当前代码：升级失败要能原样退回去
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stamp = clock.compact()
     old_version = version.version()
     backup = os.path.join(BACKUP_DIR, f"code-{old_version}-{stamp}.zip")
     with zipfile.ZipFile(backup, "w", compression=zipfile.ZIP_DEFLATED) as bz:
@@ -338,7 +339,7 @@ def _install_zip(blob: bytes, target_version: str, say) -> dict:
 
     # 记录构建时间与版本号文件（页面读 BUILD / VERSION 显示）
     with open(os.path.join(ROOT, "BUILD"), "w", encoding="utf-8") as f:
-        f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        f.write(clock.stamp())
     with open(os.path.join(ROOT, "VERSION"), "w", encoding="utf-8") as f:
         f.write(target_version + "\n")
 
@@ -441,8 +442,29 @@ def upgrade_local(port: int, host: str, blob: bytes, filename: str = "",
 
 
 def _finish_with_restart(result: dict, port: int, host: str) -> dict:
-    """给升级结果补上「已交棒给监督进程」这一步。"""
+    """给升级结果补上「已交棒给监督进程」这一步。
+
+    交棒之前先让新代码自己跑一遍（`relaunch.selfcheck`）。语法错、缺模块这类
+    问题在这里就露出来，原地换回备份再重启——比"起不来 → 等 60 秒 → 回滚"
+    少一次服务空窗，也少一次必然失败的等待。
+    """
     from . import relaunch
+
+    problem = relaunch.selfcheck()
+    if problem:
+        got = relaunch.revert(str(result.get("to") or ""),
+                              str(result.get("backup") or ""),
+                              str(result.get("from") or ""))
+        result["selfcheck"] = problem
+        result["reverted"] = bool(got.get("ok"))
+        if not got.get("ok"):
+            result["restarting"] = False
+            result["message"] = (f"新版本自检没过（{problem}），"
+                                 f"也没找到可用的备份，未重启；请手动检查代码")
+            return result
+        result["to"] = str(result.get("from") or result.get("to") or "")
+        result["message"] = (f"新版本自检没过（{problem}），"
+                             f"已换回 {result.get('from')} 并重启")
 
     spawn = relaunch.spawn(
         port, host=host,
@@ -452,11 +474,12 @@ def _finish_with_restart(result: dict, port: int, host: str) -> dict:
     )
     result["restart"] = spawn
     result["restarting"] = bool(spawn.get("ok"))
-    if spawn.get("ok"):
-        result["message"] = f"已升级到 {result.get('to')}，正在重启"
-    else:
-        result["message"] = (f"已升级到 {result.get('to')}，但重启没成功："
-                             f"{spawn.get('error')}；请手动重启")
+    if not result.get("selfcheck"):
+        if spawn.get("ok"):
+            result["message"] = f"已升级到 {result.get('to')}，正在重启"
+        else:
+            result["message"] = (f"已升级到 {result.get('to')}，但重启没成功："
+                                 f"{spawn.get('error')}；请手动重启")
     return result
 
 

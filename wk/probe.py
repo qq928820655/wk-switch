@@ -51,6 +51,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable
 
+from . import clock
 from .model import Account
 
 # ------------------------------------------------------------------ 区域端点
@@ -346,6 +347,8 @@ def probe_one(acc: Account, timeout: float = 12.0, proxy: str = "") -> dict:
       error        失败原因（成功时为空）
       remain/used/size  积分三元组，未知时为 None 不是 0
       tier         套餐名
+      restrict     True 表示这次的拒绝来自账号级风控（不是 token 失效），
+                   调用方据此把号移进风控区
       checked_at   本次探测时间戳
       latency_ms   耗时
       endpoint     实际打通的那个地址
@@ -365,6 +368,7 @@ def probe_one(acc: Account, timeout: float = 12.0, proxy: str = "") -> dict:
         "checked_at": _now(),
         "latency_ms": 0,
         "endpoint": "",
+        "restrict": False,
     }
 
     # ---- 本地就能判定的，不发请求 ----
@@ -413,7 +417,14 @@ def probe_one(acc: Account, timeout: float = 12.0, proxy: str = "") -> dict:
 
         # ---- 明确拒绝 ----
         if status in (401, 403):
-            out.update(state=STATE_INVALID, error="上游拒绝：登录已过期或 token 无效")
+            # 403 里夹着风控措辞的，是账号级限制而不是 token 失效：
+            # 两者要分开，风控的号该进风控区等解封，不是让人去重扫码。
+            restricted = looks_restricted(_body_text(body))
+            out.update(state=STATE_INVALID,
+                       error="被风控拦截（账号级限制）" if restricted
+                       else "上游拒绝：登录已过期或 token 无效")
+            if restricted:
+                out["restrict"] = True
             out["latency_ms"] = int((time.time() - started) * 1000)
             out["endpoint"] = base
             return out
@@ -421,7 +432,10 @@ def probe_one(acc: Account, timeout: float = 12.0, proxy: str = "") -> dict:
         code = summary_body.get("code")
         msg = str(_pick(summary_body, "msg", "message", "error") or "")
         if code not in (0, "0", None):
-            if _looks_like_auth_failure(msg) or status == 401:
+            if looks_restricted(msg) or looks_restricted(_body_text(summary_body)):
+                out.update(state=STATE_INVALID, error=msg or "被风控拦截")
+                out["restrict"] = True
+            elif _looks_like_auth_failure(msg) or status == 401:
                 out.update(state=STATE_INVALID, error=msg or "上游拒绝")
             else:
                 out.update(state=STATE_UNKNOWN, error=f"code {code}: {msg}"[:200])
@@ -461,10 +475,10 @@ def probe_one(acc: Account, timeout: float = 12.0, proxy: str = "") -> dict:
 def _fetch_detail(acc: Account, base: str, headers: dict, timeout: float,
                   proxy: str) -> list | None:
     """拉逐包明细。拿不到就返回 None，让调用方保留摘要的结果。"""
-    now = time.localtime()
-    begin = time.strftime("%Y-%m-%d %H:%M:%S", now)
-    end = time.strftime("%Y-%m-%d %H:%M:%S",
-                        time.localtime(time.time() + EXPIRY_WINDOW_DAYS * 86400))
+    # 窗口边界按北京时间给：上游按北京时间算套餐到期日，用 UTC 边界会在
+    # 每天早上 8 点之前漏掉「今天到期」的那一包。
+    begin = clock.stamp()
+    end = clock.stamp(time.time() + EXPIRY_WINDOW_DAYS * 86400)
     body = {
         "PageNumber": 1,
         "PageSize": 100,
@@ -626,15 +640,48 @@ class Prober:
         return [r for r in results if r is not None]
 
 
+def usable(row: dict) -> bool:
+    """这个账号现在能不能直接拿去用。
+
+    和 `state == valid` 不是一回事，hub 也是这么分的：
+
+    - **valid**：上游认这个 token，能查到数据。这是「凭据有效」。
+    - **usable**：在 valid 之上还有额度。remain 查到了且 <= 0 的号，
+      拿去跑会立刻 402/余额不足，对使用者来说等于不可用。
+
+    remain 为 None（上游没回明细）时不算不可用：没有证据表明它没额度，
+    判成不可用会把好号挡在外面。这是 hub 的 `wb_accounts.py` 里
+    `available = code == 0 and (remain > 0 or remain is None)` 同一个判断。
+    """
+    if str(row.get("state") or "") != STATE_VALID:
+        return False
+    remain = row.get("remain")
+    if isinstance(remain, (int, float)):
+        return float(remain) > 0
+    return True
+
+
 def summarize(results: Iterable[dict]) -> dict:
-    """把一批结果折成计数，给界面顶部显示。"""
+    """把一批结果折成计数，给界面顶部显示。
+
+    多给一个 `usable`：有效但没额度的号，用户关心的是「能用几个」，
+    不是「token 没过期几个」。
+    """
     counts = {STATE_VALID: 0, STATE_INVALID: 0, STATE_UNKNOWN: 0, STATE_SKIPPED: 0}
     remain = 0.0
     known_remain = 0
+    ok = 0
+    exhausted = 0
     for row in results:
         state = str(row.get("state") or STATE_UNKNOWN)
         if state in counts:
             counts[state] += 1
+        if usable(row):
+            ok += 1
+        elif state == STATE_VALID:
+            # 有效但余额为 0：单独计数，界面上一句话就能说清「几个能用、
+            # 几个是空号」，不用人去逐个看积分列
+            exhausted += 1
         value = row.get("remain")
         if isinstance(value, (int, float)):
             remain += float(value)
@@ -642,6 +689,8 @@ def summarize(results: Iterable[dict]) -> dict:
     return {
         **counts,
         "total": sum(counts.values()),
+        "usable": ok,
+        "exhausted": exhausted,
         "remain_total": round(remain, 2),
         "with_credit": known_remain,
     }

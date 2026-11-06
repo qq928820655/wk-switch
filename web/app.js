@@ -407,15 +407,42 @@ function realmOf(name) {
 
 /* ---------- 账户库 ---------- */
 
-const storeState = { rows: [], profile: null, realm: '', q: '', loaded: false, selected: new Set() };
+const storeState = { rows: [], profile: null, realm: '', q: '', batch: '', loaded: false, selected: new Set() };
 
 const REALM_PILL = { cn: 'warn', intl: 'brand' };
 const REALM_TEXT = { cn: '国内版', intl: '国际版' };
+
+/**
+ * 时间一律按北京时间显示。
+ *
+ * 服务器可能在 UTC 机房，`toLocaleTimeString()` 用的是**浏览器**时区；
+ * 手机改过时区、远程桌面接的是别的机器，看到的就不是同一个点。时间点上
+ * 绑死 Asia/Shanghai，和库里的存储口径对齐。
+ */
+const BJ_TZ = 'Asia/Shanghai';
+
+function bjTime(ts) {
+  if (!ts) return '';
+  try {
+    return new Date(ts * 1000).toLocaleTimeString('zh-CN', {
+      timeZone: BJ_TZ, hour12: false,
+    });
+  } catch (err) {
+    return '';
+  }
+}
+
+/** 批次号 `import-20261106-170858` → `11-06 17:08`。认不出就原样给。 */
+function batchLabel(batch) {
+  const m = String(batch || '').match(/(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})/);
+  return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : String(batch || '');
+}
 
 async function loadStore() {
   const params = new URLSearchParams();
   if (storeState.realm) params.set('realm', storeState.realm);
   if (storeState.q) params.set('q', storeState.q);
+  if (storeState.batch) params.set('batch', storeState.batch);
 
   const data = await apiGet('/api/store/list?' + params.toString());
   if (!data.ok) throw new Error(data.error || '账户库读取失败');
@@ -469,6 +496,27 @@ function renderStoreStats(stats) {
         <span class="hint">${esc(h.at)}</span>
       </li>`).join('')
     : '<li class="hint">还没有导入记录</li>';
+
+  fillBatchSelect(stats.batches || []);
+}
+
+/**
+ * 批次下拉。选中某个批次后列表只出那一批。
+ *
+ * 选项带上条数：同一批导了 200 条、后来又删了几条，下拉里的数字和库里的
+ * 实际条数会对上，用户不用点进去数。
+ */
+function fillBatchSelect(list) {
+  const sel = $('#store-batch');
+  if (!sel) return;
+  const keep = storeState.batch;
+  sel.innerHTML = ['<option value="">全部批次</option>'].concat(
+    list.map((b) => `<option value="${esc(b.batch)}">${esc(batchLabel(b.batch))} · ${b.count} 条</option>`)
+  ).join('');
+  // 选中的批次被清空了就回到「全部」，否则下拉会显示第一项但列表还在过滤
+  const exists = list.some((b) => b.batch === keep);
+  storeState.batch = exists ? keep : '';
+  sel.value = storeState.batch;
 }
 
 function renderStoreTable(rows) {
@@ -483,15 +531,15 @@ function renderStoreTable(rows) {
   body.innerHTML = rows.map((r) => `
     <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}">
       <td class="col-check"><input type="checkbox" class="row-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
-      <td><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
+      <td title="最近更新 ${esc(r.updated_at)}"><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
       <td><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
       <td class="mono col-uid" title="${esc(r.uid)}">${esc(shortUid(r.uid))}</td>
       <td><span class="pill ${STATE_PILL[r.state] || 'mute'}">${esc(r.state_label)}</span></td>
       <td class="col-credit">${creditCell(r)}</td>
+      <td class="col-batch">${batchCell(r)}</td>
       <td class="mono col-exp">${esc(r.expires) || '—'}</td>
       <td class="mono col-at" title="${esc(r.at)}">${esc(r.at)}</td>
       <td class="col-rt">${r.has_rt ? '<span class="pill ok">有</span>' : '<span class="hint">—</span>'}</td>
-      <td class="mono col-upd" title="${esc(r.updated_at)}">${esc(shortTime(r.updated_at))}</td>
       <td class="row-actions">
         <button class="link" data-act="rename">改名</button>
         <button class="link danger" data-act="delete">删除</button>
@@ -499,6 +547,36 @@ function renderStoreTable(rows) {
     </tr>`).join('');
 
   $('#store-hint').textContent = `共 ${rows.length} 条`;
+}
+
+/**
+ * 批次单元格：上一行是导入时间，下一行是批次号。
+ *
+ * 时间给「几点几分」，批次号给后 6 位（同一批的后 6 位就是它创建的时刻），
+ * 完整值都在 title 里——表格宽度有限，两个都铺开会把 uid 列挤没。
+ * 导入时就标了风控的，后面挂一个来源标签：那是「怎么进的风控区」，
+ * 决定这个号还值不值得去敲门。
+ */
+function batchCell(r) {
+  const when = r.imported_at ? shortTime(r.imported_at) : '';
+  const code = r.batch ? String(r.batch).slice(-6) : '';
+  // 风控来源做成一个小圆点：胶囊要 40px 宽，会把批次列撑到 124px，
+  // 整张表跟着溢出。圆点 + title 一样能看出「怎么进的风控区」，不占地方。
+  const risk = r.risk_label
+    ? `<i class="dot-risk" title="进风控区：${esc(r.risk_label)}"></i>`
+    : '';
+  if (!when && !code) {
+    return `<span class="hint">—</span>${risk}`;
+  }
+  const tip = [
+    r.batch ? `批次 ${r.batch}` : '',
+    r.imported_at ? `导入 ${r.imported_at}` : '',
+    r.first_batch && r.first_batch !== r.batch ? `首次批次 ${r.first_batch}` : '',
+  ].filter(Boolean).join('\n');
+  return `<div class="batch" title="${esc(tip)}">
+      <span class="batch-top"><b class="mono">${esc(when || '—')}</b>${risk}</span>
+      <small class="mono">${esc(code)}</small>
+    </div>`;
 }
 
 /**
@@ -630,11 +708,16 @@ async function runProbe(url, payload, btn, label) {
     const data = await api(url, payload);
     const s = data.summary || {};
     const parts = [];
-    if (s.valid) parts.push(`有效 ${s.valid}`);
+    // 「可用」放最前面：用户真正关心的是这个数，其余是它的解释
+    if (typeof s.usable === 'number') parts.push(`可用 ${s.usable}`);
+    if (s.valid) parts.push(`凭据有效 ${s.valid}`);
+    if (s.exhausted) parts.push(`额度用完 ${s.exhausted}`);
     if (s.invalid) parts.push(`失效 ${s.invalid}`);
     if (s.unknown) parts.push(`未确认 ${s.unknown}`);
     if (s.skipped) parts.push(`不可查 ${s.skipped}`);
     if (s.with_credit) parts.push(`合计剩余 ${fmtNum(s.remain_total)} 积分`);
+    // 风控判定单独说一句：这些号已经被挪进风控区，不去看名单会以为丢了
+    if (data.restricted) parts.push(`风控 ${data.restricted}（已移入风控区）`);
 
     if (hint) {
       hint.textContent = `已校验 ${data.written || 0} 个账号：${parts.join(' · ') || '无结果'}`;
@@ -722,11 +805,20 @@ async function saveToStore() {
     return;
   }
   const btn = $('#btn-save-store');
+  const riskBox = $('#opt-risk');
+  const risk = !!(riskBox && riskBox.checked);
   btn.disabled = true;
   try {
-    const data = await api('/api/store/import', { job: state.job, opts: collectOpts() });
-    toast(`已留存：新增 ${data.inserted} · 更新 ${data.updated}${data.skipped ? ' · 跳过 ' + data.skipped : ''}`);
+    const data = await api('/api/store/import', {
+      job: state.job, opts: collectOpts(), risk,
+    });
+    const parts = [`新增 ${data.inserted}`, `更新 ${data.updated}`];
+    if (data.skipped) parts.push(`跳过 ${data.skipped}`);
+    // 风控批次要明说「进了哪」，否则用户以为存进正常区了
+    if (data.risk) parts.push(`风控 ${data.risk_count || data.inserted + data.updated}`);
+    toast(`已留存：${parts.join(' · ')}`);
     storeState.loaded = false;
+    storeState.batch = '';
     await loadStore();
   } catch (err) {
     toast(err.message, true);
@@ -846,28 +938,47 @@ async function loadStoreProfiles() {
   });
 }
 
+/**
+ * 从库导出。范围规则和「导出选中」是同一条：
+ *
+ *   勾了一部分  → 只导勾选的那些（版本筛选此时不生效，用户已经用手划了范围）
+ *   全勾选/全不勾 → 全部（按上面的版本选项走，支持分版本各一份）
+ *
+ * 全勾也算「全部」：那是「这批我都都要」，不是「只要屏幕上这几十条」。
+ * 这两条规则由后端再判一次，前端算错也导不出一整库。
+ */
 async function storeExport() {
   if (!storeState.profile) {
     toast('先选择一种目标格式', true);
     return;
   }
+  const total = storeState.rows.length;
+  const picked = storeState.selected.size;
+  const partial = picked > 0 && picked < total;
+  const ids = partial ? [...storeState.selected] : [];
+
   const btn = $('#btn-store-export');
   btn.disabled = true;
   btn.textContent = '生成中…';
   try {
-    const data = await api('/api/store/export', {
+    const payload = {
       profile: storeState.profile,
       realm: realmOf('store-export-realm'),
-    });
+      // 范围由这里明确说清：服务端不再靠「有没有 ids」猜
+      scope: partial ? 'selected' : 'all',
+    };
+    if (ids.length) payload.ids = ids;
+    const data = await api('/api/store/export', payload);
+    const scope = partial ? `已选 ${ids.length} 条` : `全部 ${total} 条`;
     $('#store-downloads').innerHTML = data.files.map((f) => `
       <div class="dl">
         <div>
           <div class="dl-name">${esc(f.name)}</div>
-          <div class="dl-size">${bytesText(f.size)}</div>
+          <div class="dl-size">${bytesText(f.size)} · ${scope}</div>
         </div>
         <a href="${esc(f.download)}" download="${esc(f.name)}">下载</a>
       </div>`).join('');
-    toast('已生成 ' + data.files.length + ' 个文件');
+    toast(`已生成 ${data.files.length} 个文件（${scope}）`);
   } catch (err) {
     toast(err.message, true);
   } finally {
@@ -1168,7 +1279,7 @@ function renderSteps(st) {
   if (!box || !st) return;
   const steps = Array.isArray(st.steps) ? st.steps.slice(-6) : [];
   box.innerHTML = steps.map((s) => {
-    const t = new Date((s.at || 0) * 1000).toLocaleTimeString('zh-CN');
+    const t = bjTime(s.at);
     return `<li><span class="mono">${esc(t)}</span> ${esc(s.text || '')}</li>`;
   }).join('');
   if (st.state && STEP_TEXT[st.state]) {
@@ -1275,6 +1386,8 @@ function fillRecheckForm(cfg, disc) {
   const mihomo = cfg.mihomo || {};
   $('#rc-host').value = mihomo.host || '';
   $('#rc-ports').value = mihomo.ports || '';
+  $('#rc-api').value = mihomo.api || '';
+  $('#rc-secret').value = mihomo.secret || '';
   if (disc) {
     $('#rc-detect-hint').textContent = disc.probed
       ? `检测到 ${disc.ok_count} / ${(disc.ports || []).length} 个可用出口`
@@ -1314,21 +1427,31 @@ function renderCustomNodes(nodes) {
     : '<p class="hint">没有可测的地址</p>';
 }
 
-/* 节点卡片：地址 + 出口 IP + 延迟。mihomo 和自定义出口共用这一份渲染，
-   两边显示不一致的话，用户会以为是两套不同的东西。 */
+/* 节点卡片：节点名 + 出口 IP + 延迟。mihomo 和自定义出口共用这一份渲染，
+   两边显示不一致的话，用户会以为是两套不同的东西。
+
+   显示优先级是「节点名 > 地址」。出口 IP 分不出线路——同一订阅里两个节点
+   出口落在同一段是常事，卡片上两格数字一模一样，看着像同一个槽测了两遍。
+   mihomo 的 listener 里带着出站节点名，那才是「我在用哪条线」的答案。
+   地址放 title 里，要核对端口的时候鼠标一悬停就有。 */
 function nodeRows(nodes, probed) {
   return nodes.map((n) => {
-    const label = n.url.replace(/^https?:\/\//, '');
+    const addr = String(n.url || '').replace(/^https?:\/\//, '');
+    const name = n.name || n.listener || '';
+    const text = name || addr;
+    const cls = name ? 'node-name' : 'node-url';
+    const tip = name ? `${name}（${addr}）` : addr;
+    const head = `<span class="${cls}" title="${esc(tip)}">${esc(text)}</span>`;
     if (!probed) {
-      return `<div class="node"><span class="node-url" title="${esc(label)}">${esc(label)}</span>
+      return `<div class="node">${head}
         <span class="node-tail hint">未检测</span></div>`;
     }
     if (n.ok) {
-      return `<div class="node ok"><span class="node-url" title="${esc(label)}">${esc(label)}</span>
+      return `<div class="node ok">${head}
         <span class="node-ip mono">${esc(n.exit_ip || '')}</span>
         <span class="node-tail">${n.latency_ms} ms</span></div>`;
     }
-    return `<div class="node bad"><span class="node-url" title="${esc(label)}">${esc(label)}</span>
+    return `<div class="node bad">${head}
       <span class="node-tail" title="${esc(n.error || '')}">不可用</span></div>`;
   }).join('');
 }
@@ -1406,13 +1529,16 @@ async function saveRecheckCfg() {
     mihomo: {
       host: $('#rc-host').value.trim(),
       ports: $('#rc-ports').value.trim(),
+      // 控制器地址留空时后端按 host 推 9090；secret 只在设了才发
+      api: $('#rc-api').value.trim(),
+      secret: $('#rc-secret').value.trim(),
     },
   };
   const data = await api('/api/recheck/config', { config: cfg });
   recheckState.cfg = data.config;
   fillRecheckForm(data.config, data.nodes);
   renderTrackCounts(data.stats);
-  $('#rc-save-hint').textContent = `已保存 · ${new Date().toLocaleTimeString('zh-CN')}`;
+  $('#rc-save-hint').textContent = `已保存 · ${bjTime(Date.now() / 1000)}`;
   toast('复检设置已保存');
 }
 
@@ -1425,10 +1551,16 @@ async function detectNodes() {
       mihomo: {
         host: $('#rc-host').value.trim(),
         ports: $('#rc-ports').value.trim(),
+        api: $('#rc-api').value.trim(),
+        secret: $('#rc-secret').value.trim(),
       },
     });
     if (!data.ok) throw new Error(data.error || '检测失败');
-    $('#rc-detect-hint').textContent = `检测到 ${data.ok_count} / ${(data.ports || []).length} 个可用出口`;
+    // 拿到节点名就说「检测到 N 个」，拿不到额外提一句控制器没通——
+    // 否则用户只会看到一串 IP，不知道自己填的控制器地址有没有生效
+    const named = data.named ? '' : '（控制器未通，只显示地址）';
+    $('#rc-detect-hint').textContent =
+      `检测到 ${data.ok_count} / ${(data.ports || []).length} 个可用出口${named}`;
     renderNodes(data.nodes || [], true);
     if (!data.ok_count) {
       $('#rc-detect-hint').textContent =
@@ -1712,6 +1844,17 @@ function bind() {
       loadStore().catch((err) => toast(err.message, true));
     }, 220);
   });
+
+  // 批次筛选：选中某一批就只看那一批，方便对账 / 整批重打
+  const batchSel = $('#store-batch');
+  if (batchSel) {
+    batchSel.addEventListener('change', () => {
+      storeState.batch = batchSel.value;
+      // 换批次等于换列表，勾选跟着清空——留着会让「导出选中」跨批次出错
+      storeState.selected.clear();
+      loadStore().catch((err) => toast(err.message, true));
+    });
+  }
 
   // 表格行内操作走事件委托：表格每次重绘，逐行绑事件会漏
   $('#store-table tbody').addEventListener('click', (e) => {

@@ -27,12 +27,19 @@ from wk import version
 def port_free(port: int, host: str = "127.0.0.1") -> bool:
     """端口能不能真的绑上。
 
-    这里**不设** SO_REUSEADDR：Linux 上它只影响 TIME_WAIT，Windows 上却
-    允许绑定一个正在 LISTEN 的端口，会把「已被占用」误判成「空闲」，
-    于是升级重启时新进程以为 8765 空着、绑上去、实际抢不到而退出。
-    不设它，Windows 的 bind 遇到已监听端口会直接报 WSAEADDRINUSE。
+    **POSIX 上必须设 SO_REUSEADDR。** 服务的 socket 是
+    `ThreadingHTTPServer`，`allow_reuse_address = 1`；上一个连接由服务端
+    主动关闭后，端口有约 60 秒 TIME_WAIT，服务自己照样能绑，但裸 socket
+    不设这个选项就会 `EADDRINUSE`。探测一旦比现实严，得到的结论就是
+    「端口还被占」——升级重启会因此白等到超时。
+
+    **Windows 上不设**：那边 SO_REUSEADDR 允许绑定一个正在 LISTEN 的端口，
+    会把「已被占用」误判成「空闲」，新进程绑上去实际抢不到又退出。
+    `SO_REUSEADDR` 只放过对端已关闭的旧连接，挡不住另一个进程的 LISTEN。
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if os.name != "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
             sock.listen(1)

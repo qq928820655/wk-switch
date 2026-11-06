@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import clock
 from . import token as tok
 from .model import Account
 
@@ -284,5 +285,5 @@ def summarize(accounts: list[Account]) -> dict[str, Any]:
             {"key": k, "count": v, "ratio": round(v / total * 100, 1) if total else 0}
             for k, v in fields.items()
         ],
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": clock.stamp(),
     }

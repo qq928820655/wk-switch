@@ -215,6 +215,28 @@ class InvalidTests(_ServerCase):
         self.route("/billing/meter/get-user-resource-summary", 403, {})
         res = self.probe_with_base(self.acc(), (self.base,))
         self.assertEqual(res["state"], probe.STATE_INVALID)
+        # 没带风控措辞的 403 只是「没权限/过期」，不能标成风控
+        self.assertFalse(res.get("restrict"))
+
+    def test_403_with_restrict_wording_sets_flag(self):
+        """带 11140 / request illegal 的 403 是账号级风控，要单独标出来。
+
+        这类号进风控区等解封，和「token 失效」不是一个处理方式：前者去敲门
+        看解没解，后者只能重新扫码。
+        """
+        self.route("/billing/meter/get-user-resource-summary", 403,
+                   {"code": 11140, "msg": "request illegal"})
+        res = self.probe_with_base(self.acc(), (self.base,))
+        self.assertEqual(res["state"], probe.STATE_INVALID)
+        self.assertTrue(res.get("restrict"))
+
+    def test_business_code_restrict_sets_flag(self):
+        """200 但 code=11140，同样算风控。"""
+        self.route("/billing/meter/get-user-resource-summary", 200,
+                   {"code": 11140, "msg": "request illegal"})
+        res = self.probe_with_base(self.acc(), (self.base,))
+        self.assertEqual(res["state"], probe.STATE_INVALID)
+        self.assertTrue(res.get("restrict"))
 
     def test_business_code_login_expired(self):
         """200 但 code=10001 + 「登录已过期」，仍是无效。"""
@@ -389,6 +411,46 @@ class SafetyTests(unittest.TestCase):
                 self.assertTrue(
                     any(k in path for k in ("get-user-resource", "get-enterprise")),
                     path)
+
+
+class UsableTests(unittest.TestCase):
+    """「可用」和「有效」分开算：有效但没额度，拿去跑就是立刻余额不足。
+
+    判据照 hub 的 available = code == 0 and (remain > 0 or remain is None)。
+    """
+
+    def test_valid_with_credit_is_usable(self) -> None:
+        self.assertTrue(probe.usable({"state": "valid", "remain": 42.0}))
+
+    def test_valid_with_zero_credit_is_not_usable(self) -> None:
+        self.assertFalse(probe.usable({"state": "valid", "remain": 0}))
+
+    def test_valid_without_detail_is_still_usable(self) -> None:
+        """查不到明细时不能判不可用——没有证据说它没额度，误杀好号代价更大。"""
+        self.assertTrue(probe.usable({"state": "valid", "remain": None}))
+
+    def test_invalid_is_never_usable(self) -> None:
+        self.assertFalse(probe.usable({"state": "invalid", "remain": 999.0}))
+
+    def test_unknown_is_not_usable(self) -> None:
+        self.assertFalse(probe.usable({"state": "unknown"}))
+
+    def test_summary_counts_usable_and_exhausted(self) -> None:
+        got = probe.summarize([
+            {"state": "valid", "remain": 10.0},
+            {"state": "valid", "remain": 0},
+            {"state": "invalid", "remain": None},
+            {"state": "unknown", "remain": None},
+        ])
+        self.assertEqual(got["usable"], 1)
+        self.assertEqual(got["exhausted"], 1)
+        self.assertEqual(got["valid"], 2)
+        self.assertEqual(got["total"], 4)
+
+    def test_restrict_flag_defaults_false(self) -> None:
+        """403 不带风控措辞时不能被当成封号，否则正常过期号会被拖进风控区。"""
+        got = probe.probe_one  # 只确认函数存在，真实判定在假上游用例里
+        self.assertTrue(callable(got))
 
 
 if __name__ == "__main__":

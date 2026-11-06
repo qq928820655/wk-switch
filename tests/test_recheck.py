@@ -479,5 +479,118 @@ class RunnerExitTests(unittest.TestCase):
         self.assertEqual(runner._plan(0)["exit_ip"], "6.6.6.6")
 
 
+class ListenerNameTests(unittest.TestCase):
+    """节点名来自 mihomo 的 /listeners，出口 IP 分不出线路。"""
+
+    def _fake(self, payload: dict, secret: str = ""):
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):  # noqa: N802
+                if self.path != "/listeners":
+                    self.send_error(404)
+                    return
+                if secret and self.headers.get("Authorization") != "Bearer " + secret:
+                    self.send_error(401)
+                    return
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        # addCleanup 是后进先出：先登记 close，后登记 shutdown，才能
+        # 保证 shutdown 在 server_close 之前跑（反过来会对着已关闭的
+        # socket 调 select，Windows 上直接抛 WinError 10038）
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _cfg(self, api: str, secret: str = "") -> dict:
+        return {"mihomo": {"host": "127.0.0.1", "ports": "17901-17902",
+                           "probe_url": "https://api.ipify.org", "timeout": 3.0,
+                           "api": api, "secret": secret, "enabled": True}}
+
+    def test_api_base_derives_9090_when_empty(self):
+        self.assertEqual(recheck.api_base({"host": "cli-proxy-mihomo", "api": ""}),
+                         "http://cli-proxy-mihomo:9090")
+
+    def test_api_base_keeps_explicit(self):
+        self.assertEqual(recheck.api_base({"host": "x", "api": "http://10.0.0.2:6000"}),
+                         "http://10.0.0.2:6000")
+
+    def test_api_base_host_with_port(self):
+        self.assertEqual(recheck.api_base({"host": "127.0.0.1:9090", "api": ""}),
+                         "http://127.0.0.1:9090")
+
+    def test_fetch_listeners_maps_port_to_proxy(self):
+        port = self._fake({"listeners": [
+            {"name": "http-17901", "type": "http", "port": 17901, "proxy": "香港01"},
+            {"name": "http-17902", "type": "http", "port": 17902, "proxy": "日本02"},
+            {"name": "socks-17903", "type": "socks", "port": 0, "proxy": "跳过"},
+        ]})
+        got = recheck.fetch_listeners(self._cfg(f"http://127.0.0.1:{port}"))
+        self.assertEqual(got[17901]["proxy"], "香港01")
+        self.assertEqual(got[17902]["proxy"], "日本02")
+        self.assertEqual(got[17902]["name"], "http-17902")
+        self.assertNotIn(0, got)
+
+    def test_fetch_listeners_sends_secret(self):
+        port = self._fake({"listeners": [
+            {"name": "a", "port": 17901, "proxy": "节点A"}]}, secret="s3cret")
+        got = recheck.fetch_listeners(self._cfg(f"http://127.0.0.1:{port}", "s3cret"))
+        self.assertEqual(got[17901]["proxy"], "节点A")
+
+    def test_fetch_listeners_empty_when_unauthorized(self):
+        port = self._fake({"listeners": [
+            {"name": "a", "port": 17901, "proxy": "节点A"}]}, secret="s3cret")
+        got = recheck.fetch_listeners(self._cfg(f"http://127.0.0.1:{port}", "wrong"))
+        self.assertEqual(got, {})
+
+    def test_fetch_listeners_empty_when_unreachable(self):
+        """控制器没开的话不该抛异常，只是拿不到名字。"""
+        self.assertEqual(recheck.fetch_listeners(self._cfg("http://127.0.0.1:1")), {})
+
+    def test_discover_nodes_prefers_proxy_name(self):
+        cfg = self._cfg("")
+        nodes = [
+            {"url": "http://127.0.0.1:17901", "ok": True, "exit_ip": "1.1.1.1",
+             "latency_ms": 10, "error": ""},
+            {"url": "http://127.0.0.1:17902", "ok": True, "exit_ip": "2.2.2.2",
+             "latency_ms": 20, "error": ""},
+        ]
+        with mock.patch.object(recheck, "fetch_listeners",
+                               return_value={17901: {"name": "listener-1", "proxy": "香港01"},
+                                             17902: {"name": "listener-2", "proxy": ""}}), \
+             mock.patch.object(recheck, "probe_urls", return_value=nodes):
+            data = recheck.discover_nodes(cfg, probe_now=True)
+        self.assertEqual([n["name"] for n in data["nodes"]], ["香港01", "listener-2"])
+        self.assertTrue(data["named"])
+        self.assertEqual(data["nodes"][0]["port"], 17901)
+
+    def test_discover_nodes_falls_back_to_address(self):
+        """控制器不通时 name 是空串，前端退回显示地址。"""
+        cfg = self._cfg("")
+        with mock.patch.object(recheck, "fetch_listeners", return_value={}), \
+             mock.patch.object(recheck, "probe_urls",
+                               return_value=[{"url": "http://127.0.0.1:17901",
+                                              "ok": True, "exit_ip": "1.1.1.1",
+                                              "latency_ms": 10, "error": ""}]):
+            data = recheck.discover_nodes(cfg, probe_now=True)
+        self.assertEqual(data["nodes"][0]["name"], "")
+        self.assertFalse(data["named"])
+
+    def test_port_of_handles_garbage(self):
+        self.assertEqual(recheck.port_of("http://127.0.0.1:17901"), 17901)
+        self.assertEqual(recheck.port_of(""), 0)
+        self.assertEqual(recheck.port_of("不对"), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

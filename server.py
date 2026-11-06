@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from wk import (auth, formats, pipeline, probe, recheck, store,
+from wk import (auth, clock, formats, pipeline, probe, recheck, store,
                 update as updater, version)
 from wk.model import Account
 
@@ -73,7 +73,7 @@ def _rows_for_ui(accounts: list[Account], limit: int = 200) -> list[dict]:
             "domain": acc.domain,
             "state": state,
             "state_label": tok.STATE_LABEL.get(state, state),
-            "expires": time.strftime("%Y-%m-%d", time.localtime(acc.expires_at)) if acc.expires_at else "",
+            "expires": clock.stamp(acc.expires_at, "%Y-%m-%d") if acc.expires_at else "",
             "at": (acc.access_token[:8] + "…" + acc.access_token[-4:]) if len(acc.access_token) > 14 else ("*" * len(acc.access_token)),
             "rt": "有" if acc.refresh_token else "",
             "enabled": acc.enabled,
@@ -514,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
         if realm_mode == "split":
             outputs = []
             # 同一批导出共用时间戳，两份文件不会跨秒、排序时挨在一起
-            stamp = time.strftime("%Y%m%d-%H%M%S")
+            stamp = clock.compact()
             for realm in ("cn", "intl"):
                 subset = [a for a in accounts if (a.realm or "").lower() == realm]
                 if not subset:
@@ -548,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
             "report": {
                 "profile": profile_id,
                 "profile_name": formats.PROFILES[profile_id].name,
-                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "exported_at": clock.stamp(),
                 "realm": realm_mode,
                 "count": total,
                 "opts": opts,
@@ -557,7 +557,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 本地账户库 -----------------------------------------------
     def _store_import(self, payload: dict) -> None:
-        """把当前会话的转换结果写进本地库，按 (名称, 版本) 去重更新。"""
+        """把当前会话的转换结果写进本地库，按 (uid, 版本) 去重更新。
+
+        `risk=True` 表示这一批导入时就已经知道是风控状态（来源系统标注过、
+        或者用户自己清楚），直接进风控区；不传就是正常账号。**只有这里和
+        后续验证能决定一个号进不进风控区**，导入文件里的备注措辞不再自动
+        判定——那条路径会把整批正常号一起拖进风控区。
+        """
         accounts = self._load_job(payload)
         opts = payload.get("opts") or {}
         result = pipeline.convert(list(accounts), opts)
@@ -565,11 +571,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("转换结果为空，没有可留存的账号")
 
         source = str(payload.get("source") or "wk-switch")
-        batch = time.strftime("import-%Y%m%d-%H%M%S")
-        stats = store.upsert(result.accounts, batch=batch, source=source)
+        risk = bool(payload.get("risk"))
+        batch = "import-" + clock.compact()
+        stats = store.upsert(result.accounts, batch=batch, source=source, risk=risk)
         self._json(200, {
             "ok": True,
             "batch": batch,
+            "risk": risk,
+            "risk_count": stats.get("risk", 0),
             "inserted": stats["inserted"],
             "updated": stats["updated"],
             "skipped": stats["skipped"],
@@ -583,12 +592,15 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(urlparse(self.path).query)
         realm = (query.get("realm") or [""])[0]
         keyword = (query.get("q") or [""])[0]
+        batch = (query.get("batch") or [""])[0]
         try:
             limit = int((query.get("limit") or ["500"])[0] or 500)
         except ValueError:
             limit = 500
-        rows = store.list_accounts(realm=realm, query=keyword, limit=min(limit, 2000))
-        self._json(200, {"ok": True, "rows": rows, "total": len(rows), "stats": store.stats()})
+        rows = store.list_accounts(realm=realm, query=keyword,
+                                   limit=min(limit, 2000), batch=batch)
+        self._json(200, {"ok": True, "rows": rows, "total": len(rows),
+                         "batch": batch, "stats": store.stats()})
 
     def _store_rename(self, payload: dict) -> None:
         row_id = int(payload.get("id") or 0)
@@ -606,15 +618,31 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "removed": removed, "stats": store.stats()})
 
     def _store_export(self, payload: dict) -> None:
-        """从本地库直接导出，不依赖当前会话。"""
+        """从本地库直接导出，不依赖当前会话。
+
+        范围规则（和服务端前端各判一次，任何一边算错都不会导出一整库）：
+
+        - **勾了一部分** → 只导勾选的那些跳过版本筛选，因为用户已经用手划了
+          范围，再按版本掐一遍会把选中的行悄悄剔掉；
+        - **全勾选 / 一条不勾** → 导出全部并按版本选项走。全勾是「这批我都要」，
+          不勾是「我没限定」，两种都等于不限制。
+        """
         profile_id = str(payload.get("profile") or "")
         realm_mode = str(payload.get("realm") or "all")
         ids = payload.get("ids") or None
+        # 前端会明确说这次是「只导勾的」还是「导全部」：全勾时它不会传 ids，
+        # 但万一有人直接打接口传了全量 ids，scope 优先，不然版本选项会被跳过。
+        asked = str(payload.get("scope") or "").strip()
+        scope = "all"
+        if asked == "all":
+            ids = None
 
         if ids:
-            # 勾选导出以勾选为准：再按版本过滤会把用户明确选中的行悄悄剔掉
-            accounts = store.load_for_export(ids=[int(i) for i in ids])
-            realm_mode = "all"
+            ids = [int(i) for i in ids]
+            accounts = store.load_for_export(ids=ids)
+            scope = "selected"
+            # 分版本导出对「已选中的这批」照样有效：拆包只看 realm，不看范围。
+            realm_mode = "split" if realm_mode == "split" else "all"
         elif realm_mode in ("cn", "intl"):
             accounts = store.load_for_export(realm=realm_mode)
         else:
@@ -624,7 +652,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("本地库里没有可导出的账号")
 
         outputs = self._build_exports(accounts, profile_id, realm_mode)
-        self._respond_files(outputs, profile_id, {}, realm_mode, len(accounts))
+        self._respond_files(outputs, profile_id, {"scope": scope},
+                            realm_mode, len(accounts))
 
     # ---- 在线升级 -------------------------------------------------
     def _site(self) -> tuple[int, str]:
@@ -650,6 +679,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _exit_after_restart(self, result: dict) -> None:
+        """响应已经发出去了，现在决定这一进程怎么退。
+
+        正常情况：监督进程在另一个 cgroup / 独立 session 里接着干，这里直接
+        退出，把端口让出来。
+
+        降级情况（systemd 部署但拿不到 systemd-run）：没有独立 cgroup 可用，
+        监督进程会被 systemd 随服务一起停掉。那就由本进程在退出前按一下重启键
+        —— `--no-block` 让它立即返回，真正的停和起交给 systemd。
+        """
+        from wk import relaunch
+
+        spawn = result.get("restart") if isinstance(result.get("restart"), dict) else {}
+        if spawn.get("degraded"):
+            unit = str(spawn.get("unit") or "")
+            def kick() -> None:
+                if unit:
+                    relaunch.kick_systemd(unit)
+                os._exit(0)
+            # 0.5 秒：够浏览器把响应体收完，又不至于让页面干等
+            threading.Timer(0.5, kick).start()
+            return
+        threading.Timer(0.5, lambda: os._exit(0)).start()
+
     def _update_upgrade(self) -> None:
         """一键升级：下载 → 替换 → 重启，一个请求做完。
 
@@ -665,8 +718,7 @@ class Handler(BaseHTTPRequestHandler):
         result["old_pid"] = os.getpid()
         self._json(200, result)
         if result.get("restarting"):
-            # 响应已经刷出去，给浏览器 0.5 秒收完再退，否则它看到的是连接被重置
-            threading.Timer(0.5, lambda: os._exit(0)).start()
+            self._exit_after_restart(result)
 
     def _update_restart(self) -> None:
         port, host = self._site()
@@ -676,7 +728,7 @@ class Handler(BaseHTTPRequestHandler):
         result["old_pid"] = os.getpid()
         self._json(200, result)
         if result.get("ok"):
-            threading.Timer(0.5, lambda: os._exit(0)).start()
+            self._exit_after_restart(result)
 
     def _update_status(self) -> None:
         """重启进度。重启期间旧进程已退，只有新进程起来后才读得到。"""
@@ -699,7 +751,7 @@ class Handler(BaseHTTPRequestHandler):
         result["old_pid"] = os.getpid()
         self._json(200, result)
         if result.get("restarting"):
-            threading.Timer(0.5, lambda: os._exit(0)).start()
+            self._exit_after_restart(result)
 
     def _update_local(self, payload: dict) -> None:
         """上传本地升级包，替换 + 重启一步到位。
@@ -723,7 +775,7 @@ class Handler(BaseHTTPRequestHandler):
         result["old_pid"] = os.getpid()
         self._json(200, result)
         if result.get("restarting"):
-            threading.Timer(0.5, lambda: os._exit(0)).start()
+            self._exit_after_restart(result)
 
     def _update_config(self, payload: dict) -> None:
         patch = {k: payload[k] for k in ("repo", "index_url", "asset", "allow_prerelease", "proxy")
@@ -909,6 +961,11 @@ class Handler(BaseHTTPRequestHandler):
             cfg["mihomo"] = {**cfg["mihomo"], **patch}
             cfg["mihomo"]["timeout"] = recheck._float(
                 cfg["mihomo"].get("timeout"), 10.0, 3.0, 60.0)
+            # api 只收 http/https（normalize_url 会把非法值洗成空串）；
+            # secret 原样保留但去掉首尾空白——手输容易带空格
+            cfg["mihomo"]["api"] = recheck.normalize_url(
+                str(cfg["mihomo"].get("api") or "").strip())
+            cfg["mihomo"]["secret"] = str(cfg["mihomo"].get("secret") or "").strip()
         data = recheck.discover_nodes(cfg, probe_now=True)
         # 自定义出口栏填着东西时一并测，页面上一次点击就能看到两边的出口 IP
         custom = payload.get("custom")
@@ -953,7 +1010,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # 结果按输入顺序返回，pairs 也是同一个顺序，用下标对齐
         rows = []
+        moved = 0
         for (row_id, acc), res in zip(pairs, results):
+            restrict = bool(res.get("restrict"))
+            if restrict:
+                moved += 1
             rows.append({
                 "id": row_id,
                 "state": res.get("state"),
@@ -962,6 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
                 "size": res.get("size"),
                 "checked_at": res.get("checked_at"),
                 "note": res.get("error") or "",
+                "restrict": restrict,
             })
 
         written = store.update_credits(rows)
@@ -969,6 +1031,8 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "ok": True,
             "written": written,
+            # 这次校验里有多少个被判定为风控、已经挪进风控区
+            "restricted": moved,
             "summary": summary,
             "results": [
                 {
@@ -1053,9 +1117,11 @@ def _auto_recheck_once() -> None:
     if not cfg["enabled"] or not cfg["auto"]:
         return
 
-    now = time.localtime()
-    today = time.strftime("%Y-%m-%d", now)
-    if now.tm_hour < cfg["auto_hour"]:
+    # 北京时间：服务器在 UTC 上跑时，本地时间 23 点对应北京早上 7 点，
+    # 「每天早上 8 点复检」会提前 8 小时触发，还会把「今天」算错一天。
+    now = clock.dt()
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < cfg["auto_hour"]:
         return
     with _auto_lock:
         if _auto_state["last_day"] == today:

@@ -393,5 +393,123 @@ class ProbeColumnTests(StoreTestBase):
         self.assertEqual(by_id[0][0], pairs[0][0])
 
 
+class BatchTests(StoreTestBase):
+    """导入批次：同一批导进来的号要能一次捞出来，也要能看出是什么时候导的。"""
+
+    def test_batch_and_imported_at_recorded(self) -> None:
+        store.upsert([self.acc("u-b1", "甲")], batch="import-20261106-101010")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["batch"], "import-20261106-101010")
+        self.assertEqual(row["first_batch"], "import-20261106-101010")
+        # 时间是北京时间字符串，格式固定，不可能是空的
+        self.assertRegex(row["imported_at"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+    def test_first_batch_survives_reimport(self) -> None:
+        """重复导入只改「最近批次」，首次批次得留着——不然找不出最早那批。"""
+        store.upsert([self.acc("u-b2", "甲")], batch="import-20261101-090000")
+        store.upsert([self.acc("u-b2", "甲")], batch="import-20261106-101010")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["batch"], "import-20261106-101010")
+        self.assertEqual(row["first_batch"], "import-20261101-090000")
+
+    def test_filter_by_batch(self) -> None:
+        store.upsert([self.acc("u-b3", "甲"), self.acc("u-b4", "乙")],
+                     batch="import-20261106-101010")
+        store.upsert([self.acc("u-b5", "丙")], batch="import-20261106-111111")
+        rows = store.list_accounts(batch="import-20261106-111111")
+        self.assertEqual([r["nickname"] for r in rows], ["丙"])
+
+    def test_batches_counts(self) -> None:
+        store.upsert([self.acc("u-b6", "甲"), self.acc("u-b7", "乙")],
+                     batch="import-20261106-101010")
+        store.upsert([self.acc("u-b8", "丙")], batch="import-20261106-111111")
+        got = {b["batch"]: b["count"] for b in store.batches()}
+        self.assertEqual(got["import-20261106-101010"], 2)
+        self.assertEqual(got["import-20261106-111111"], 1)
+        # 新的批次排在前面
+        self.assertEqual(store.batches()[0]["batch"], "import-20261106-111111")
+
+    def test_search_matches_batch(self) -> None:
+        store.upsert([self.acc("u-b9", "甲")], batch="import-20261106-101010")
+        self.assertEqual(len(store.list_accounts(query="20261106-101010")), 1)
+
+
+class RiskImportTests(StoreTestBase):
+    """风控配置：不配置就是正常号，配置了直接进风控区。
+
+    这条链以前是「导入字段里出现风控措辞就自动进名单」，结果是来源系统
+    备注里带一句「请求被拦截」，整批号都被拖进风控区，正常号跟着一起
+    被当风控处理。现在状态只由显式配置或后续验证写。
+    """
+
+    def _with_note(self, uid: str, note: str) -> Account:
+        a = self.acc(uid, "某号", token="at-" + uid)
+        a.note = note
+        return a
+
+    def test_default_is_normal(self) -> None:
+        store.upsert([self.acc("u-r1", "甲")], batch="b-normal")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["recheck_state"], "")
+        self.assertEqual(row["risk_src"], "")
+        # 正常号不该出现在风控区
+        self.assertEqual(store.list_accounts(track="banned"), [])
+
+    def test_risk_import_goes_straight_to_risk_area(self) -> None:
+        stats = store.upsert([self.acc("u-r2", "甲")], batch="b-risk", risk=True)
+        self.assertEqual(stats["risk"], 1)
+        row = store.list_accounts()[0]
+        self.assertEqual(row["recheck_state"], "banned")
+        self.assertEqual(row["risk_src"], "import")
+        self.assertEqual(row["risk_label"], "导入标记")
+        self.assertEqual(len(store.list_accounts(track="banned")), 1)
+
+    def test_banned_wording_in_note_does_not_auto_flag(self) -> None:
+        """来源备注里带风控措辞，没勾风控就不该被塞进风控区。"""
+        store.upsert([self._with_note("u-r3", "banned by upstream")], batch="b1")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["recheck_state"], "")
+        self.assertEqual(store.list_accounts(track="banned"), [])
+
+    def test_verify_finding_moves_to_risk_area(self) -> None:
+        """后续验证发现风控：探针回写 restrict 时自动进风控区。"""
+        store.upsert([self.acc("u-r4", "甲")], batch="b1")
+        row = store.list_accounts()[0]
+        store.update_credits([{
+            "id": row["id"], "state": "invalid", "checked_at": 1790000000,
+            "note": "被风控拦截（账号级限制）", "restrict": True,
+        }])
+        got = store.list_accounts()[0]
+        self.assertEqual(got["recheck_state"], "banned")
+        self.assertEqual(got["risk_src"], "verify")
+
+    def test_risk_import_overrides_normal_state(self) -> None:
+        store.upsert([self.acc("u-r5", "甲")], batch="b1")
+        store.upsert([self.acc("u-r5", "甲")], batch="b2", risk=True)
+        row = store.list_accounts()[0]
+        self.assertEqual(row["recheck_state"], "banned")
+        self.assertEqual(row["risk_src"], "import")
+
+    def test_manual_add_marks_manual_source(self) -> None:
+        store.upsert([self.acc("u-r6", "甲")], batch="b1")
+        row = store.list_accounts()[0]
+        store.set_track([row["id"]], "banned")
+        got = store.list_accounts()[0]
+        self.assertEqual(got["risk_src"], "manual")
+        store.set_track([row["id"]], "")
+        self.assertEqual(store.list_accounts()[0]["risk_src"], "")
+
+    def test_backup_restore_keeps_risk_state(self) -> None:
+        """还原不能把风控区放空——那是备份最该保住的东西。"""
+        store.upsert([self.acc("u-r7", "甲")], batch="b1", risk=True)
+        blob, _ = store.backup_bytes()
+        store.clear()
+        self.assertEqual(store.list_accounts(), [])
+        store.restore_bytes(blob, "backup.zip", mode="replace")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["recheck_state"], "banned")
+        self.assertEqual(row["risk_src"], "import")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

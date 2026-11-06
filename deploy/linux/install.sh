@@ -249,10 +249,14 @@ PIDF="\$DIR/wk.pid"
 LOGF="\$DIR/logs/wk-switch.log"
 mkdir -p "\$DIR/logs"
 
-# 已在跑就别再起一个，避免端口冲突
+# 已在跑就别再起一个，避免端口冲突。
+# 光看 `kill -0` 不够：pid 会被复用，升级重启后 wk.pid 里那个号可能已经
+# 变成别的进程（甚至是 systemd 拉起的另一个实例），误判成「已在运行」就
+# 直接 exit 0，监督进程等到超时，整条升级链路判失败。所以再核一次命令行。
 if [ -f "\$PIDF" ]; then
-  OLD="\$(cat "\$PIDF")"
-  if kill -0 "\$OLD" 2>/dev/null; then
+  OLD="\$(cat "\$PIDF" 2>/dev/null)"
+  if [ -n "\$OLD" ] && kill -0 "\$OLD" 2>/dev/null \
+     && grep -qa "main.py" "/proc/\$OLD/cmdline" 2>/dev/null; then
     echo "已在运行 PID \$OLD"
     exit 0
   fi
@@ -305,7 +309,7 @@ fi
 # 兜底：pid 文件丢了或进程换过，按端口找
 if have ss; then
   PID2="\$(ss -ltnp 2>/dev/null | grep ":\${PORT} " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
-  [ -n "\$PID2" ] && [ "\$PID2" != "\$PID" ] && kill "\$PID2" 2>/dev/null && { echo "已停止端口 \$PORT 上的 PID \$PID2"; stopped=1; }
+  [ -n "\$PID2" ] && [ "\$PID2" != "\${PID:-}" ] && kill "\$PID2" 2>/dev/null && { echo "已停止端口 \$PORT 上的 PID \$PID2"; stopped=1; }
 fi
 
 [ "\$stopped" = "1" ] || echo "没有在运行"
@@ -338,6 +342,11 @@ WorkingDirectory=${HOME_DIR}
 ExecStart=${py} ${HOME_DIR}/main.py ${PORT} --host ${HOST} --no-browser
 Restart=on-failure
 RestartSec=3
+# 页面「一键升级」的重启由监督进程执行（wk/relaunch.py）。KillMode 默认是
+# control-group，服务一停 systemd 会 SIGTERM 整个 cgroup，监督进程和它拉起的
+# 新进程会被一起打掉——升级窗口里服务就彻底空了。改成 process：只杀主进程，
+# 剩下的交给监督进程自己收尾。少这一行，Linux 上「升级失败自动回滚」是废的。
+KillMode=process
 Environment=PYTHONUNBUFFERED=1
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true

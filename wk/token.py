@@ -16,6 +16,8 @@ import json
 import time
 from typing import Any
 
+from . import clock
+
 # 与参考项目一致的区域标记
 CN_MARKERS = ("copilot.tencent.com", "codebuddy.cn", "workbuddy.cn")
 INTL_MARKERS = ("workbuddy.ai", "codebuddy.ai")
@@ -176,6 +178,6 @@ def describe(token: str, expires_at: int, refresh_token: str = "") -> dict[str, 
         "is_jwt": bool(claims),
         "issuer": str(claims.get("iss") or ""),
         "expires_at": exp,
-        "expires_text": time.strftime("%Y-%m-%d %H:%M", time.localtime(exp)) if exp else "",
+        "expires_text": clock.stamp(exp, "%Y-%m-%d %H:%M") if exp else "",
         "realm": detect_realm(token, "", False),
     }

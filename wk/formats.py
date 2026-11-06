@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .model import Account, from_row
+from . import clock
 from . import token as tok
 
 # ZIP 解包上限：账户包不该有这么大，超了说明拿错文件或压缩炸弹。
@@ -324,7 +325,7 @@ def _int(value: Any, default: int = 0) -> int:
 
 
 def _now_text() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    return clock.stamp()
 
 
 def _merge_extra(payload: dict, acc: Account) -> dict:
@@ -426,7 +427,7 @@ def to_daily(acc: Account) -> dict:
         "access_token": acc.access_token,
         "refresh_token": acc.refresh_token,
         "env_line": env_line,
-        "login_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(acc.created_at or time.time())),
+        "login_at": clock.stamp(acc.created_at or time.time()),
     }
 
 
@@ -458,7 +459,7 @@ def export_filename(profile: Profile, realm_filter: str = "",
     只在显式过滤时插入，这样国内版和国际版的包不会互相覆盖。
     """
     ext = _EXT_OF.get(profile.container, "dat")
-    stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
+    stamp = stamp or clock.compact()
     parts = [_safe_name(profile.project, profile.id)]
     realm = (realm_filter or "").strip().lower()
     if realm in ("cn", "intl"):

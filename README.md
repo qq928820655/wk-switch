@@ -9,12 +9,15 @@
 - **多格式识别**：导入时自动嗅探 JSON / ZIP / NDJSON / CSV / 文本行 / 加密信封，七个项目的导出包直接拖进来即可
 - **格式互转**：8 种输出格式，按目标项目的目录与字段约定命名
 - **本地账户库**：SQLite 留存，唯一键 `(uid, realm)`；同名不同号不会被合并
+- **导入批次可查**：每条记录带「批次号 + 导入时间（北京时间）」，工具栏能按批次筛，同一个包第几次导进来一眼对得上；`first_batch` 记着首次导入，重复导入不会把它冲掉
 - **国内版 / 国际版分离**：按 JWT issuer 与域名判定，导出可「全部 / 仅国内 / 仅国际 / 分版本各一份」
 - **备份还原**：整库打包 zip（`accounts.db` + `accounts.json`），支持合并与覆盖两种还原
 - **一键升级并重启**：下载、备份、替换代码、重启、自检一个动作做完，页面自动等新进程应答后刷新；起不来自动回滚到上一版。仅当制品库版本更高时标签页才标红点
 - **导出命名可辨**：文件名统一为 `<项目名>-<版本>-<时间戳>.<扩展名>`，例如 `workbuddy-manager-cn-20261103-125433.zip`，下载一堆包不会互相覆盖
-- **上游校验与积分**：选中账号后可向上游只读查询，判定凭据是否仍然有效并取回积分余额。**不刷新 token**——refresh token rotation 会让别处正在用同一账号的服务掉线，详见下文
-- **封号复检**：被上游风控拦掉的账号单独进「封号复检」标签页，定时发一次最小对话探活；出口可走**同一 / 随机 / 自定义**三档，支持 mihomo 端口自动检测与自填代理表
+- **上游校验与积分**：选中账号后可向上游只读查询，判定「凭据有效」和「额度可用」两件事，并取回积分余额。**不刷新 token**——refresh token rotation 会让别处正在用同一账号的服务掉线，详见下文
+- **风控账号单独成区**：导入时可勾「这批是风控账号」，勾了直接进封号复检名单；不勾就是正常号。导入字段里的风控措辞不再自动判定——以前那样会把整批正常号拖进风控区。后续校验发现风控的，自动移进去并标来源
+- **导出范围跟勾选走**：勾了一部分就只导勾的；全勾或一条不勾都按全部导出（版本选项照常生效）
+- **封号复检**：被上游风控拦掉的账号单独进「封号复检」标签页，定时发一次最小对话探活；出口可走**同一 / 随机 / 自定义**三档，支持 mihomo 端口自动检测（显示节点名，不只是一串 IP）与自填代理表
 - **访问口令**：登录页口令换会话 cookie，默认 `qq928820655`（改 `config/auth.json`）
 - **应用图标**：indigo 双向箭头，favicon / 页头 / 任务栏 / PWA 主屏同一张图，随代码生成，`python tools/make_icon.py` 可重出任意尺寸
 
@@ -27,6 +30,23 @@ python main.py --version    # 版本号
 ```
 
 首次访问会跳到登录页，输入口令后进入。
+
+## 时间口径
+
+全站时间都是**北京时间（UTC+8）**，包括：库里所有时间列、批次号、导入记录、校验与复检时间、「每天自动复检」的触发点、导出文件名的时间戳、日志行。
+
+服务器可能开在 UTC 机房（VPS 默认就是）。用 `time.strftime()` 是跟系统时区走的：同一份数据在 UTC 机器上显示 09:30、在北京机器上显示 17:30，两边对不上任何一条记录，自动复检还会在错误的小时触发、把「今天」算错一天。
+
+所有时间只从 `wk/clock.py` 出：
+
+```python
+clock.stamp()              # 2026-11-06 17:30:08
+clock.compact()            # 20261106-173008  （批次号、文件名）
+clock.short(ts)            # 11-06 17:30      （表格里）
+clock.day_start()          # 北京时间当天 00:00 的 epoch
+```
+
+时区写成固定偏移 +8 而不是 `ZoneInfo("Asia/Shanghai")`：中国不实行夏令时，固定偏移更省事，也不依赖系统的 tzdata 是否存在（Windows 上某些精简版 Python 没有，`ZoneInfo` 直接抛异常）。
 
 ## 支持的格式
 
@@ -66,12 +86,24 @@ python main.py --version    # 版本号
 
 | 结论 | 触发条件 | 含义 |
 |---|---|---|
-| 有效 | HTTP 200 且 `code=0` | 上游认这个 token |
+| 可用 | 有效 **且** 剩余积分 > 0（或查不到明细） | 现在就能拿去跑 |
+| 有效 | HTTP 200 且 `code=0` | 上游认这个 token，但不一定有额度 |
 | 已失效 | 401 / 403，或 `code≠0` 且提示登录过期 | 需要重新登录 |
 | 未确认 | 网络故障、超时、5xx、所有计费前缀都 404 | 不下结论，可再试 |
 | 不可校验 | 加密信封 token、空 token | 本地就能判定，不发请求 |
 
 「未确认」和「已失效」必须分开：把网络故障显示成封号，会让人去删一个好账号。
+
+**「可用」和「有效」也是两件事**
+
+有效只说明 token 没过期。余额为 0 的号拿去跑，第一句话就是余额不足，对使用者等于不可用。所以汇总里单独给「可用 / 额度用完」两个数，判据照 hub 的 `available = code == 0 and (remain > 0 or remain is None)`：
+
+- `remain` 查到且 `<= 0` → 有效但不可用
+- `remain` 为 `None`（上游没回明细）→ 仍算可用。没有证据说明它没额度，误杀好号的代价比漏放一个大
+
+**被封和过期也要分开**
+
+403 或 `code=11140` 且正文带「request illegal / 账号存在异常行为」这类措辞的，是账号级风控，不是 token 失效：这种号进风控区等解封，只有 `401` 或明确的登录过期提示才算需要重新扫码。判错方向会让人去重扫一个其实只是被封着的号。
 
 **并发与节奏**
 
@@ -162,12 +194,18 @@ python main.py --version    # 版本号
     "host": "cli-proxy-mihomo",
     "ports": "17901-17910",
     "probe_url": "https://api.ipify.org",
-    "timeout": 10.0
+    "timeout": 10.0,
+    "api": "http://cli-proxy-mihomo:9090",
+    "secret": ""
   }
 }
 ```
 
-`host` 默认 `cli-proxy-mihomo`（docker 网络里的服务名），`ports` 默认 `17901-17910`，与 hub 的 `PROXY_DISCOVER_HOST` / `PROXY_DISCOVER_PORTS` 同源。已经配过 hub 的机器直接就能复用，也可以用环境变量 `WB_PROXY_DISCOVER_HOST` / `WB_PROXY_DISCOVER_PORTS` 覆盖。
+`host` 默认 `cli-proxy-mihomo`（docker 网络里的服务名），`ports` 默认 `17901-17910`，与 hub 的 `PROXY_DISCOVER_HOST` / `PROXY_DISCOVER_PORTS` 同源。
+
+`api` 是 mihomo 的 external-controller，填了才能显示**节点名**。出口 IP 分不出线路——同一订阅里两个节点出口落在同一段是常事，卡片上两格数字一模一样，看着像同一个槽测了两遍。mihomo 的 `/listeners` 里每个 listener 带着 `proxy`（这个端口钉死的出站节点名），那才是「我在用哪条线」的答案。留空时按 `host` 推 `http://<host>:9090`；控制器设了 secret 就填进 `secret`。拿不到就退回显示地址，不报错。
+
+Clash 原版没有 `/listeners`，只有 mihomo 有。已经配过 hub 的机器直接就能复用，也可以用环境变量 `WB_PROXY_DISCOVER_HOST` / `WB_PROXY_DISCOVER_PORTS` 覆盖。
 
 节点全不通时复检会直连——不会因为代理挂了就不检查，只是失去了换 IP 这层保护。`same` / `custom` 两档钉死了出口，就不会再去扫端口，省掉十来个用不上的请求。
 
@@ -241,7 +279,7 @@ uninstall.bat    :: 卸载（保留 data 与 config）
 | 症状 | 原因 | 现在 |
 |---|---|---|
 | 重启后打不开 / 换了端口 | 新进程起太早，旧进程还没让出端口，`find_port` 往后找 | 监督进程先确认端口空，再拉起；`--wait-port` 等不到就报错退出，绝不漂移 |
-| 服务没回来，也不知道为什么 | 子进程 stdout/stderr 丢进 DEVNULL | 日志写 `data/logs/server.log`，失败时页面直接摊开日志尾部 |
+| 服务没回来，也不知道为什么 | 子进程 stdout/stderr 丢进 DEVNULL，或写进了没人读的文件 | 日志写当前部署实际在用的那份（部署态 `logs/wk-switch.log`），失败时页面直接摊开日志尾部 |
 | 新版本起不来就彻底失联 | 没有回退路径 | 60 秒没应答自动回滚到升级前的备份，再拉起一次 |
 | 升级完要重新登录 | 会话只放内存，重启即失效 | 会话落盘 `data/sessions.json`，重启后仍然有效 |
 
@@ -254,6 +292,36 @@ uninstall.bat    :: 卸载（保留 data 与 config）
 回滚挑备份的规则是「版本号低于当前、且最接近当前」的那一份。失败的新版本自己
 也会在 `backups/` 里留一份，按时间挑最新的会把坏代码滚回来；这类备份会被改名
 成 `.zip.broken`。
+
+**Linux 上的两条重启路径**
+
+部署形态不同，重启方式必须分开，混着来一定会失败：
+
+| 形态 | 怎么重启 | 为什么 |
+|---|---|---|
+| systemd（`Type=simple`） | 监督进程执行 `systemctl --no-block restart <unit>` | 进程归 systemd 管，`is-active`、日志、开机自启才对得上。自己 Popen 会让端口有服务、systemd 却认为已停，下次 restart 再起一个就撞端口 |
+| nohup（`start.sh`） | 监督进程直接 Popen `main.py` | 不经 `start.sh` 转手：它是 `nohup ... &` 后立刻退出，Popen 拿到的是那个 bash 的 pid，bash 一死就会误判「新进程崩了」 |
+
+systemd 的 `KillMode` 默认是 `control-group`，停服务时会 SIGTERM 整个 cgroup。
+监督进程要是也在里面，它刚发出 restart 就被自己一起杀掉，回滚一行都跑不到。
+所以 `install.sh` 生成的 unit 带 `KillMode=process`，同时监督进程优先用
+`systemd-run` 起一个 transient unit（独立 cgroup）。**已经装过的机器要重跑一次
+`install.sh` 才会更新 unit**；没更新的机器上，若拿不到 `systemd-run`，会降级成
+「旧进程直接按重启键」，没有自动回滚，但有确定的结局。
+
+**探测端口时必须带 `SO_REUSEADDR`（POSIX）**
+
+服务的 socket 是 `ThreadingHTTPServer`，`allow_reuse_address = 1`。上一个连接由
+服务端主动关闭后，端口有约 60 秒 TIME_WAIT，服务自己照样能绑；裸 socket 不设
+`SO_REUSEADDR` 就必然 `EADDRINUSE`。探测比现实更严，得到的结论就是「旧进程没
+退出」——而它其实早就没了。
+
+Windows 上反过来，**不能设**：那边 `SO_REUSEADDR` 会放过正在 LISTEN 的端口，
+判据直接失效。所以两边分开写，`main.port_free()` 与 `relaunch._bindable()` 一致。
+
+另外，等端口超时后会先 `kill -0` 看一眼旧进程：**已经死了就继续拉起**，不当成
+「端口被占」。`_wait_port()` 因此返回三态 `ok / dead / busy`，`dead` 走正常流程，
+`busy` 才去结束旧进程。
 
 **制品源**
 
@@ -342,6 +410,7 @@ wk/
   store.py           本地账户库（SQLite）、备份还原
   probe.py           只读探针：计费查询 + 对话探活
   recheck.py         封号复检：名单流转、mihomo 节点发现
+  clock.py           时间源：北京时间（UTC+8），全站唯一出口
   auth.py            访问口令与会话
   update.py          在线升级
   version.py         版本号
@@ -351,7 +420,7 @@ deploy/linux/        install.sh / uninstall.sh
 deploy/windows/      install.bat / start.bat / stop.bat / uninstall.bat
 samples/             九个样例包与生成脚本
 tests/               单元测试
-tools/               图标生成脚本与预览页
+tools/               图标生成脚本、预览页、带登录的无头截图脚本
 ```
 
 ## 测试

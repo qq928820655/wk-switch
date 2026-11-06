@@ -139,6 +139,10 @@
     <div class="export-bar">
       <button class="btn primary" id="btn-export" disabled>生成导出文件</button>
       <button class="btn" id="btn-save-store">保存到账户库</button>
+      <label class="risk-opt" title="勾上：这一批直接进「封号复检」的风控区，不混在正常账号里">
+        <input type="checkbox" id="opt-risk">
+        <span>这批是风控账号</span>
+      </label>
       <span class="hint" id="export-hint">先选择一种目标格式</span>
     </div>
 
@@ -182,8 +186,12 @@
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
         </svg>
-        <input type="search" id="store-search" placeholder="搜索名称 / uid / 邮箱">
+        <input type="search" id="store-search" placeholder="搜索名称 / uid / 邮箱 / 批次">
       </label>
+
+      <select class="select-batch" id="store-batch" title="按导入批次筛选">
+        <option value="">全部批次</option>
+      </select>
 
       <button class="btn small" id="btn-probe-all" title="逐个向上游查询积分，只读，不刷新 token">校验全部</button>
     </div>
@@ -200,12 +208,30 @@
 
     <div class="table-wrap tall">
       <table class="grid" id="store-table">
+        <!-- 列宽集中在这里：fixed 布局下 colgroup 的宽度就是最终宽度，
+             散落在 CSS 里的 .col-* 会被内容的最小宽度改回来（试过，不生效） -->
+        <colgroup>
+          <col style="width:36px">
+          <!-- 名称列也必须给宽度：fixed 布局下「不写宽度」= 抢剩余空间，
+               窄屏剩余为负时它会直接被压成 0 宽，整列消失 -->
+          <col style="width:132px">
+          <col style="width:64px">
+          <col style="width:88px">
+          <col style="width:62px">
+          <col style="width:92px">
+          <col style="width:112px">
+          <col style="width:86px">
+          <col style="width:92px">
+          <col style="width:44px">
+          <col style="width:92px">
+        </colgroup>
         <thead>
           <tr>
             <th class="col-check"><input type="checkbox" id="store-check-all" title="全选本页"></th>
             <th>名称</th><th>版本</th><th class="col-uid">uid</th><th>状态</th>
             <th class="col-credit">积分</th>
-            <th class="col-exp">到期</th><th class="col-at">AT</th><th class="col-rt">RT</th><th class="col-upd">更新</th><th></th>
+            <th class="col-batch">批次 / 导入</th>
+            <th class="col-exp">到期</th><th class="col-at">AT</th><th class="col-rt">RT</th><th></th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -263,6 +289,9 @@
       <button class="btn primary" id="btn-store-export" disabled>从库导出</button>
       <span class="hint" id="store-export-hint">先选择一种目标格式</span>
     </div>
+    <p class="hint" id="store-export-scope">
+      勾了一部分就只导勾选的那些；全勾或一条不勾都按全部导出（版本选项照常生效）。
+    </p>
 
     <div class="downloads" id="store-downloads"></div>
   </section>
@@ -465,6 +494,17 @@
       </label>
     </div>
 
+    <div class="rc-grid">
+      <label class="field">
+        <span>控制器地址</span>
+        <input type="text" id="rc-api" placeholder="留空按主机推 9090" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>控制器 secret</span>
+        <input type="password" id="rc-secret" placeholder="没设就留空" spellcheck="false">
+      </label>
+    </div>
+
     <div class="export-bar">
       <button class="btn" id="btn-rc-detect">自动检测</button>
       <span class="hint" id="rc-detect-hint">环境变量 WB_PROXY_DISCOVER_HOST / WB_PROXY_DISCOVER_PORTS 优先于这两栏</span>
@@ -528,7 +568,7 @@
   <section class="card">
     <div class="card-head">
       <h2>把账号加进名单</h2>
-      <span class="hint">导入时带了风控原因的会自动进来；这里补手工的</span>
+      <span class="hint">导入时勾了「这批是风控账号」的直接进来；这里补手工发现的</span>
     </div>
     <div class="export-bar">
       <select id="rc-add-select" class="rc-pick">

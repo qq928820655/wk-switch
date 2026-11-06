@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import time
 
+from . import clock
+
 APP_NAME = "wk-switch"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 CHANNEL = "stable"
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,7 +44,7 @@ def info() -> dict:
         "channel": CHANNEL,
         "build": build_time(),
         "python": "%d.%d.%d" % __import__("sys").version_info[:3],
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": clock.stamp(),
     }
 
 

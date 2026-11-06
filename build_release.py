@@ -28,6 +28,7 @@ import sys
 import tarfile
 import time
 import zipfile
+from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(ROOT, "dist")
@@ -39,6 +40,15 @@ INCLUDE = (
 )
 EXCLUDE_DIRS = {"__pycache__", ".git", ".workbuddy", "data", "config", "backups", "dist", ".idea"}
 EXCLUDE_EXT = {".pyc", ".pyo", ".db", ".log"}
+
+
+#: 北京时间。打包脚本是独立入口，不 import wk，所以这里自带一份偏移量。
+_BJ = timezone(timedelta(hours=8))
+
+
+def _bj_stamp() -> str:
+    """构建时间戳，北京时间。和运行时 wk/clock.py 同一个时区。"""
+    return datetime.now(_BJ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def read_version() -> str:
@@ -158,7 +168,7 @@ def main() -> int:
 
     if not args.no_stamp:
         with open(os.path.join(ROOT, "BUILD"), "w", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+            f.write(_bj_stamp())
     with open(os.path.join(ROOT, "VERSION"), "w", encoding="utf-8") as f:
         f.write(version + "\n")
 

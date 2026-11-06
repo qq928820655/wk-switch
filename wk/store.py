@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from typing import Any, Iterable
 
 from . import token as tok
+from . import clock
 from .model import Account
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,7 +35,8 @@ DB_PATH = os.path.join(DATA_DIR, "accounts.db")
 #: 2 = 唯一键从 (name, realm) 改成 (uid, realm)
 #: 3 = 加探针列（积分三元组 / 校验状态 / 校验时间），见 wk/probe.py
 #: 4 = 加封号复检列（名单状态 / 次数 / 时间 / 结论），见 wk/recheck.py
-SCHEMA_VERSION = 4
+#: 5 = 加导入批次列（最近批次 / 首次批次 / 导入时间）+ 风控来源标记
+SCHEMA_VERSION = 5
 
 #: 探针状态的中文名。与 wk/probe.py 的 STATE_* 常量一一对应，
 #: 界面上不再自己拼字符串。
@@ -52,6 +54,14 @@ RECHECK_LABELS = {
     "revived": "已解封",
     "auth": "凭据失效",
     "unknown": "未确认",
+}
+
+#: 账号是怎么进风控区的。界面在批次列旁边标一个来源，方便判断该不该去敲门：
+#: 导入时就标了风控的号，复检大概率还是被封，白敲一次。
+RISK_LABELS = {
+    "import": "导入标记",
+    "verify": "验证发现",
+    "manual": "手工加入",
 }
 
 #: 导入时自动进复检名单的文本特征。
@@ -109,6 +119,17 @@ CREATE TABLE IF NOT EXISTS accounts (
     recheck_count INTEGER DEFAULT 0,
     recheck_at    INTEGER DEFAULT 0,
     recheck_note  TEXT,
+    -- 导入批次。batch/imported_at 是「最近一次」导入，first_* 是「第一次」，
+    -- 重复导入同一份文件不会把 first_* 冲掉 —— 想找「最早那批导进来的」
+    -- 只能靠它。时间都是北京时间字符串（见 wk/clock.py）。
+    batch             TEXT,
+    imported_at       TEXT,
+    first_batch       TEXT,
+    first_imported_at TEXT,
+    -- 进风控区的来源：'import' 导入时明确标了风控，'verify' 后续验证发现，
+    -- '' 表示不在风控区。和 recheck_state 分开存，是因为「怎么进来的」
+    -- 决定它该不该被自动复检——导入时就标了风控的号，复检多半也白搭。
+    risk_src TEXT DEFAULT '',
     UNIQUE (uid, realm)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_realm ON accounts(realm);
@@ -130,7 +151,8 @@ CREATE TABLE IF NOT EXISTS import_log (
 
 
 def _now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    """库里所有时间列的默认值：北京时间字符串。"""
+    return clock.stamp()
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -174,6 +196,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "recheck_count": "INTEGER DEFAULT 0",
         "recheck_at": "INTEGER DEFAULT 0",
         "recheck_note": "TEXT",
+        # ---- v4 → v5：导入批次 + 风控来源 ----
+        # 老库这两列是空的：不知道历史上那批是什么时候导的，也不该瞎猜。
+        # 界面遇空值显示「—」，不拿 updated_at 冒充导入时间。
+        "batch": "TEXT",
+        "imported_at": "TEXT",
+        "first_batch": "TEXT",
+        "first_imported_at": "TEXT",
+        "risk_src": "TEXT DEFAULT ''",
     }
     current = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
     for name, decl in extra_cols.items():
@@ -282,14 +312,27 @@ def _realm_of(acc: Account) -> str:
     return tok.detect_realm(acc.access_token, acc.domain, acc.api_key)
 
 
-def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> dict[str, Any]:
+def upsert(accounts: Iterable[Account], batch: str = "", source: str = "",
+           risk: bool = False) -> dict[str, Any]:
     """按 (uid, realm) 写入或更新。返回新增/更新/跳过的计数。
 
     同一批里出现同一 uid 两次时，后一条覆盖前一条——「导入顺序即优先级」，
     也避免批内自己跟自己打架。
+
+    `batch` 是这一批的批次号，写进每条记录（`batch` 存最近一次，`first_batch`
+    存第一次）：账户库要能按批次筛、按批次导，靠的就是它。
+
+    `risk=True` 表示这批账号导入前就已知处于风控状态，直接进风控区。
+    不传就是正常账号。
+
+    **导入字段里的风控措辞不再决定名单状态。** 以前 `banned_hint_of` 一命中
+    就把整条塞进 banned：来源系统备注里带一句「请求被拦截」，整批号都会被
+    拖进风控区，正常号跟着一起被当风控处理。现在措辞只作为备注证据留档，
+    进不进风控区由调用方显式传 `risk`，或者由后续验证（复检 / 探针）写回。
     """
-    stats = {"total": 0, "inserted": 0, "updated": 0, "skipped": 0, "items": []}
-    batch = batch or time.strftime("batch-%Y%m%d-%H%M%S")
+    stats = {"total": 0, "inserted": 0, "updated": 0, "skipped": 0,
+             "risk": 0, "items": []}
+    batch = batch or "batch-" + clock.compact()
     now = _now()
 
     with connect() as conn:
@@ -304,13 +347,16 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
             name = account_name(acc)
             state = tok.token_state(acc.access_token, acc.expires_at, acc.refresh_token)
             payload = json.dumps(acc.to_dict(), ensure_ascii=False)
-            # 来源系统已经把它标成封号的，导进来就直接进复检名单。
-            # 这就是 banned-retry 的「扫 /status 自动识别」那条路径，
-            # 只是换成在入库时判一次，不用每轮去扫。
+            # 只当证据用，不再据此改状态
             hint = banned_hint_of(acc)
+            mark = "banned" if risk else ""
+            src = "import" if risk else ""
+            if risk:
+                stats["risk"] += 1
 
             row = conn.execute(
-                "SELECT id, access_token, recheck_state FROM accounts WHERE uid = ? AND realm = ?",
+                "SELECT id, access_token, recheck_state, IFNULL(risk_src,'') AS risk_src "
+                "FROM accounts WHERE uid = ? AND realm = ?",
                 (uid, realm),
             ).fetchone()
 
@@ -320,39 +366,49 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
                        (uid, realm, name, nickname, email, phone, access_token, refresh_token,
                         device_token, token_state, expires_at, domain, enterprise_id, enabled,
                         source, payload, created_at, updated_at,
-                        recheck_state, recheck_count, recheck_at, recheck_note)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        recheck_state, recheck_count, recheck_at, recheck_note,
+                        batch, imported_at, first_batch, first_imported_at, risk_src)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (uid, realm, name, acc.nickname, acc.email, acc.phone,
                      acc.access_token, acc.refresh_token, acc.device_token, state,
                      acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
                      source or acc.source, payload, now, now,
-                     "banned" if hint else "", 0, 0, hint[:200] or None),
+                     mark, 0, 0, (hint[:200] or None) if risk else None,
+                     batch, now, batch, now, src),
                 )
                 stats["inserted"] += 1
                 action = "inserted"
             else:
-                # 「已在名单里」的判定：已有状态优先，没有才按这次的 hint 补。
-                # 不能反过来——复检结果（revived / auth）比导入字段新，
-                # 用导入字段覆盖会把刚解封的号重新打回 banned。
+                # 已有状态优先，除非这一批明确标了风控。不能无条件用新值覆盖：
+                # 复检结果（revived / auth）比导入动作新，覆盖会把刚解封的号
+                # 重新打回 banned。
                 current_track = (row["recheck_state"] or "") if "recheck_state" in row.keys() else ""
-                new_track = current_track or ("banned" if hint else "")
+                current_src = (row["risk_src"] or "") if "risk_src" in row.keys() else ""
+                new_track = "banned" if risk else current_track
+                new_src = "import" if risk else current_src
                 # token 换了就作废旧的校验结果：同一 uid 重新扫码后拿到的是新
                 # 凭据，旧积分属于上一个 token，留着会让人以为「刚校验过」。
                 # token 没变（重复导入同一份文件）则保留，省一次上游查询。
                 same_token = str(row["access_token"] or "") == str(acc.access_token or "")
+                common = (name, acc.nickname, acc.email, acc.phone,
+                          acc.access_token, acc.refresh_token, acc.device_token, state,
+                          acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
+                          source or acc.source, payload, now,
+                          new_track, (hint[:200] or None) if risk else None,
+                          batch, now, batch, now, new_src)
                 if same_token:
                     conn.execute(
                         """UPDATE accounts SET
                              name=?, nickname=?, email=?, phone=?, access_token=?, refresh_token=?,
                              device_token=?, token_state=?, expires_at=?, domain=?, enterprise_id=?,
                              enabled=?, source=?, payload=?, updated_at=?,
-                             recheck_state=?, recheck_note=COALESCE(recheck_note, ?)
+                             recheck_state=?, recheck_note=COALESCE(?, recheck_note),
+                             batch=?, imported_at=?,
+                             first_batch=COALESCE(first_batch, ?),
+                             first_imported_at=COALESCE(first_imported_at, ?),
+                             risk_src=?
                            WHERE id=?""",
-                        (name, acc.nickname, acc.email, acc.phone,
-                         acc.access_token, acc.refresh_token, acc.device_token, state,
-                         acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
-                         source or acc.source, payload, now,
-                         new_track, hint[:200] or None, row["id"]),
+                        common + (row["id"],),
                     )
                 else:
                     conn.execute(
@@ -360,15 +416,15 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
                              name=?, nickname=?, email=?, phone=?, access_token=?, refresh_token=?,
                              device_token=?, token_state=?, expires_at=?, domain=?, enterprise_id=?,
                              enabled=?, source=?, payload=?, updated_at=?,
+                             recheck_state=?, recheck_note=COALESCE(?, recheck_note),
                              credit_remain=NULL, credit_used=NULL, credit_size=NULL,
                              credit_state=NULL, checked_at=0, checked_note=NULL,
-                             recheck_state=?, recheck_note=COALESCE(recheck_note, ?)
+                             batch=?, imported_at=?,
+                             first_batch=COALESCE(first_batch, ?),
+                             first_imported_at=COALESCE(first_imported_at, ?),
+                             risk_src=?
                            WHERE id=?""",
-                        (name, acc.nickname, acc.email, acc.phone,
-                         acc.access_token, acc.refresh_token, acc.device_token, state,
-                         acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
-                         source or acc.source, payload, now,
-                         new_track, hint[:200] or None, row["id"]),
+                        common + (row["id"],),
                     )
                 stats["updated"] += 1
                 action = "updated"
@@ -391,11 +447,31 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "") -> di
     return stats
 
 
+def batches(limit: int = 50) -> list[dict]:
+    """批次列表，新的在前。账户库的批次筛选下拉用它。
+
+    计数从 accounts 表算，不从 import_log 算：同一条记录重复导入只算一次，
+    用户点「这批」想看的是「这批导进来、现在还在库里的有几个」。
+    """
+    limit = max(1, min(int(limit or 50), 500))
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT IFNULL(batch,'') AS b, COUNT(*) AS n, "
+            "       MAX(IFNULL(imported_at,'')) AS at "
+            "FROM accounts WHERE IFNULL(batch,'') <> '' "
+            "GROUP BY b ORDER BY at DESC, b DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [{"batch": r["b"], "count": r["n"], "at": r["at"] or ""} for r in rows]
+
+
 def list_accounts(realm: str = "", query: str = "", limit: int = 500,
-                  track: str = "") -> list[dict]:
-    """按版本筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。
+                  track: str = "", batch: str = "") -> list[dict]:
+    """按版本 / 批次筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。
 
     `track` 按复检名单状态筛：传 "banned" 就是「封号复检」标签页要的那批。
+    `batch` 按导入批次筛：同一批导进来的号一次性全捞出来（对账、整批重打、
+    整批删除都靠它）。
     用参数而不是另写一个查询，是为了让排序、脱敏、字段组装只有一份实现——
     两份实现迟早会漂移，界面上就会出现某个字段在这里有、那里没有。
     """
@@ -409,10 +485,14 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
         # 那种情况由 _migrate 负责，这里只管正常路径。
         sql += " AND IFNULL(recheck_state,'') = ?"
         args.append(track)
+    if batch:
+        sql += " AND IFNULL(batch,'') = ?"
+        args.append(batch)
     if query:
-        sql += " AND (name LIKE ? OR uid LIKE ? OR nickname LIKE ? OR email LIKE ?)"
+        sql += (" AND (name LIKE ? OR uid LIKE ? OR nickname LIKE ? OR email LIKE ?"
+                " OR IFNULL(batch,'') LIKE ?)")
         like = f"%{query}%"
-        args.extend([like, like, like, like])
+        args.extend([like, like, like, like, like])
     sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
     args.append(limit)
 
@@ -432,6 +512,8 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
         recheck_state = (row["recheck_state"] if "recheck_state" in keys else "") or ""
         recheck_count = int((row["recheck_count"] if "recheck_count" in keys else 0) or 0)
         recheck_at = int((row["recheck_at"] if "recheck_at" in keys else 0) or 0)
+        row_batch = (row["batch"] if "batch" in keys else "") or ""
+        first_batch = (row["first_batch"] if "first_batch" in keys else "") or ""
         out.append({
             "id": row["id"],
             "name": row["name"],
@@ -443,13 +525,22 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
             "state": state,
             "state_label": tok.STATE_LABEL.get(state, state),
             "expires_at": row["expires_at"] or 0,
-            "expires": time.strftime("%Y-%m-%d", time.localtime(row["expires_at"]))
+            # 到期日是上游给的时间戳，也按北京时间算，否则「今天到期」会在
+            # 早上 8 点之前判错一天
+            "expires": clock.stamp(row["expires_at"], "%Y-%m-%d")
                        if row["expires_at"] else "",
             "at": _mask(row["access_token"] or ""),
             "has_rt": bool(row["refresh_token"]),
             "source": row["source"] or "",
             "created_at": row["created_at"] or "",
             "updated_at": row["updated_at"] or "",
+            # ---- 导入批次 ----
+            "batch": row_batch,
+            "imported_at": (row["imported_at"] if "imported_at" in keys else "") or "",
+            "first_batch": first_batch,
+            "first_imported_at": (row["first_imported_at"] if "first_imported_at" in keys else "") or "",
+            "risk_src": (row["risk_src"] if "risk_src" in keys else "") or "",
+            "risk_label": RISK_LABELS.get((row["risk_src"] if "risk_src" in keys else "") or "", ""),
             # ---- 探针 ----
             # None 原样透传：前端要能区分「没查过」和「0」
             "credit_remain": row["credit_remain"] if "credit_remain" in keys else None,
@@ -458,16 +549,14 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
             "credit_state": credit_state,
             "credit_state_label": PROBE_LABELS.get(credit_state, ""),
             "checked_at": checked_at,
-            "checked": time.strftime("%m-%d %H:%M", time.localtime(checked_at))
-                       if checked_at else "",
+            "checked": clock.stamp(checked_at, "%m-%d %H:%M") if checked_at else "",
             "checked_note": (row["checked_note"] if "checked_note" in keys else "") or "",
             # ---- 封号复检 ----
             "recheck_state": recheck_state,
             "recheck_label": RECHECK_LABELS.get(recheck_state, ""),
             "recheck_count": recheck_count,
             "recheck_at": recheck_at,
-            "recheck": time.strftime("%m-%d %H:%M", time.localtime(recheck_at))
-                       if recheck_at else "",
+            "recheck": clock.stamp(recheck_at, "%m-%d %H:%M") if recheck_at else "",
             "recheck_note": (row["recheck_note"] if "recheck_note" in keys else "") or "",
         })
     return out
@@ -512,6 +601,9 @@ def stats() -> dict[str, Any]:
              "skipped": r["skipped"], "at": r["created_at"]}
             for r in last
         ],
+        # 批次下拉的候选。limit 50 够用：一批几百条的人不会攒出 50 批还不清理，
+        # 真攒到了也该按时间翻，不该把下拉塞成几百项。
+        "batches": batches(50),
         "db_path": DB_PATH,
     }
 
@@ -632,10 +724,14 @@ def load_for_probe(ids: list[int] | None = None, realm: str = "") -> list[tuple[
 def update_credits(results: list[dict[str, Any]]) -> int:
     """把探针结果写回库。
 
-    results 里每条：{id, state, remain, used, size, tier, checked_at, note}
+    results 里每条：{id, state, remain, used, size, tier, checked_at, note, restrict}
 
     remain / used / size 为 None 时写 NULL 而不是 0——界面上「没查过」和
     「查过了确实是 0」要能分开。这也是为什么这三列不设 DEFAULT 0。
+
+    `restrict=True` 表示这次失败是**账号级风控**（403/11140 那类），不是
+    token 过期。这种号同时写进风控区：校验的用处一半就在这里，发现了却
+    让它留在正常区，下一轮又得从头再查一遍。
     """
     if not results:
         return 0
@@ -645,6 +741,7 @@ def update_credits(results: list[dict[str, Any]]) -> int:
             row_id = item.get("id")
             if row_id is None:
                 continue
+            note = str(item.get("note") or "")[:200] or None
             conn.execute(
                 """UPDATE accounts SET
                      credit_remain = ?, credit_used = ?, credit_size = ?,
@@ -656,10 +753,24 @@ def update_credits(results: list[dict[str, Any]]) -> int:
                     item.get("size"),
                     str(item.get("state") or ""),
                     int(item.get("checked_at") or 0),
-                    str(item.get("note") or "")[:200] or None,
+                    note,
                     int(row_id),
                 ),
             )
+            if item.get("restrict"):
+                # 只从「不在名单」挪到 banned，不回退已有结论：已经解封
+                # （revived）的号如果再次被判风控，这里覆盖回 banned 是对的，
+                # 但 auth（凭据失效）不该被一条 403 改写成风控。
+                row = conn.execute(
+                    "SELECT IFNULL(recheck_state,'') AS s, IFNULL(risk_src,'') AS src "
+                    "FROM accounts WHERE id = ?", (int(row_id),)
+                ).fetchone()
+                if row is not None and (row["s"] or "") in ("", "unknown", "revived"):
+                    conn.execute(
+                        "UPDATE accounts SET recheck_state = 'banned', risk_src = ?,"
+                        " recheck_note = COALESCE(recheck_note, ?) WHERE id = ?",
+                        (row["src"] or "verify", note, int(row_id)),
+                    )
             written += 1
     return written
 
@@ -684,19 +795,30 @@ def update_recheck(results: list[dict[str, Any]]) -> int:
                 continue
             verdict = str(item.get("verdict") or "")
             row = conn.execute(
-                "SELECT IFNULL(recheck_state,'') AS s, IFNULL(recheck_count,0) AS n "
+                "SELECT IFNULL(recheck_state,'') AS s, IFNULL(recheck_count,0) AS n, "
+                "IFNULL(risk_src,'') AS risk_src "
                 "FROM accounts WHERE id = ?", (int(row_id),)
             ).fetchone()
             if row is None:
                 continue
             state = recheck_mod.next_track(row["s"] or "", verdict)
             note = str(item.get("detail") or item.get("raw") or "")[:200] or None
+            # 「验证发现是风控」要记来源：复检判定仍被封的号写 verify，
+            # 导入时就标了 risk 的保留 import（那是更强的证据，不该被覆盖成
+            # 一个更弱的来源）。解封后清空——它已经不在风控区了。
+            risk_src = row["risk_src"] or ""
+            if state == "banned":
+                risk_src = risk_src or "verify"
+            elif state in ("revived", "auth", ""):
+                risk_src = ""
             conn.execute(
                 """UPDATE accounts SET
-                     recheck_state = ?, recheck_count = ?, recheck_at = ?, recheck_note = ?
+                     recheck_state = ?, recheck_count = ?, recheck_at = ?, recheck_note = ?,
+                     risk_src = ?
                    WHERE id = ?""",
                 (state, int(row["n"] or 0) + 1,
-                 int(item.get("checked_at") or time.time()), note, int(row_id)),
+                 int(item.get("checked_at") or time.time()), note, risk_src,
+                 int(row_id)),
             )
             written += 1
     return written
@@ -715,17 +837,23 @@ def set_track(ids: list[int], state: str, note: str = "") -> int:
     placeholders = ",".join("?" * len(ids))
     with connect() as conn:
         if state:
+            # 风控来源记 manual：这批不是导入时标的风控，也不是复检判出来的，
+            # 是用户自己划进来的。三种来源分开记，页面上才看得出该不该去敲门。
             cur = conn.execute(
-                f"UPDATE accounts SET recheck_state = ?, recheck_note = COALESCE(?, recheck_note) "
+                f"UPDATE accounts SET recheck_state = ?, "
+                f"recheck_note = COALESCE(?, recheck_note), "
+                f"risk_src = CASE WHEN IFNULL(risk_src,'') = '' THEN 'manual' "
+                f"                 ELSE risk_src END "
                 f"WHERE id IN ({placeholders})",
                 [state, (note[:200] or None)] + [int(i) for i in ids],
             )
         else:
-            # 移出名单时把计数和时间一起清掉：留着会让下一次加入时
+            # 移出名单时把计数、时间和来源一起清掉：留着会让下一次加入时
             # 立刻被最小间隔挡住，用户会以为按钮没生效。
             cur = conn.execute(
                 f"UPDATE accounts SET recheck_state = '', recheck_count = 0, "
-                f"recheck_at = 0, recheck_note = NULL WHERE id IN ({placeholders})",
+                f"recheck_at = 0, recheck_note = NULL, risk_src = '' "
+                f"WHERE id IN ({placeholders})",
                 [int(i) for i in ids],
             )
         return cur.rowcount or 0
@@ -800,6 +928,18 @@ def dump_records() -> list[dict]:
         "source": r["source"],
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
+        # 复检 / 风控 / 批次这些是「导入之后才产生的状态」，payload 里没有。
+        # 不一起存的话，还原完风控区就空了——用户刚把要保留的名单备份下来，
+        # 一还原全变回正常号，比不备份还糟。
+        "batch": r["batch"],
+        "imported_at": r["imported_at"],
+        "first_batch": r["first_batch"],
+        "first_imported_at": r["first_imported_at"],
+        "risk_src": r["risk_src"],
+        "recheck_state": r["recheck_state"],
+        "recheck_count": r["recheck_count"],
+        "recheck_at": r["recheck_at"],
+        "recheck_note": r["recheck_note"],
         "account": json.loads(r["payload"] or "{}"),
     } for r in rows] + [{
         "__import_log__": True,
@@ -819,7 +959,7 @@ def backup_bytes() -> tuple[bytes, str]:
     import io
     import zipfile
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stamp = clock.compact()
     name = f"wk-switch-backup-{stamp}.zip"
 
     records = dump_records()
@@ -830,7 +970,7 @@ def backup_bytes() -> tuple[bytes, str]:
         "format": "wk-switch-backup",
         "version": 1,
         "schema_version": SCHEMA_VERSION,
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at": clock.stamp(),
         "accounts": len(accounts),
         "import_log": len(logs),
         "db_path": DB_PATH,
@@ -849,6 +989,40 @@ def backup_bytes() -> tuple[bytes, str]:
         zf.writestr("accounts.json", json.dumps(dump, ensure_ascii=False, indent=2))
         zf.writestr("accounts.db", _sqlite_snapshot())
     return buf.getvalue(), name
+
+
+#: 备份里要跟着还原的「导入之后产生的状态」列。
+_META_COLS = ("batch", "imported_at", "first_batch", "first_imported_at",
+              "risk_src", "recheck_state", "recheck_count", "recheck_at",
+              "recheck_note")
+
+
+def _restore_meta(items: list[dict]) -> int:
+    """把备份里的复检 / 风控 / 批次状态写回库。
+
+    `upsert` 只认「这次导入」的字段，备份带回来的历史状态得单独盖一遍。
+    不盖的话，还原等于把所有号从风控区放出来——备份的意义正好反了。
+    """
+    written = 0
+    with connect() as conn:
+        for item in items:
+            if not isinstance(item, dict) or item.get("__import_log__"):
+                continue
+            uid = str(item.get("uid") or "")
+            realm = str(item.get("realm") or "")
+            if not uid:
+                continue
+            cols = [c for c in _META_COLS if c in item]
+            if not cols:
+                continue
+            sets = ", ".join(f"{c} = ?" for c in cols)
+            values = [item.get(c) for c in cols]
+            cur = conn.execute(
+                f"UPDATE accounts SET {sets} WHERE uid = ? AND realm = ?",
+                values + [uid, realm],
+            )
+            written += cur.rowcount or 0
+    return written
 
 
 def _restore_from_dump(data: dict, mode: str) -> dict[str, Any]:
@@ -872,11 +1046,13 @@ def _restore_from_dump(data: dict, mode: str) -> dict[str, Any]:
 
     # 走 upsert 而不是直接 INSERT：备份里的记录也遵循 (uid, realm) 唯一键，
     # 直接写会撞 UNIQUE 约束。
-    stats = upsert(accounts, batch=time.strftime("restore-%Y%m%d-%H%M%S"),
+    stats = upsert(accounts, batch="restore-" + clock.compact(),
                    source="backup")
+    meta = _restore_meta(items)
     return {
         "mode": mode,
         "restored": len(accounts),
+        "meta": meta,
         "inserted": stats["inserted"],
         "updated": stats["updated"],
         "skipped": stats["skipped"],
@@ -946,8 +1122,14 @@ def _restore_from_sqlite(blob: bytes, mode: str) -> dict[str, Any]:
             conn.close()
 
         accounts = []
+        meta_items = []
         for row in rows:
             keys = row.keys()
+            # 复检 / 风控 / 批次状态：db 路径下这些列本来就在，直接带出来
+            meta = {c: row[c] for c in _META_COLS if c in keys}
+            meta["uid"] = row["uid"] if "uid" in keys else ""
+            meta["realm"] = row["realm"] if "realm" in keys else ""
+            meta_items.append(meta)
             payload = row["payload"] if "payload" in keys else None
             if payload:
                 try:
@@ -972,11 +1154,13 @@ def _restore_from_sqlite(blob: bytes, mode: str) -> dict[str, Any]:
 
     if mode == "replace":
         clear()
-    stats = upsert(accounts, batch=time.strftime("restore-%Y%m%d-%H%M%S"),
+    stats = upsert(accounts, batch="restore-" + clock.compact(),
                    source="backup")
+    meta = _restore_meta(meta_items)
     return {
         "mode": mode,
         "restored": len(accounts),
+        "meta": meta,
         "inserted": stats["inserted"],
         "updated": stats["updated"],
         "skipped": stats["skipped"],
