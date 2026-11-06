@@ -1578,13 +1578,20 @@ async function detectNodes() {
     if (!data.named) {
       line += data.api_error ? `｜${data.api_error}` : '｜控制器未通，只显示端口';
     }
-    $('#rc-detect-hint').textContent = line;
-    $('#rc-detect-hint').classList.toggle('bad', !data.named);
-    renderNodes(data.nodes || [], true);
+    // 一个都不通时补一句排查方向，但**不能覆盖**上面那行：全不通最常见
+    // 的原因就是主机名在这台机器上解析不到，把控制器错因冲掉正好丢掉
+    // 唯一的线索。
     if (!data.ok_count) {
-      $('#rc-detect-hint').textContent =
-        '一个都没通。确认 mihomo 在跑、端口对、本机能访问这个主机名';
+      line += '｜一个都没通：确认 mihomo 在跑、端口对、本机能访问这个主机名';
     }
+    $('#rc-detect-hint').textContent = line;
+    $('#rc-detect-hint').classList.toggle('bad', !data.named || !data.ok_count);
+    renderNodes(data.nodes || [], true);
+  } catch (err) {
+    // 以前这里没有 catch：接口 500 时按钮恢复、提示停在「正在检测…」，
+    // 看起来像卡死。
+    $('#rc-detect-hint').textContent = err.message;
+    $('#rc-detect-hint').classList.add('bad');
   } finally {
     btn.disabled = false;
   }
