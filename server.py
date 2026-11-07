@@ -265,6 +265,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._recheck_nodes(payload)
             elif path == "/api/recheck/track":
                 self._recheck_track(payload)
+            elif path == "/api/recheck/assign":
+                self._recheck_assign(payload)
+            elif path == "/api/recheck/exit":
+                self._recheck_exit(payload)
             elif path == "/api/update/apply":
                 self._update_apply()
             elif path == "/api/update/upgrade":
@@ -905,8 +909,12 @@ class Handler(BaseHTTPRequestHandler):
         if not pairs:
             raise ValueError("名单里没有账号，无需复检")
 
+        # 出口按行从库里取：名单上显示的那个端口，就是这一趟真正要走的，
+        # 两边必须是同一个数，否则用户核对时会对不上。
+        port_map = store.exit_ports_of([row_id for row_id, _ in pairs])
         runner = recheck.Runner(cfg)
-        results = runner.run(pairs, force=bool(payload.get("force")))
+        results = runner.run(pairs, force=bool(payload.get("force")),
+                             ports=port_map)
         written = store.update_recheck(results)
 
         self._json(200, {
@@ -981,6 +989,75 @@ class Handler(BaseHTTPRequestHandler):
             data["custom_nodes"] = nodes
             data["custom_ok"] = sum(1 for n in nodes if n.get("ok"))
         self._json(200, {"ok": True, **data})
+
+    def _recheck_assign(self, payload: dict) -> None:
+        """按当前模式把端口分给名单里的账号。
+
+        界面上「点端口」和「切模式」都走这里：单一出口 → 所有行同一个端口；
+        随机出口 → 在勾选范围里逐行随机。分配结果落库，复检只认库里的
+        `exit_port`，不再每轮重摇——名单上那一列要能对得上实际用的。
+        """
+        cfg = recheck.load_config()
+        mode = str(payload.get("mode") or cfg.get("exit_mode") or recheck.EXIT_RANDOM)
+        if mode not in recheck.EXIT_MODES:
+            raise ValueError(f"未知的出口模式：{mode}")
+
+        raw_ports = payload.get("ports")
+        if raw_ports is None:
+            picked = list(cfg.get("exit_ports") or [])
+        elif isinstance(raw_ports, list):
+            picked = []
+            for item in raw_ports:
+                try:
+                    picked.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            raise ValueError("ports 需要是端口号数组")
+
+        ids = [int(i) for i in (payload.get("ids") or []) if str(i).isdigit()]
+        if not ids:
+            ids = store.recheck_ids()
+        if not ids:
+            raise ValueError("复检名单里没有账号：先把要复检的号加进名单")
+
+        # 可用端口就是节点面板能列出来的那些（不探测，列表本身够用）
+        disc = recheck.discover_nodes(cfg, probe_now=False)
+        all_ports = [int(n.get("port") or 0) for n in (disc.get("nodes") or [])]
+        plan = recheck.assign_ports(mode, picked, all_ports, ids)
+        if not plan:
+            raise ValueError("没有可用端口：先点「自动检测」确认 mihomo 端口能列出来")
+
+        changed = store.set_exit_map(plan)
+        # 勾选状态也存下来：下次打开页面要能看到上次点的是哪几个
+        cfg = recheck.save_config({"exit_mode": mode, "exit_ports": picked})
+        self._json(200, {
+            "ok": True,
+            "mode": mode,
+            "ports": cfg.get("exit_ports") or [],
+            "assigned": changed,
+            "rows": store.list_accounts(track=str(payload.get("track") or "banned")),
+            "stats": store.recheck_stats(),
+        })
+
+    def _recheck_exit(self, payload: dict) -> None:
+        """单行改出口（名单上的下拉）。`port=0` 改回直连。"""
+        ids = [int(i) for i in (payload.get("ids") or []) if str(i).isdigit()]
+        if not ids:
+            raise ValueError("没有选中账号")
+        try:
+            port = int(payload.get("port") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("端口不是数字") from None
+        if port and not (0 < port < 65536):
+            raise ValueError(f"端口超出范围：{port}")
+        changed = store.set_exit_port(ids, port)
+        self._json(200, {
+            "ok": True,
+            "changed": changed,
+            "port": port,
+            "rows": store.list_accounts(track=str(payload.get("track") or "banned")),
+        })
 
     def _recheck_track(self, payload: dict) -> None:
         """手工加进 / 移出名单。state 为空串表示移出。"""

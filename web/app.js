@@ -1334,16 +1334,23 @@ async function saveSource() {
 const RECHECK_PILL = { banned: 'bad', pending: 'warn', revived: 'ok', auth: 'mute' };
 const RECHECK_TEXT = { banned: '封号中', pending: '待复检', revived: '已解封', auth: '凭据失效' };
 
-/* 三档出口策略。文案要能回答「我该选哪个」，光写名字等于没说。 */
+/* 两档出口策略。文案要能回答「我该选哪个」，光写名字等于没说。
+
+   「自定义」不再单列一档：指定某一行走哪个端口，改名单那一行的下拉就行，
+   再单开一档全局地址表反而多一层要维护的东西。 */
 const EXIT_TIPS = {
-  same: '所有号从同一个出口出去。用来验证封的是号还是 IP：同一个 IP 下还有号能通，说明封在账号层。',
-  random: '每个号从上面检测到的可用节点里随机挑一个。IP 不撞车，也不成规律。',
-  custom: '按表里的顺序逐号轮换。手上有一套别家代理，或要指定地区时用这档。',
+  same: '所有号从同一个端口出去：到下面点一张卡片（单选，点第二张会自动换过去）。用来验证封的是号还是 IP。',
+  random: '每行在选中范围里各自分一个端口：一个都不点 = 全部端口，点了几条就只在这几条里。',
 };
 
 const recheckState = {
   cfg: null, rows: [], nodes: [], track: 'banned', q: '',
   selected: new Set(), running: false,
+  //: 当前勾选的端口。只决定「分配时的范围」——真正生效的是每行的
+  //: exit_port，删了这行也不影响复检走哪条线。
+  picked: new Set(),
+  //: 上一轮是「测过」还是「没测」，重渲染卡片时要原样传回去
+  probed: false,
 };
 
 async function loadRecheck() {
@@ -1375,8 +1382,7 @@ function fillRecheckForm(cfg, disc) {
   const radio = document.querySelector(`input[name="rc-exit"][value="${mode}"]`);
   if (radio) radio.checked = true;
   applyExitMode(mode);
-  $('#rc-pin').value = cfg.exit_pin || '';
-  $('#rc-custom').value = cfg.exit_custom || '';
+  recheckState.picked = new Set((cfg.exit_ports || []).map(Number).filter(Boolean));
   // 秒 → 分钟：库里存秒，界面上写分钟更好懂
   $('#rc-min-interval').value = Math.round((cfg.min_interval || 0) / 60);
   $('#rc-batch').value = cfg.batch_limit;
@@ -1424,19 +1430,124 @@ function currentExitMode() {
 }
 
 function renderNodes(nodes, probed) {
+  recheckState.nodes = nodes || [];
+  recheckState.probed = !!probed;
   const box = $('#rc-nodes');
-  if (!nodes.length) {
+  if (!recheckState.nodes.length) {
     box.innerHTML = '<p class="hint">没有配置端口</p>';
     return;
   }
-  box.innerHTML = nodeRows(nodes, probed);
+  box.innerHTML = nodeRows(recheckState.nodes, probed);
+  // 卡片是 innerHTML 重建的，选中态来自 picked；下拉要跟着补一遍
+  syncExitSelects();
 }
 
-function renderCustomNodes(nodes) {
-  const box = $('#rc-custom-nodes');
-  box.innerHTML = nodes.length
-    ? nodeRows(nodes, true)
-    : '<p class="hint">没有可测的地址</p>';
+/* 点卡片 = 选/取消这个端口。
+   单一出口是单选（点第二张换过去，不做取消——那档必须有一个出口）；
+   随机出口是开关（再点一次取消，全不点 = 全部端口）。 */
+async function togglePort(raw) {
+  const port = Number(raw);
+  if (!port) return;
+  const mode = currentExitMode();
+  const picked = recheckState.picked;
+  if (mode === 'same') {
+    picked.clear();
+    picked.add(port);
+  } else if (picked.has(port)) {
+    picked.delete(port);
+  } else {
+    picked.add(port);
+  }
+  renderNodes(recheckState.nodes, recheckState.probed);
+  await assignExits();
+}
+
+/* 分配请求串行化。
+   每次分配都是「整份名单按当前范围重分一遍」，连点两张卡片会发两个请求。
+   并发跑的话，先发的那个可能在后发的之后落库，最终状态就取决于网络顺序，
+   而不是用户最后点的那个范围。排成一条链，最后一次一定是最后的状态。
+
+   注意请求参数在**入队时**就快照下来（ports/mode 在函数开头取），
+   不能在链里再读 recheckState.picked —— 那时候用户可能已经改了。 */
+let assignChain = Promise.resolve();
+
+function assignExits(ids) {
+  if (!recheckState.rows.length && !(ids && ids.length)) {
+    toast('复检名单还是空的，先把账号加进来', true);
+    return Promise.resolve();
+  }
+  const mode = currentExitMode();
+  const ports = [...recheckState.picked];
+  const track = recheckState.track;
+  const only = ids && ids.length ? ids : null;
+
+  assignChain = assignChain.then(async () => {
+    const data = await api('/api/recheck/assign', {
+      mode, ports, ids: only, track,
+    });
+    // picked 不拿响应回写：它是本地的点击状态，服务端那份只是镜像。
+    // 回写会让「点第二张时第一张的响应正好回来」把选择冲掉。
+    if (data.rows) {
+      recheckState.rows = data.rows;
+      renderRecheckTable();
+    }
+    const n = data.assigned || 0;
+    const scope = ports.length ? `${ports.length} 条端口` : '全部端口';
+    toast(mode === 'same'
+      ? `${n} 个号统一走 ${ports[0] || '第一个可用端口'}`
+      : `${n} 个号已分到 ${scope}里`);
+  }).catch((err) => toast(err.message, true));
+  return assignChain;
+}
+
+/* 单行改出口（名单里的下拉）。0 = 直连。 */
+async function setRowExit(id, port) {
+  const data = await api('/api/recheck/exit', {
+    ids: [Number(id)], port: Number(port) || 0, track: recheckState.track,
+  });
+  if (data.rows) {
+    recheckState.rows = data.rows;
+    renderRecheckTable();
+  }
+  toast(Number(port) ? `这一行改走 ${port}` : '这一行改回直连');
+}
+
+/* 出口下拉：直连 + 检测到的端口。手动改一行就是「自定义出口」。 */
+function exitCell(r) {
+  const cur = Number(r.exit_port || 0);
+  const seen = new Set([0]);
+  const opts = ['<option value="0">直连</option>'];
+  // 窄屏只写端口号：那一列就那么宽，带上节点名会把号码也挤掉，而号码
+  // 才是「这个号走哪条线」的答案。完整名字在 title 里。
+  const narrow = window.matchMedia('(max-width: 720px)').matches;
+  recheckState.nodes.forEach((n) => {
+    const port = Number(n.port || 0);
+    if (!port || seen.has(port)) return;
+    seen.add(port);
+    const name = n.name || n.listener || '';
+    const text = narrow || !name ? String(port) : `${port} ${esc(name)}`;
+    opts.push(`<option value="${port}"${port === cur ? ' selected' : ''}>${text}</option>`);
+  });
+  // 库里存着一个本轮没列出来的端口（池子重排过、或还没点检测）：也要能
+  // 显示出来，否则下拉会静默跳回「直连」，看起来像分配丢了
+  if (cur && !seen.has(cur)) {
+    opts.push(`<option value="${cur}" selected>${cur}（未检测到）</option>`);
+  }
+  // title 放完整端口与节点名：这一列宽度有限，「17951 新加坡机房-02」会被
+  // 浏览器截掉尾巴，悬停要能看全
+  const curName = (recheckState.nodes.find((n) => Number(n.port) === cur) || {});
+  const label = cur ? `${cur} ${curName.name || curName.listener || ''}`.trim() : '直连';
+  return `<select class="rc-exit-pick mono" data-id="${r.id}" title="出口：${esc(label)}">${opts.join('')}</select>`;
+}
+
+/* 卡片重建后把下拉的选中项对一遍：新版浏览器能记住 selected，但换档
+   重渲染时不一定，显式设一次最稳。 */
+function syncExitSelects() {
+  document.querySelectorAll('#rc-table .rc-exit-pick').forEach((sel) => {
+    const row = recheckState.rows.find((r) => String(r.id) === sel.dataset.id);
+    if (!row) return;
+    sel.value = String(row.exit_port || 0);
+  });
 }
 
 /* 节点卡片：端口 + 节点名 + 类型 + 延迟。
@@ -1451,11 +1562,19 @@ function nodeRows(nodes, probed) {
   return nodes.map((n) => {
     const addr = String(n.url || '').replace(/^https?:\/\//, '');
     const port = String(n.port || addr.split(':').pop() || addr);
+    const portNum = Number(port) || 0;
     const name = n.name || n.listener || '';
     const kind = String(n.kind || '');
     const kindCls = { '住宅': 'resi', '机房': 'dc', '代理': 'proxy' }[kind] || '';
-    const tip = [name, addr, n.exit_ip ? `出口 ${n.exit_ip}` : '']
+    // 选中的卡片要说清楚「点了会发生什么」，所以提示里带上当前档位
+    const hint = probed ? '' : '（点一下 = 选这个端口）';
+    const tip = [name, addr, n.exit_ip ? `出口 ${n.exit_ip}` : '', hint]
       .filter(Boolean).join(' · ');
+
+    const on = recheckState.picked.has(portNum);
+    const cls = ['node'];
+    if (probed) cls.push(n.ok ? 'ok' : 'bad');
+    if (on) cls.push('picked');
 
     const portCell = `<span class="node-port mono">${esc(port)}</span>`;
     const nameCell = name
@@ -1464,16 +1583,20 @@ function nodeRows(nodes, probed) {
     const kindCell = kind
       ? `<span class="node-kind ${kindCls}">${esc(kind)}</span>` : '';
 
+    let tail;
     if (!probed) {
-      return `<div class="node" title="${esc(tip)}">${portCell}${nameCell}${kindCell}
-        <span class="node-tail hint">未检测</span></div>`;
+      tail = '<span class="node-tail hint">未检测</span>';
+    } else if (n.ok) {
+      tail = `<span class="node-tail">${n.latency_ms} ms</span>`;
+    } else {
+      tail = `<span class="node-tail" title="${esc(n.error || '')}">不可用</span>`;
     }
-    if (n.ok) {
-      return `<div class="node ok" title="${esc(tip)}">${portCell}${nameCell}${kindCell}
-        <span class="node-tail">${n.latency_ms} ms</span></div>`;
-    }
-    return `<div class="node bad" title="${esc(tip)}">${portCell}${nameCell}${kindCell}
-      <span class="node-tail" title="${esc(n.error || '')}">不可用</span></div>`;
+
+    // data-port 只有拿到真端口才给：点了没端口的卡片只会让分配算错
+    const attr = portNum
+      ? ` data-port="${portNum}" role="button" tabindex="0" aria-pressed="${on}"`
+      : '';
+    return `<div class="${cls.join(' ')}" title="${esc(tip)}"${attr}>${portCell}${nameCell}${kindCell}${tail}</div>`;
   }).join('');
 }
 
@@ -1491,7 +1614,7 @@ function renderTrackCounts(stats) {
 function renderRecheckTable() {
   const body = $('#rc-table tbody');
   if (!recheckState.rows.length) {
-    body.innerHTML = '<tr><td colspan="9" class="empty-cell">这一档没有账号。导入带风控原因的账号会自动进名单。</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" class="empty-cell">这一档没有账号。导入带风控原因的账号会自动进名单。</td></tr>';
     $('#rc-hint').textContent = '';
     syncRecheckSelection();
     return;
@@ -1509,14 +1632,16 @@ function renderRecheckTable() {
       <td class="col-rc-realm"><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
       <td class="col-rc-state"><span class="pill ${pill}">${esc(text)}</span></td>
       <td class="col-credit">${creditCell(r)}</td>
+      <td class="col-rc-exit">${exitCell(r)}</td>
       <td class="mono col-rc-count">${r.recheck_count || 0}</td>
       <td class="mono col-rc-at">${esc(r.recheck) || '—'}</td>
-      <td class="rc-note" title="${esc(r.recheck_note || '')}">${esc(trimNote(r.recheck_note)) || '<span class="hint">—</span>'}</td>
+      <td class="rc-note col-rc-note" title="${esc(r.recheck_note || '')}">${esc(trimNote(r.recheck_note)) || '<span class="hint">—</span>'}</td>
       <td class="row-actions"><button class="link danger" data-act="untrack">移出</button></td>
     </tr>`;
   }).join('');
 
   $('#rc-hint').textContent = `共 ${recheckState.rows.length} 条`;
+  syncExitSelects();
   syncRecheckSelection();
 }
 
@@ -1529,7 +1654,8 @@ function trimNote(text) {
 function syncRecheckSelection() {
   const n = recheckState.selected.size;
   $('#rc-sel-count').textContent = n ? `已选 ${n} 条` : '未选择';
-  ['#btn-rc-sel-probe', '#btn-rc-sel-remove', '#btn-rc-sel-clear'].forEach((k) => {
+  ['#btn-rc-sel-probe', '#btn-rc-sel-exit', '#btn-rc-sel-remove',
+   '#btn-rc-sel-clear'].forEach((k) => {
     $(k).disabled = n === 0;
   });
 }
@@ -1539,8 +1665,9 @@ async function saveRecheckCfg() {
     enabled: $('#rc-enabled').checked,
     auto: $('#rc-auto').checked,
     exit_mode: currentExitMode(),
-    exit_pin: $('#rc-pin').value.trim(),
-    exit_custom: $('#rc-custom').value.trim(),
+    // 勾选端口一起存：下次打开页面要看到上次点的是哪几个。真正的出口
+    // 在每行的 exit_port 上，这两个字段只是「范围」
+    exit_ports: [...recheckState.picked],
     // 分钟 → 秒。后端会把小于 10 分钟的值钳回 600 秒，这里不用重复校验。
     min_interval: Math.max(10, Number($('#rc-min-interval').value) || 360) * 60,
     batch_limit: Number($('#rc-batch').value) || 20,
@@ -1620,27 +1747,6 @@ function shortApiError(text) {
   // 地址就只剩「返回 401：…」，看不出是哪一步断的。换成 flex 换行后
   // 宽度不再是问题，原样显示。
   return raw;
-}
-
-async function detectCustom() {
-  const btn = $('#btn-rc-test-custom');
-  const urls = $('#rc-custom').value.trim();
-  btn.disabled = true;
-  $('#rc-custom-hint').textContent = '正在检测…';
-  try {
-    const data = await api('/api/recheck/nodes', { custom: urls });
-    const nodes = data.custom_nodes || [];
-    if (!nodes.length) {
-      $('#rc-custom-hint').textContent = '没有合法地址：一行一个 http://host:port，socks5 不收';
-      renderCustomNodes([]);
-      return;
-    }
-    $('#rc-custom-hint').textContent =
-      `可用 ${data.custom_ok} / ${nodes.length}｜出口 IP 见每行右侧`;
-    renderCustomNodes(nodes);
-  } finally {
-    btn.disabled = false;
-  }
 }
 
 async function runRecheck(force, ids) {
@@ -1791,11 +1897,42 @@ function bind() {
   /* --- 封号复检 --- */
   document.querySelectorAll('input[name="rc-exit"]').forEach((el) => {
     el.addEventListener('change', () => {
-      if (el.checked) applyExitMode(el.value);
+      if (!el.checked) return;
+      applyExitMode(el.value);
+      // 切档时把范围收一下，两个档的语义本来就不一样：
+      //   random：清空 = 全部端口，这是「没人点」的默认状态。留着上一档
+      //           单选的那一个，会变成「随机但只有一个可选」，看着像没生效。
+      //   same  ：只能有一个。多个就留第一个，一个都没有就交给后端取
+      //           第一个可用端口——这一档必须有一个出口。
+      const picked = recheckState.picked;
+      if (el.value === 'random') {
+        picked.clear();
+      } else if (picked.size > 1) {
+        const first = [...picked][0];
+        picked.clear();
+        picked.add(first);
+      }
+      renderNodes(recheckState.nodes, recheckState.probed);
+      // 名单是空的就不发请求——那会立刻弹一句「名单里没有账号」，
+      // 而用户只是在看看设置。
+      if (recheckState.rows.length) {
+        assignExits().catch((err) => toast(err.message, true));
+      }
     });
   });
-  $('#btn-rc-test-custom').addEventListener('click', () => {
-    detectCustom().catch((err) => toast(err.message, true));
+  // 点卡片选端口：事件委托，卡片是 innerHTML 重建的，逐张绑会丢
+  $('#rc-nodes').addEventListener('click', (e) => {
+    const card = e.target.closest('.node[data-port]');
+    if (!card) return;
+    togglePort(card.dataset.port).catch((err) => toast(err.message, true));
+  });
+  // 键盘也能选：卡片挂了 role=button，回车/空格要跟点击一个效果
+  $('#rc-nodes').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const card = e.target.closest('.node[data-port]');
+    if (!card) return;
+    e.preventDefault();
+    togglePort(card.dataset.port).catch((err) => toast(err.message, true));
   });
   $('#btn-rc-save').addEventListener('click', () => {
     saveRecheckCfg().catch((err) => toast(err.message, true));
@@ -1811,6 +1948,10 @@ function bind() {
   });
   $('#btn-rc-sel-probe').addEventListener('click', () => {
     runRecheck(true, [...recheckState.selected]).catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-sel-exit').addEventListener('click', () => {
+    assignExits([...recheckState.selected])
+      .catch((err) => toast(err.message, true));
   });
   $('#btn-rc-sel-remove').addEventListener('click', () => {
     trackSelected('').catch((err) => toast(err.message, true));
@@ -1860,6 +2001,12 @@ function bind() {
     renderRecheckTable();
   });
   $('#rc-table').addEventListener('change', (e) => {
+    const pick = e.target.closest('.rc-exit-pick');
+    if (pick) {
+      setRowExit(pick.dataset.id, pick.value)
+        .catch((err) => toast(err.message, true));
+      return;
+    }
     const box = e.target.closest('.rc-check');
     if (!box) return;
     const id = Number(box.dataset.id);

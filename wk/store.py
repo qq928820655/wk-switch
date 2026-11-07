@@ -36,7 +36,7 @@ DB_PATH = os.path.join(DATA_DIR, "accounts.db")
 #: 3 = 加探针列（积分三元组 / 校验状态 / 校验时间），见 wk/probe.py
 #: 4 = 加封号复检列（名单状态 / 次数 / 时间 / 结论），见 wk/recheck.py
 #: 5 = 加导入批次列（最近批次 / 首次批次 / 导入时间）+ 风控来源标记
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: 探针状态的中文名。与 wk/probe.py 的 STATE_* 常量一一对应，
 #: 界面上不再自己拼字符串。
@@ -130,6 +130,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- '' 表示不在风控区。和 recheck_state 分开存，是因为「怎么进来的」
     -- 决定它该不该被自动复检——导入时就标了风控的号，复检多半也白搭。
     risk_src TEXT DEFAULT '',
+    -- 复检出口：这是 mihomo 的 listener 端口（0 = 直连，不下发代理）。
+    -- 存端口而不是代理 URL，是因为池子重排时端口是稳定坐标，节点名会变；
+    -- 而且用户是按端口绑账号的（一个端口 = 一个固定出口）。
+    exit_port INTEGER DEFAULT 0,
     UNIQUE (uid, realm)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_realm ON accounts(realm);
@@ -204,6 +208,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "first_batch": "TEXT",
         "first_imported_at": "TEXT",
         "risk_src": "TEXT DEFAULT ''",
+        # ---- v5 → v6：复检出口端口 ----
+        # 老库全 0，等于「没分配」，复检按直连走 —— 这正是升级前没配过
+        # 出口的人本来在做的事。
+        "exit_port": "INTEGER DEFAULT 0",
     }
     current = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
     for name, decl in extra_cols.items():
@@ -558,6 +566,9 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
             "recheck_at": recheck_at,
             "recheck": clock.stamp(recheck_at, "%m-%d %H:%M") if recheck_at else "",
             "recheck_note": (row["recheck_note"] if "recheck_note" in keys else "") or "",
+            # 出口端口：0 = 直连。节点名由前端拿端口去 nodes 表里查，
+            # store 不认识 mihomo，别在这里硬塞一份名单。
+            "exit_port": int((row["exit_port"] if "exit_port" in keys else 0) or 0),
         })
     return out
 
@@ -859,6 +870,59 @@ def set_track(ids: list[int], state: str, note: str = "") -> int:
         return cur.rowcount or 0
 
 
+def recheck_ids() -> list[int]:
+    """名单内所有行 id。批量分配出口时当默认范围。
+
+    只取在名单里的号：不在名单里的号根本不会被复检，给它分配端口只会
+    让界面显示一个永远用不上的数字。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM accounts WHERE IFNULL(recheck_state,'') != '' ORDER BY id"
+        ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def set_exit_port(ids: list[int], port: int) -> int:
+    """把一批账号的出口钉到同一个端口。`port=0` 改回直连。"""
+    if not ids:
+        return 0
+    port = max(0, int(port or 0))
+    placeholders = ",".join("?" * len(ids))
+    with connect() as conn:
+        cur = conn.execute(
+            f"UPDATE accounts SET exit_port = ? WHERE id IN ({placeholders})",
+            [port] + [int(i) for i in ids],
+        )
+        return cur.rowcount or 0
+
+
+def exit_ports_of(ids: Iterable[int]) -> dict[int, int]:
+    """`{行 id: 出口端口}`。复检前查一次，别在循环里逐行查库。"""
+    rows = [int(i) for i in ids]
+    if not rows:
+        return {}
+    placeholders = ",".join("?" * len(rows))
+    with connect() as conn:
+        got = conn.execute(
+            f"SELECT id, IFNULL(exit_port,0) AS p FROM accounts "
+            f"WHERE id IN ({placeholders})", rows
+        ).fetchall()
+    return {int(r["id"]): int(r["p"] or 0) for r in got}
+
+
+def set_exit_map(pairs: Iterable[tuple[int, int]]) -> int:
+    """按 `(行 id, 端口)` 逐行写。随机分配走这条——同一批里每行端口不同，
+    一条 UPDATE 写不了，但又必须在一个事务里落，否则中途失败会留下半个
+    分配结果。"""
+    rows = [(max(0, int(port or 0)), int(i)) for i, port in pairs]
+    if not rows:
+        return 0
+    with connect() as conn:
+        conn.executemany("UPDATE accounts SET exit_port = ? WHERE id = ?", rows)
+        return len(rows)
+
+
 def delete(ids: list[int]) -> int:
     if not ids:
         return 0
@@ -940,6 +1004,8 @@ def dump_records() -> list[dict]:
         "recheck_count": r["recheck_count"],
         "recheck_at": r["recheck_at"],
         "recheck_note": r["recheck_note"],
+        # 出口端口也是导入后配的，和复检状态一样必须跟着备份走
+        "exit_port": (r["exit_port"] if "exit_port" in r.keys() else 0) or 0,
         "account": json.loads(r["payload"] or "{}"),
     } for r in rows] + [{
         "__import_log__": True,
@@ -992,9 +1058,13 @@ def backup_bytes() -> tuple[bytes, str]:
 
 
 #: 备份里要跟着还原的「导入之后产生的状态」列。
+#:
+#: exit_port 必须在这张表里：它是用户按号配的出口，跟复检结论一样属于
+#: 「导入之后才产生的东西」。漏了它，还原会静默把所有人的出口清成直连，
+#: 而复检下一次跑就从本机 IP 出去了——正好是最不该发生的那种偏差。
 _META_COLS = ("batch", "imported_at", "first_batch", "first_imported_at",
               "risk_src", "recheck_state", "recheck_count", "recheck_at",
-              "recheck_note")
+              "recheck_note", "exit_port")
 
 
 def _restore_meta(items: list[dict]) -> int:

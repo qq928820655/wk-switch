@@ -88,15 +88,27 @@ TRACK_LABELS = {
 BANNED_HINTS = store.BANNED_HINTS
 
 #: 出口策略。顺序就是界面上的排列顺序。
+#:
+#: `custom`（按手填地址表逐号轮换）已经从选项里拿掉了：真正生效的是每行
+#: 账号自己的 `exit_port`，想指定哪一行走哪个端口，改那一行的下拉就行，
+#: 不需要再维护一份全局地址表。常量留着只为读得懂老配置——`_coerce` 会把
+#: 它折成 same，`plan_exit` 的分支也还在，老文件不会读崩。
 EXIT_SAME = "same"
 EXIT_RANDOM = "random"
 EXIT_CUSTOM = "custom"
-EXIT_MODES = (EXIT_SAME, EXIT_RANDOM, EXIT_CUSTOM)
+EXIT_MODES = (EXIT_SAME, EXIT_RANDOM)
+
+#: 单个账号的实际出口由 `exit_port` 决定（0 = 直连）。这两个标签用于复检
+#: 结果里说明「这一趟从哪出去的」。
+EXIT_PORT = "port"
+EXIT_DIRECT = "direct"
 
 EXIT_LABELS = {
     EXIT_SAME: "同一出口",
     EXIT_RANDOM: "随机出口",
     EXIT_CUSTOM: "自定义出口",
+    EXIT_PORT: "指定端口",
+    EXIT_DIRECT: "直连",
 }
 
 DEFAULTS: dict[str, Any] = {
@@ -111,7 +123,13 @@ DEFAULTS: dict[str, Any] = {
     #: 出口策略：random / same / custom。见模块顶部那张表。
     "exit_mode": "random",
     #: same 模式固定走这个出口。空 = 不下发代理（账号自带优先，其次直连）。
+    #: 新流程下这是遗留字段：指定出口改成按端口（见下），这里只为兼容
+    #: 还在写它的老配置文件与外部脚本。
     "exit_pin": "",
+    #: 当前勾选的端口（mihomo listener 端口）。single 模式只有一个，
+    #: random 模式可以是多个，空列表 = 全部可用端口。它只决定「分配时的
+    #: 范围」——真正生效的是每行的 exit_port，见 EXIT_PORT 那段注释。
+    "exit_ports": [],
     #: custom 模式的地址表，一行一个，支持 http://host:port 或裸 host:port。
     "exit_custom": "",
     #: 旧字段，只为读老配置文件保留。真正的行为由 exit_mode 决定，
@@ -183,6 +201,17 @@ def _coerce(cfg: dict) -> dict:
     # rotate_proxy 是派生字段，写回时跟 exit_mode 保持一致
     cfg["rotate_proxy"] = mode == EXIT_RANDOM
     cfg["exit_pin"] = normalize_url(cfg.get("exit_pin"))
+    # 勾选的端口：去重、丢非法值、保序（用户点选的顺序在界面上有意义）。
+    # 上限 64：端口池本身通常 32 个，留一倍余量就够，再多只是把配置写胖。
+    picked: list[int] = []
+    for item in (cfg.get("exit_ports") or []):
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 0 < port < 65536 and port not in picked:
+            picked.append(port)
+    cfg["exit_ports"] = picked[:64]
     custom = cfg.get("exit_custom")
     if isinstance(custom, (list, tuple)):
         # 允许前端直接传数组，存成一行一个
@@ -969,7 +998,10 @@ def plan_exit(cfg: dict, nodes: list[dict], index: int,
     「节点里取第一个」，都没节点就直连。任何时候都不返回半截状态。
     """
     mode = str(cfg.get("exit_mode") or EXIT_RANDOM)
-    if mode not in EXIT_MODES:
+    # custom 不在 EXIT_MODES 里（界面已经不给这档），但函数要读得懂老配置：
+    # 折成 random 会让 exit_custom 那张表被静默丢掉，用户升级后突然全从
+    # 「随机某条线」出去。这里显式放行，分支自己会退化成 same。
+    if mode not in EXIT_MODES and mode != EXIT_CUSTOM:
         mode = EXIT_RANDOM
     lookup = dict(ips or {})
     for node in nodes or []:
@@ -1006,6 +1038,59 @@ def plan_exit(cfg: dict, nodes: list[dict], index: int,
             "exit_ip": lookup.get(url, ""), "label": url}
 
 
+# ------------------------------------------------------------------ 出口分配
+def assign_ports(mode: str, picked: Iterable[int], all_ports: Iterable[int],
+                 ids: Iterable[int], rng: Any = None) -> list[tuple[int, int]]:
+    """给一批账号分配出口端口，返回 `[(行 id, 端口)]`。
+
+    这是「点端口 / 切模式」那一下做的事：把范围算成每行的具体端口写进库，
+    复检时只看每行自己的端口，不再每次重新摇。理由很实际——名单里要能
+    看到「这个号走哪个端口」，每次摇的话这一列永远是问号。
+
+    - `same`   ：所有行同一个端口。勾了几个就取第一个（界面本来只让选一个）。
+    - `random` ：在勾选范围里逐行随机；范围空 = 全部可用端口。
+    - 分配不出（没有端口可选）时返回空表，调用方保持原值，不能把每行
+      悄悄写成 0——那等于把用户配好的出口全清了。
+    """
+    pool = [int(p) for p in picked if p] or [int(p) for p in all_ports if p]
+    # 去重但保序：用户点选的顺序在 same 里决定「第一个是谁」
+    uniq: list[int] = []
+    for port in pool:
+        if port not in uniq:
+            uniq.append(port)
+    if not uniq:
+        return []
+
+    rows = [int(i) for i in ids]
+    if str(mode or "") == EXIT_SAME:
+        return [(i, uniq[0]) for i in rows]
+    picker = rng or random
+    return [(i, picker.choice(uniq)) for i in rows]
+
+
+def plan_port(cfg: dict, port: int, names: dict | None = None,
+              ips: dict | None = None) -> dict:
+    """按账号自己的端口决定这一号从哪出去。`port=0` 表示直连。
+
+    和 `plan_exit` 的分工：那个按全局策略算，是升级前的老路；这个只看
+    每行一个整数。现在复检走这条，`plan_exit` 留给还在读老配置的调用方
+    与测试，两边都返回同样的五个键，调用方不用分情况。
+    """
+    port = int(port or 0)
+    if not port:
+        return {"mode": EXIT_DIRECT, "mode_label": EXIT_LABELS[EXIT_DIRECT],
+                "proxy": "", "exit_ip": "", "label": "直连"}
+    url = _proxy_url(str(cfg["mihomo"].get("host") or ""), port)
+    name = str((names or {}).get(port) or "")
+    return {
+        "mode": EXIT_PORT,
+        "mode_label": EXIT_LABELS[EXIT_PORT],
+        "proxy": url,
+        "exit_ip": (ips or {}).get(url, ""),
+        "label": f"{port} {name}".strip(),
+    }
+
+
 # ------------------------------------------------------------------ 名单判定
 def looks_banned(text: str) -> bool:
     """这段文字里有没有「封号」的证据。"""
@@ -1023,60 +1108,60 @@ class Runner:
 
     def __init__(self, cfg: dict | None = None, rng: Any = None):
         self.cfg = cfg or load_config()
-        self.nodes: list[dict] = []
-        #: url → 出口 IP。mihomo 节点由 discover_nodes 带回，自定义地址现探。
+        #: 端口 → 节点名。只为本批用到的端口去查，不扫全量。
+        self._names: dict[int, str] = {}
+        #: url → 出口 IP。只为结果里那行「出口 IP」服务，探不到就留空。
         self._ips: dict[str, str] = {}
         self._rng = rng
 
-    def _nodes(self) -> list[dict]:
-        if not self.cfg["mihomo"]["enabled"]:
-            return []
-        if not self.nodes:
-            self.nodes = discover_nodes(self.cfg, probe_now=True)["nodes"]
-            for node in self.nodes:
-                if node.get("ok") and node.get("exit_ip"):
-                    self._ips[node["url"]] = node["exit_ip"]
-        return self.nodes
+    def _prepare(self, ports: dict[int, int]) -> None:
+        """把本批真要用的端口收拾出来：节点名（一条 HTTP）+ 出口 IP（逐端口探）。
 
-    def _warm_exits(self) -> None:
-        """给「还不知道出口 IP」的地址补探一次。
+        为什么按批取而不是扫全量：池子有三十来个端口，全量探测要几十秒，
+        而这一批可能只用其中两个。用户名下有几个号就配几个端口，扫全量
+        纯属替他浪费时间。
 
-        为什么要探：复检结果里要写「这个号从哪个 IP 出去的」。用户切到同一
-        出口，多半就是在验「IP 干净但号被封」；切到自定义出口，是在对照几个
-        出口谁通。不给 IP，这两条结论都没法自己核对。
-
-        random 模式的 IP 由 discover_nodes 带回，这里不重复探。
+        名字走 `deep=False`：只问 `/listeners` 和池面板，**不开隧道**。复检
+        自己就在跑网络请求，不该为了一个显示用的名字再挂三十条长连接。
         """
-        mode = self.cfg.get("exit_mode")
-        if mode == EXIT_CUSTOM:
-            candidates = parse_urls(self.cfg.get("exit_custom"))
-        elif mode == EXIT_SAME:
-            pin = normalize_url(self.cfg.get("exit_pin"))
-            candidates = [pin] if pin else []
-        else:
-            candidates = []
-        urls = [u for u in candidates if u not in self._ips]
+        wanted = sorted({int(p) for p in (ports or {}).values() if p})
+        if not wanted:
+            return
+        try:
+            names, _ = _fetch_listeners(self.cfg, ports=wanted, timeout=2.0,
+                                        deep=False)
+        except Exception:  # noqa: BLE001 — 取不到名字不该拦住复检
+            names = {}
+        self._names = {
+            int(p): str((names.get(int(p)) or {}).get("proxy")
+                        or (names.get(int(p)) or {}).get("name") or "")
+            for p in wanted
+        }
+        if not self.cfg["mihomo"]["enabled"]:
+            return
+        urls = [_proxy_url(str(self.cfg["mihomo"]["host"] or ""), p)
+                for p in wanted if p not in self._ips]
         if not urls:
             return
-        for node in probe_urls(urls, self.cfg["mihomo"]["probe_url"],
-                               self.cfg["mihomo"]["timeout"]):
-            # 探不通也记一笔空串，避免同一批地址在下一轮重复探测
-            self._ips[node["url"]] = node.get("exit_ip") or ""
+        try:
+            for node in probe_urls(urls, self.cfg["mihomo"]["probe_url"],
+                                   self.cfg["mihomo"]["timeout"]):
+                # 探不通也记一笔空串，避免同一批端口在下一轮重复探测
+                self._ips[node["url"]] = node.get("exit_ip") or ""
+        except Exception:  # noqa: BLE001 — 出口 IP 只是结果里的注解
+            pass
 
-    def _plan(self, index: int) -> dict:
-        mode = self.cfg.get("exit_mode")
-        # 出口已经钉死（custom 有表 / same 有 pin）时不去扫 mihomo 端口：
-        # 扫一遍是十来个网络请求，白花几十秒，结果还用不上。
-        pinned = bool(normalize_url(self.cfg.get("exit_pin")))
-        if mode == EXIT_CUSTOM or (mode == EXIT_SAME and pinned):
-            nodes: list[dict] = []
-        else:
-            nodes = self._nodes()
-        return plan_exit(self.cfg, nodes, index, rng=self._rng, ips=self._ips)
+    def _plan(self, row_id: int, ports: dict[int, int] | None) -> dict:
+        port = int((ports or {}).get(int(row_id)) or 0)
+        return plan_port(self.cfg, port, self._names, self._ips)
 
     def run(self, pairs: Iterable[tuple[int, Account]], force: bool = False,
-            on_result: Callable[[int, Account, dict], None] | None = None) -> list[dict]:
-        """跑一轮。pairs 是 [(行 id, Account)]。
+            on_result: Callable[[int, Account, dict], None] | None = None,
+            ports: dict[int, int] | None = None) -> list[dict]:
+        """跑一轮。pairs 是 [(行 id, Account)]，ports 是 {行 id: 出口端口}。
+
+        端口从库里带进来（每行自己的 `exit_port`），不在这里现算：名单上
+        显示的就是这个数，复检必须走同一个，否则用户看到的和实际用的对不上。
 
         返回值每项：{id, verdict, detail, raw, status, endpoint, latency_ms,
                      proxy, proxy_ip, exit_mode, checked_at, skipped}
@@ -1084,7 +1169,7 @@ class Runner:
         `force=True` 跳过最小间隔检查（界面上「立即复检」按钮）。
         """
         items = list(pairs)[: self.cfg["batch_limit"]]
-        self._warm_exits()
+        self._prepare(ports or {})
         now = int(time.time())
         results: list[dict] = []
 
@@ -1109,7 +1194,7 @@ class Runner:
             if index:
                 time.sleep(self.cfg["gap_seconds"])
 
-            plan = self._plan(index)
+            plan = self._plan(row_id, ports)
             res = probe.chat_probe(acc, timeout=self.cfg["timeout"], proxy=plan["proxy"])
             item = {
                 "id": row_id,
@@ -1122,7 +1207,7 @@ class Runner:
                 "latency_ms": res["latency_ms"],
                 "proxy": plan["proxy"],
                 "proxy_ip": plan["exit_ip"],
-                "exit_mode": self.cfg["exit_mode"],
+                "exit_mode": plan["mode"],
                 "checked_at": int(time.time()),
             }
             results.append(item)

@@ -363,10 +363,15 @@ class ExitPlanTests(unittest.TestCase):
         self.assertTrue(on["rotate_proxy"])
         self.assertFalse(off["rotate_proxy"])
 
-    def test_explicit_mode_wins_over_legacy(self):
+    def test_removed_custom_mode_folds_to_random(self):
+        """custom 已经从选项里拿掉：老配置读进来要折成一个还存在的档。
+
+        折成 random 而不是 same —— 老 custom 是「逐号轮换」，打散 IP 的意图
+        和 random 一致；折成 same 会把一堆号全塞到同一个出口，正好相反。
+        """
         cfg = self._cfg(exit_mode="custom", rotate_proxy=True)
-        self.assertEqual(cfg["exit_mode"], recheck.EXIT_CUSTOM)
-        self.assertFalse(cfg["rotate_proxy"])
+        self.assertEqual(cfg["exit_mode"], recheck.EXIT_RANDOM)
+        self.assertTrue(cfg["rotate_proxy"])
 
     def test_same_pin(self):
         cfg = self._cfg(exit_mode="same", exit_pin="9.9.9.9:7890")
@@ -405,30 +410,45 @@ class ExitPlanTests(unittest.TestCase):
         self.assertEqual(recheck.plan_exit(cfg, [], 0)["proxy"], "")
 
     def test_custom_rotates_in_order(self):
-        cfg = self._cfg(exit_mode="custom",
-                        exit_custom="http://c1:1\nhttp://c2:2")
+        """plan_exit 的 custom 分支还在：老配置文件直接喂进来时要读得懂。
+
+        界面已经不给这档了（指定出口改成按行选端口），但函数不能因为
+        「入口没了」就把老配置读成别的意思。
+        """
+        cfg = dict(recheck.DEFAULTS, exit_mode="custom",
+                   exit_custom="http://c1:1\nhttp://c2:2")
         got = [recheck.plan_exit(cfg, [], i)["proxy"] for i in range(5)]
         self.assertEqual(got, ["http://c1:1", "http://c2:2",
                                "http://c1:1", "http://c2:2", "http://c1:1"])
 
     def test_custom_empty_falls_back_to_same(self):
         """表里一个合法地址都没有时不能谁都直连了事，要按 same 处理。"""
-        cfg = self._cfg(exit_mode="custom", exit_custom="socks5://x:1",
-                        exit_pin="7.7.7.7:1080")
+        cfg = dict(recheck.DEFAULTS, exit_mode="custom",
+                   exit_custom="socks5://x:1", exit_pin="7.7.7.7:1080")
         plan = recheck.plan_exit(cfg, [], 0)
         self.assertEqual(plan["proxy"], "http://7.7.7.7:1080")
         self.assertEqual(plan["mode"], recheck.EXIT_SAME)
 
 
 class RunnerExitTests(unittest.TestCase):
-    """Runner 真的把 plan 算出来的代理传下去了没有。"""
+    """Runner 真的把「这一行该走的端口」传下去了没有。
+
+    出口从「全局三档」改成「每行一个端口」之后，这一层是唯一会把端口变成
+    实际代理串的地方。错了不会抛异常，只会所有号都直连（或都走同一个口），
+    所以逐条钉。
+    """
 
     def _cfg(self, **kw):
-        return recheck._coerce(dict(recheck.DEFAULTS, enabled=True, gap_seconds=1.0, **kw))
+        mihomo = {"enabled": True, "host": "127.0.0.1", "ports": "17950-17951",
+                  "probe_url": "http://probe.local/ip", "timeout": 2.0,
+                  "api": "", "secret": "", "pool": "", "pool_token": ""}
+        mihomo.update(kw.pop("mihomo", {}) or {})
+        return recheck._coerce(dict(recheck.DEFAULTS, enabled=True,
+                                    gap_seconds=1.0, mihomo=mihomo, **kw))
 
-    def test_custom_passes_url_to_chat_probe(self):
-        cfg = self._cfg(exit_mode="custom", exit_custom="http://p1:1")
-        runner = recheck.Runner(cfg)
+    def test_port_becomes_proxy(self):
+        """行上写了 17950，这一号就必须从 127.0.0.1:17950 出去。"""
+        runner = recheck.Runner(self._cfg())
         seen = []
 
         def fake(acc_, timeout=0, proxy=""):
@@ -437,15 +457,14 @@ class RunnerExitTests(unittest.TestCase):
                     "status": 200, "endpoint": "", "latency_ms": 1}
 
         with mock.patch.object(probe, "chat_probe", fake), \
-             mock.patch.object(recheck.Runner, "_warm_exits", lambda self: None):
-            results = runner.run([(1, acc())], force=True)
-        self.assertEqual(seen, ["http://p1:1"])
-        self.assertEqual(results[0]["proxy"], "http://p1:1")
-        self.assertEqual(results[0]["exit_mode"], recheck.EXIT_CUSTOM)
+             mock.patch.object(recheck.Runner, "_prepare", lambda self, p: None):
+            results = runner.run([(1, acc())], force=True, ports={1: 17950})
+        self.assertEqual(seen, ["http://127.0.0.1:17950"])
+        self.assertEqual(results[0]["proxy"], "http://127.0.0.1:17950")
+        self.assertEqual(results[0]["exit_mode"], recheck.EXIT_PORT)
 
-    def test_same_sends_same_proxy_for_every_row(self):
-        cfg = self._cfg(exit_mode="same", exit_pin="http://pin:9")
-        runner = recheck.Runner(cfg)
+    def test_same_port_for_every_row(self):
+        runner = recheck.Runner(self._cfg())
         seen = []
 
         def fake(acc_, timeout=0, proxy=""):
@@ -453,31 +472,44 @@ class RunnerExitTests(unittest.TestCase):
             return {"verdict": probe.RECHECK_BANNED, "detail": "", "raw": "",
                     "status": 403, "endpoint": "", "latency_ms": 1}
 
-        with mock.patch.object(probe, "chat_probe", fake):
-            runner.run([(1, acc(uid="a")), (2, acc(uid="b"))], force=True)
-        self.assertEqual(seen, ["http://pin:9", "http://pin:9"])
+        with mock.patch.object(probe, "chat_probe", fake), \
+             mock.patch.object(recheck.Runner, "_prepare", lambda self, p: None):
+            runner.run([(1, acc(uid="a")), (2, acc(uid="b"))], force=True,
+                       ports={1: 17950, 2: 17950})
+        self.assertEqual(seen, ["http://127.0.0.1:17950"] * 2)
 
-    def test_warm_fills_exit_ip_for_custom(self):
-        cfg = self._cfg(exit_mode="custom", exit_custom="http://p1:1")
-        runner = recheck.Runner(cfg)
-        with mock.patch.object(recheck, "probe_exit",
-                               lambda url, pu, to: {"url": url, "ok": True,
-                                                    "exit_ip": "8.8.8.8",
-                                                    "latency_ms": 1, "error": ""}):
-            runner._warm_exits()
-        self.assertEqual(runner._ips["http://p1:1"], "8.8.8.8")
+    def test_row_without_port_goes_direct(self):
+        """没分配出口就是直连，不许回退到「随便挑个节点」——那会让用户
+        以为自己选的东西没生效。"""
+        runner = recheck.Runner(self._cfg())
+        seen = []
 
-    def test_warm_fills_exit_ip_for_pinned_same(self):
-        """同一出口也要报 IP——这档的全部意义就是确认「那个 IP 是谁」。"""
-        cfg = self._cfg(exit_mode="same", exit_pin="http://pin:9")
-        runner = recheck.Runner(cfg)
-        with mock.patch.object(recheck, "probe_exit",
-                               lambda url, pu, to: {"url": url, "ok": True,
-                                                    "exit_ip": "6.6.6.6",
-                                                    "latency_ms": 1, "error": ""}):
-            runner._warm_exits()
-        self.assertEqual(runner._ips["http://pin:9"], "6.6.6.6")
-        self.assertEqual(runner._plan(0)["exit_ip"], "6.6.6.6")
+        def fake(acc_, timeout=0, proxy=""):
+            seen.append(proxy)
+            return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
+                    "status": 200, "endpoint": "", "latency_ms": 1}
+
+        with mock.patch.object(probe, "chat_probe", fake), \
+             mock.patch.object(recheck.Runner, "_prepare", lambda self, p: None):
+            results = runner.run([(1, acc())], force=True, ports={})
+        self.assertEqual(seen, [""])
+        self.assertEqual(results[0]["exit_mode"], recheck.EXIT_DIRECT)
+
+    def test_prepare_fills_name_and_exit_ip(self):
+        runner = recheck.Runner(self._cfg())
+        with mock.patch.object(recheck, "_fetch_listeners",
+                               lambda *a, **kw: ({17950: {"name": "HUB-E01",
+                                                          "proxy": "香港住宅01"}}, "")):
+            with mock.patch.object(recheck, "probe_urls",
+                                   lambda urls, pu, to: [
+                                       {"url": u, "ok": True, "exit_ip": "8.8.8.8",
+                                        "latency_ms": 1, "error": ""} for u in urls]):
+                runner._prepare({1: 17950})
+        self.assertEqual(runner._names[17950], "香港住宅01")
+        self.assertEqual(runner._ips["http://127.0.0.1:17950"], "8.8.8.8")
+        plan = runner._plan(1, {1: 17950})
+        self.assertEqual(plan["label"], "17950 香港住宅01")
+        self.assertEqual(plan["exit_ip"], "8.8.8.8")
 
 
 class ListenerNameTests(unittest.TestCase):
@@ -937,6 +969,70 @@ class NodeKindTests(unittest.TestCase):
         # proxy 空就退到 listener 名，仍然不是地址
         self.assertEqual(got[1]["name"], "mixed-in-2")
         self.assertEqual(got[1]["kind"], "")
+
+
+class AssignPortsTests(unittest.TestCase):
+    """点端口 / 切模式 → 每行一个端口。
+
+    这一段是「用户以为他配了，实际全直连」最容易发生的地方：分配函数返回
+    空表时如果被上层当成「全写 0」，整份名单的出口就静默没了。
+    """
+
+    class _Last:
+        """固定挑最后一个，用来验证「在范围里」而不是「挑最小/最大」。"""
+
+        def choice(self, seq):
+            return seq[-1]
+
+    def test_same_uses_first_picked(self):
+        got = recheck.assign_ports("same", [17952, 17950], [], [1, 2])
+        self.assertEqual(got, [(1, 17952), (2, 17952)])
+
+    def test_same_falls_back_to_all_ports(self):
+        got = recheck.assign_ports("same", [], [17950, 17951], [1])
+        self.assertEqual(got, [(1, 17950)])
+
+    def test_random_stays_inside_picked(self):
+        got = recheck.assign_ports("random", [17950, 17951], [17950, 17951, 17952],
+                                   [1, 2, 3], rng=self._Last())
+        self.assertTrue(got)
+        for _id, port in got:
+            self.assertIn(port, (17950, 17951))
+        # 每次都取范围内最后一个：证明真的按 picked 收窄了
+        self.assertEqual({p for _, p in got}, {17951})
+
+    def test_random_uses_all_when_nothing_picked(self):
+        got = recheck.assign_ports("random", [], [17950, 17951],
+                                   [1, 2], rng=self._Last())
+        self.assertEqual({p for _, p in got}, {17951})
+
+    def test_no_port_returns_empty(self):
+        """没有可选端口时必须返回空表：上层据此报错，而不是把每行写成 0。"""
+        self.assertEqual(recheck.assign_ports("same", [], [], [1, 2]), [])
+        self.assertEqual(recheck.assign_ports("random", [0], [0], [1]), [])
+
+    def test_duplicates_collapse(self):
+        got = recheck.assign_ports("same", [17950, 17950], [], [1])
+        self.assertEqual(got, [(1, 17950)])
+
+    def test_plan_port_zero_is_direct(self):
+        cfg = {"mihomo": {"host": "127.0.0.1"}}
+        plan = recheck.plan_port(cfg, 0)
+        self.assertEqual(plan["proxy"], "")
+        self.assertEqual(plan["mode"], recheck.EXIT_DIRECT)
+
+    def test_plan_port_builds_proxy_and_label(self):
+        cfg = {"mihomo": {"host": "127.0.0.1"}}
+        plan = recheck.plan_port(cfg, 17950, {17950: "香港住宅01"},
+                                 {"http://127.0.0.1:17950": "1.1.1.1"})
+        self.assertEqual(plan["proxy"], "http://127.0.0.1:17950")
+        self.assertEqual(plan["exit_ip"], "1.1.1.1")
+        self.assertEqual(plan["label"], "17950 香港住宅01")
+        self.assertEqual(plan["mode"], recheck.EXIT_PORT)
+
+    def test_plan_port_without_name_keeps_port(self):
+        cfg = {"mihomo": {"host": "10.0.0.2"}}
+        self.assertEqual(recheck.plan_port(cfg, 17951)["label"], "17951")
 
 
 class PoolPanelTests(unittest.TestCase):

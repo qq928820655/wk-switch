@@ -511,5 +511,69 @@ class RiskImportTests(StoreTestBase):
         self.assertEqual(row["risk_src"], "import")
 
 
+class ExitPortTests(StoreTestBase):
+    """每行一个出口端口（0 = 直连）。复检实际走哪条线全靠它。"""
+
+    def test_default_is_direct(self) -> None:
+        store.upsert([self.acc("u-e1", "甲")])
+        self.assertEqual(store.list_accounts()[0]["exit_port"], 0)
+
+    def test_set_same_port_for_many(self) -> None:
+        store.upsert([self.acc("u-e2", "甲"), self.acc("u-e3", "乙")])
+        ids = [r["id"] for r in store.list_accounts()]
+        self.assertEqual(store.set_exit_port(ids, 17950), 2)
+        self.assertEqual({r["exit_port"] for r in store.list_accounts()}, {17950})
+
+    def test_set_map_per_row(self) -> None:
+        """随机分配必须一行一个值，一条 UPDATE 写不了。"""
+        store.upsert([self.acc("u-e4", "甲"), self.acc("u-e5", "乙")])
+        rows = store.list_accounts()
+        pairs = [(rows[0]["id"], 17950), (rows[1]["id"], 17951)]
+        self.assertEqual(store.set_exit_map(pairs), 2)
+        got = {r["id"]: r["exit_port"] for r in store.list_accounts()}
+        self.assertEqual(got[rows[0]["id"]], 17950)
+        self.assertEqual(got[rows[1]["id"]], 17951)
+
+    def test_clear_to_direct(self) -> None:
+        store.upsert([self.acc("u-e6", "甲")])
+        rid = store.list_accounts()[0]["id"]
+        store.set_exit_port([rid], 17950)
+        store.set_exit_port([rid], 0)
+        self.assertEqual(store.list_accounts()[0]["exit_port"], 0)
+
+    def test_exit_ports_of_batch(self) -> None:
+        store.upsert([self.acc("u-e7", "甲"), self.acc("u-e8", "乙")])
+        rows = store.list_accounts()
+        store.set_exit_map([(rows[0]["id"], 17952)])
+        got = store.exit_ports_of([r["id"] for r in rows])
+        self.assertEqual(got[rows[0]["id"]], 17952)
+        self.assertEqual(got[rows[1]["id"]], 0)
+
+    def test_recheck_ids_only_tracked(self) -> None:
+        """没在名单里的号不参与分配——分配一个永远用不上的端口没有意义。"""
+        store.upsert([self.acc("u-e9", "甲"), self.acc("u-e10", "乙")])
+        rows = store.list_accounts()
+        store.set_track([rows[0]["id"]], "banned")
+        self.assertEqual(store.recheck_ids(), [rows[0]["id"]])
+
+    def test_backup_keeps_exit_port(self) -> None:
+        store.upsert([self.acc("u-e11", "甲")])
+        rid = store.list_accounts()[0]["id"]
+        store.set_exit_port([rid], 17960)
+        blob, _ = store.backup_bytes()
+        store.clear()
+        store.restore_bytes(blob, "b.zip", mode="replace")
+        self.assertEqual(store.list_accounts()[0]["exit_port"], 17960)
+
+    def test_untrack_keeps_exit_port(self) -> None:
+        """移出名单不清出口：加回来时还想用原来那个端口。"""
+        store.upsert([self.acc("u-e12", "甲")])
+        rid = store.list_accounts()[0]["id"]
+        store.set_track([rid], "banned")
+        store.set_exit_port([rid], 17970)
+        store.set_track([rid], "")
+        self.assertEqual(store.list_accounts()[0]["exit_port"], 17970)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -446,34 +446,24 @@
     </div>
 
     <div class="seg rc-exit-seg" id="rc-exit-seg">
-      <label><input type="radio" name="rc-exit" value="same"><span>同一出口</span></label>
+      <label><input type="radio" name="rc-exit" value="same"><span>单一出口</span></label>
       <label><input type="radio" name="rc-exit" value="random" checked><span>随机出口</span></label>
-      <label><input type="radio" name="rc-exit" value="custom"><span>自定义出口</span></label>
     </div>
 
     <p class="hint rc-exit-tip" id="rc-exit-tip"></p>
 
     <div class="rc-exit-pane" data-exit="same" hidden>
-      <div class="rc-grid">
-        <label class="field">
-          <span>固定出口地址</span>
-          <input type="text" id="rc-pin" placeholder="http://127.0.0.1:7890" spellcheck="false">
-        </label>
-      </div>
-      <p class="hint">留空不下发代理：账号自带 proxy 的用自己的，剩下的直连</p>
+      <p class="hint">
+        到下面「mihomo 节点」里点一个端口：点第二个会自动换过去（单选）。
+        分配后名单里每一行的「出口」都是这个端口。
+      </p>
     </div>
 
-    <div class="rc-exit-pane" data-exit="custom" hidden>
-      <label class="field rc-wide">
-        <span>出口地址（一行一个，按号顺序轮换）</span>
-        <textarea id="rc-custom" rows="3" spellcheck="false"
-          placeholder="http://10.0.0.5:7891&#10;http://10.0.0.5:7892"></textarea>
-      </label>
-      <div class="export-bar">
-        <button class="btn small" id="btn-rc-test-custom">测试这些地址</button>
-        <span class="hint" id="rc-custom-hint">只认 http / https，socks5 不走这里</span>
-      </div>
-      <div class="node-list" id="rc-custom-nodes"></div>
+    <div class="rc-exit-pane" data-exit="random">
+      <p class="hint">
+        下面「mihomo 节点」里可以点多条：一个都不点 = 全部端口里随机；
+        点了几条就只在这几条里随机。同一张卡片再点一次取消。
+      </p>
     </div>
   </section>
 
@@ -553,6 +543,7 @@
       <span class="sel-count" id="rc-sel-count">未选择</span>
       <div class="sel-actions">
         <button class="btn small" id="btn-rc-sel-probe" disabled>复检选中</button>
+        <button class="btn small" id="btn-rc-sel-exit" disabled>分配出口</button>
         <button class="btn small" id="btn-rc-sel-remove" disabled>移出名单</button>
         <button class="link" id="btn-rc-sel-clear" disabled>取消</button>
       </div>
@@ -565,8 +556,9 @@
             <th class="col-check"><input type="checkbox" id="rc-check-all" title="全选本页"></th>
             <th>名称</th><th class="col-rc-realm">版本</th><th class="col-rc-state">复检</th>
             <th class="col-credit">积分</th>
+            <th class="col-rc-exit">出口</th>
             <th class="col-rc-count">次数</th><th class="col-rc-at">上次复检</th>
-            <th>结论</th><th></th>
+            <th class="col-rc-note">结论</th><th class="row-actions"></th>
           </tr>
         </thead>
         <tbody></tbody>
