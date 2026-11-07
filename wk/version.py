@@ -8,7 +8,7 @@ import time
 from . import clock
 
 APP_NAME = "wk-switch"
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 CHANNEL = "stable"
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -492,7 +492,7 @@ class RunnerExitTests(unittest.TestCase):
         runner = recheck.Runner(self._cfg())
         seen = []
 
-        def fake(acc_, timeout=0, proxy=""):
+        def fake(acc_, timeout=0, proxy="", model=""):
             seen.append(proxy)
             return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
                     "status": 200, "endpoint": "", "latency_ms": 1}
@@ -508,7 +508,7 @@ class RunnerExitTests(unittest.TestCase):
         runner = recheck.Runner(self._cfg())
         seen = []
 
-        def fake(acc_, timeout=0, proxy=""):
+        def fake(acc_, timeout=0, proxy="", model=""):
             seen.append(proxy)
             return {"verdict": probe.RECHECK_BANNED, "detail": "", "raw": "",
                     "status": 403, "endpoint": "", "latency_ms": 1}
@@ -525,7 +525,7 @@ class RunnerExitTests(unittest.TestCase):
         runner = recheck.Runner(self._cfg())
         seen = []
 
-        def fake(acc_, timeout=0, proxy=""):
+        def fake(acc_, timeout=0, proxy="", model=""):
             seen.append(proxy)
             return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
                     "status": 200, "endpoint": "", "latency_ms": 1}
@@ -1439,6 +1439,91 @@ class PortBindTests(unittest.TestCase):
         port, _state, _calls = self._pool([{"name": "香港住宅01", "port": 17950}])
         with self.assertRaises(ValueError):
             recheck.bind_port(self._cfg(port), 0, "香港住宅01")
+
+
+class GroupPortTests(unittest.TestCase):
+    """正常区 / 风控区的端口隔离。
+
+    一键分配前先扣掉对方正在用的端口。这里测的是纯函数那一层，服务端
+    两个分配接口都调它，不用起 HTTP 也能把「撞端口」钉死。
+    """
+
+    def test_free_ports_removes_busy(self):
+        self.assertEqual(
+            recheck.free_ports([17950, 17951, 17952], {17951}),
+            [17950, 17952])
+
+    def test_free_ports_keeps_order_and_dedupes(self):
+        # same 模式取第一个：顺序被集合运算打乱，分配结果就跟着变
+        self.assertEqual(
+            recheck.free_ports([17952, 17950, 17952, 0, None], {17999}),
+            [17952, 17950])
+
+    def test_free_ports_drops_non_numeric(self):
+        self.assertEqual(recheck.free_ports(["x", 17950, ""], set()), [17950])
+
+    def test_all_busy_leaves_no_plan(self):
+        self.assertEqual(recheck.free_ports([17950], {17950}), [])
+        # 没端口时保持原值，不能把每行悄悄写成 0
+        self.assertEqual(recheck.assign_ports("random", [], [], [1, 2]), [])
+
+    def test_assigned_ports_never_in_busy(self):
+        free = recheck.free_ports([17950, 17951, 17952], {17951})
+        plan = recheck.assign_ports("random", [], free, list(range(30)))
+        self.assertEqual(len(plan), 30)
+        self.assertTrue({p for _, p in plan} <= {17950, 17952})
+
+    def test_same_uses_first_free_port(self):
+        free = recheck.free_ports([17951, 17952], {17951})
+        self.assertEqual(
+            recheck.assign_ports("same", free, [], [1, 2, 3]),
+            [(1, 17952), (2, 17952), (3, 17952)])
+
+
+class ChatModelTests(unittest.TestCase):
+    """账户验证模型：默认 deepseek-v4.1-flash，可配置，且要传到降级请求。"""
+
+    def test_default_is_deepseek_flash(self):
+        self.assertEqual(recheck.DEFAULTS["chat_model"], "deepseek-v4.1-flash")
+        self.assertEqual(probe.CHAT_MODEL, "deepseek-v4.1-flash")
+        self.assertEqual(recheck.load_config()["chat_model"],
+                         "deepseek-v4.1-flash")
+
+    def test_coerce_keeps_custom_model(self):
+        cfg = recheck._coerce(dict(recheck.DEFAULTS, chat_model="  my-model-2  "))
+        self.assertEqual(cfg["chat_model"], "my-model-2")
+
+    def test_coerce_blank_falls_back(self):
+        cfg = recheck._coerce(dict(recheck.DEFAULTS, chat_model="   "))
+        self.assertEqual(cfg["chat_model"], recheck.DEFAULTS["chat_model"])
+
+    def test_runner_passes_configured_model(self):
+        cfg = recheck._coerce(dict(recheck.DEFAULTS, enabled=True,
+                                   gap_seconds=1.0, chat_model="verify-x"))
+        seen = []
+
+        def fake(acc_, timeout=0, proxy="", model=""):
+            seen.append(model)
+            return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
+                    "status": 200, "endpoint": "", "latency_ms": 1}
+
+        with mock.patch.object(probe, "chat_probe", fake), \
+             mock.patch.object(recheck.Runner, "_prepare", lambda self, p: None):
+            recheck.Runner(cfg).run([(1, acc())], force=True, ports={})
+        self.assertEqual(seen, ["verify-x"])
+
+    def test_model_in_both_bodies(self):
+        """400 之后的降级请求必须送同一个模型，不能回退到旧默认值。"""
+        bodies = []
+
+        def fake(url, body, headers, timeout, proxy=""):
+            bodies.append(dict(body))
+            return 400, {"code": 11133, "msg": "model_param_invalid"}
+
+        with mock.patch.object(probe, "_post_json", fake):
+            res = probe.chat_probe(acc(), timeout=5, model="verify-x")
+        self.assertEqual([b["model"] for b in bodies], ["verify-x", "verify-x"])
+        self.assertEqual(res["verdict"], probe.RECHECK_UNKNOWN)
 
 
 if __name__ == "__main__":

@@ -210,6 +210,9 @@
       </select>
 
       <button class="btn small" id="btn-probe-all" title="逐个向上游查询积分，只读，不刷新 token">校验全部</button>
+      <button class="btn small" id="btn-store-assign" title="给正常账号随机分配出口；勾了几个就只分这几个。风控账号占用的端口会自动避开">一键分配出口</button>
+      <button class="btn small" id="btn-store-direct" title="把正常账号的出口全部改回直连">全部直连</button>
+      <button class="btn small ghost" id="btn-store-exits" title="重新读一次 mihomo 端口表">刷新节点</button>
     </div>
 
     <div class="sel-bar" id="sel-bar">
@@ -235,6 +238,7 @@
           <col style="width:88px">
           <col style="width:62px">
           <col style="width:92px">
+          <col style="width:148px">
           <col style="width:112px">
           <col style="width:86px">
           <col style="width:92px">
@@ -246,6 +250,7 @@
             <th class="col-check"><input type="checkbox" id="store-check-all" title="全选本页"></th>
             <th>名称</th><th>版本</th><th class="col-uid">uid</th><th>状态</th>
             <th class="col-credit">积分</th>
+            <th class="col-store-exit">出口</th>
             <th class="col-batch">批次 / 导入</th>
             <th class="col-exp">到期</th><th class="col-at">AT</th><th class="col-rt">RT</th><th></th>
           </tr>
@@ -254,6 +259,7 @@
       </table>
     </div>
     <p class="hint" id="store-hint"></p>
+    <p class="hint" id="store-exit-hint"></p>
     <p class="hint probe-hint" id="probe-hint" hidden></p>
 
     <details class="issues" id="store-history">
@@ -446,6 +452,12 @@
       <label class="field">
         <span>每日自动复检时间（点）</span>
         <input type="number" id="rc-auto-hour" min="0" max="23" step="1">
+      </label>
+      <label class="field">
+        <span>账户验证模型</span>
+        <input type="text" id="rc-model" spellcheck="false"
+               placeholder="deepseek-v4.1-flash"
+               title="复检与账户验证送的裸模型名，别带 cn: / global: 前缀">
       </label>
     </div>
 

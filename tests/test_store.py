@@ -613,5 +613,46 @@ class ExitPortTests(StoreTestBase):
         self.assertEqual(store.list_accounts()[0]["exit_port"], 17970)
 
 
+class GroupPortsTests(StoreTestBase):
+    """两区分组：一键分配的范围、以及「哪些端口对方正在用」。"""
+
+    def _ids(self):
+        return {r["uid"]: r["id"] for r in store.list_accounts()}
+
+    def test_normal_ids_excludes_risk(self):
+        store.upsert([self.acc("u-a", "甲"), self.acc("u-b", "乙")])
+        ids = self._ids()
+        store.set_track([ids["u-a"]], "banned")
+        self.assertEqual(store.normal_ids(), [ids["u-b"]])
+
+    def test_exit_ports_in_use_split_by_group(self):
+        store.upsert([self.acc("u-a", "甲"), self.acc("u-b", "乙"),
+                      self.acc("u-c", "丙")])
+        ids = self._ids()
+        store.set_track([ids["u-a"]], "banned")
+        store.set_exit_port([ids["u-a"]], 17950)
+        store.set_exit_port([ids["u-b"]], 17951)
+        self.assertEqual(store.exit_ports_in_use("risk"), {17950})
+        self.assertEqual(store.exit_ports_in_use("normal"), {17951})
+        self.assertEqual(store.exit_ports_in_use(), {17950, 17951})
+
+    def test_zero_port_is_not_a_slot(self):
+        store.upsert([self.acc("u-a", "甲")])
+        ids = self._ids()
+        store.set_track([ids["u-a"]], "banned")
+        store.set_exit_port([ids["u-a"]], 0)
+        self.assertEqual(store.exit_ports_in_use(), set())
+
+    def test_untrack_moves_port_to_normal_group(self):
+        store.upsert([self.acc("u-a", "甲")])
+        ids = self._ids()
+        store.set_track([ids["u-a"]], "banned")
+        store.set_exit_port([ids["u-a"]], 17960)
+        self.assertEqual(store.exit_ports_in_use("risk"), {17960})
+        store.set_track([ids["u-a"]], "")
+        self.assertEqual(store.exit_ports_in_use("risk"), set())
+        self.assertEqual(store.exit_ports_in_use("normal"), {17960})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

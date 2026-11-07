@@ -120,6 +120,10 @@ DEFAULTS: dict[str, Any] = {
     "gap_seconds": 3.0,
     #: 单次对话请求超时。上游冷启动偶尔要 20 秒以上。
     "timeout": 25.0,
+    #: 账户验证用的对话模型。复检、以及所有「这个号还能不能用」的敲门
+    #: 都送这个裸名字；面板侧那种 `cn:xxx` / `global:xxx` 前缀是分池用的，
+    #: 转发到上游会被判成 model_param_invalid。
+    "chat_model": "deepseek-v4.1-flash",
     #: 出口策略：random / same / custom。见模块顶部那张表。
     "exit_mode": "random",
     #: same 模式固定走这个出口。空 = 不下发代理（账号自带优先，其次直连）。
@@ -217,6 +221,10 @@ def _coerce(cfg: dict) -> dict:
         # 允许前端直接传数组，存成一行一个
         custom = "\n".join(str(x) for x in custom)
     cfg["exit_custom"] = str(custom or "").strip()
+    # 模型名只做空白与长度收敛，不猜用户想写什么前缀、也不做白名单：
+    # 上游换模型是常事，写死一个列表反而会让新模型配不进去。空值回默认。
+    model = str(cfg.get("chat_model") or "").strip()
+    cfg["chat_model"] = (model[:80] or DEFAULTS["chat_model"])
     try:
         cfg["min_interval"] = max(600, int(cfg.get("min_interval") or DEFAULTS["min_interval"]))
     except (TypeError, ValueError):
@@ -1230,6 +1238,27 @@ def plan_exit(cfg: dict, nodes: list[dict], index: int,
 
 
 # ------------------------------------------------------------------ 出口分配
+def free_ports(ports: Iterable[int], busy: Iterable[int]) -> list[int]:
+    """把「另一区正在用的端口」从可用列表里扣掉，去重保序。
+
+    正常区和风控区不能共用一个 listener：同一条出口上既跑积分查询又跑
+    封号敲门，两边会把彼此的请求特征带过去。一键分配前走这一步，用户
+    在下拉里手动选则不受限制——那是他自己下的判断。
+
+    保序不是为了好看：`same` 模式取第一个端口，顺序变了分配结果就变了。
+    """
+    taken = {int(p) for p in busy if p}
+    out: list[int] = []
+    for item in ports:
+        try:
+            port = int(item or 0)
+        except (TypeError, ValueError):
+            continue
+        if port and port not in taken and port not in out:
+            out.append(port)
+    return out
+
+
 def assign_ports(mode: str, picked: Iterable[int], all_ports: Iterable[int],
                  ids: Iterable[int], rng: Any = None) -> list[tuple[int, int]]:
     """给一批账号分配出口端口，返回 `[(行 id, 端口)]`。
@@ -1386,7 +1415,9 @@ class Runner:
                 time.sleep(self.cfg["gap_seconds"])
 
             plan = self._plan(row_id, ports)
-            res = probe.chat_probe(acc, timeout=self.cfg["timeout"], proxy=plan["proxy"])
+            res = probe.chat_probe(acc, timeout=self.cfg["timeout"],
+                                   proxy=plan["proxy"],
+                                   model=self.cfg.get("chat_model", ""))
             item = {
                 "id": row_id,
                 "verdict": res["verdict"],

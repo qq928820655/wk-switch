@@ -196,6 +196,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/store/list":
             self._store_list()
             return
+        if path == "/api/store/exits":
+            self._store_exits()
+            return
         if path == "/api/store/stats":
             self._json(200, {"ok": True, "stats": store.stats()})
             return
@@ -248,6 +251,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_export(payload)
             elif path == "/api/store/import":
                 self._store_import(payload)
+            elif path == "/api/store/assign":
+                self._store_assign(payload)
+            elif path == "/api/store/exit":
+                self._store_exit(payload)
             elif path == "/api/store/rename":
                 self._store_rename(payload)
             elif path == "/api/store/delete":
@@ -698,6 +705,99 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "rows": rows, "total": len(rows),
                          "batch": batch, "stats": store.stats()})
 
+    def _store_exits(self) -> None:
+        """账户库出口栏要用的端口清单：节点表 + 两区各自占用的端口。
+
+        单独一个接口而不是塞进 /api/store/list：列节点要问一次池面板，
+        搜索框每敲一个字都跑一遍太浪费，而且面板没开时会白白卡 1 秒。
+        """
+        cfg = recheck.load_config()
+        disc = recheck.discover_nodes(cfg, probe_now=False)
+        nodes = disc.get("nodes") or []
+        risk = sorted(store.exit_ports_in_use("risk"))
+        normal = sorted(store.exit_ports_in_use("normal"))
+        self._json(200, {
+            "ok": True,
+            "host": disc.get("host") or "",
+            "nodes": nodes,
+            "busy_risk": risk,
+            "busy_normal": normal,
+            "available": recheck.free_ports(
+                (n.get("port") or 0 for n in nodes), risk),
+            "api_error": disc.get("api_error") or "",
+        })
+
+    def _store_assign(self, payload: dict) -> None:
+        """账户库的一键分配出口。
+
+        只给**正常区**（不在复检名单里）的账号分；风控那批由复检页管，
+        两边不共用端口。可带 ids 缩小范围——界面上勾了几个就只分这几个。
+        """
+        cfg = recheck.load_config()
+        mode = str(payload.get("mode") or recheck.EXIT_RANDOM)
+        if mode not in recheck.EXIT_MODES:
+            raise ValueError(f"未知的出口模式：{mode}")
+
+        raw_ids = payload.get("ids")
+        ids = ([int(i) for i in raw_ids if str(i).isdigit()]
+               if isinstance(raw_ids, list) else [])
+        allowed = set(store.normal_ids())
+        # 显式给了 ids 时按它来，但越界的、以及风控区的行一律剔掉：
+        # 用户在库里把风控号也勾上了，不该让一键分配顺手改掉它的出口。
+        ids = [i for i in (ids or sorted(allowed)) if i in allowed]
+        if not ids:
+            raise ValueError("没有可分配的正常账号：风控账号在「封号复检」页分配出口")
+
+        raw_ports = payload.get("ports")
+        picked = []
+        if isinstance(raw_ports, list):
+            for item in raw_ports:
+                try:
+                    picked.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+
+        # 风控区占着的端口从「全部」和「用户限定范围」里一起扣掉。
+        # picked 被扣空时 assign_ports 会退回全部可用端口，不会写入 0。
+        busy = store.exit_ports_in_use("risk")
+        disc = recheck.discover_nodes(cfg, probe_now=False)
+        all_ports = recheck.free_ports(
+            (n.get("port") or 0 for n in (disc.get("nodes") or [])), busy)
+        picked = recheck.free_ports(picked, busy)
+        plan = recheck.assign_ports(mode, picked, all_ports, ids)
+        if not plan:
+            raise ValueError("没有可用端口：先确认 mihomo 端口能列出来，"
+                             "或检查端口是不是都被风控区占用了")
+
+        changed = store.set_exit_map(plan)
+        self._json(200, {
+            "ok": True,
+            "mode": mode,
+            "assigned": changed,
+            "ports": sorted({p for _, p in plan}),
+            # 被排除的端口回给界面，用户点完能知道「为什么没分到那个」
+            "excluded": sorted(busy),
+            "stats": store.stats(),
+        })
+
+    def _store_exit(self, payload: dict) -> None:
+        """账户库里逐行改出口（下拉），`port=0` 改回直连。
+
+        自定义出口就落在这里：一键分配只是批量写一次，之后每行都能单独
+        改成任意端口，两边写的是同一列，不会互相覆盖。
+        """
+        ids = [int(i) for i in (payload.get("ids") or []) if str(i).isdigit()]
+        if not ids:
+            raise ValueError("没有选中账号")
+        try:
+            port = int(payload.get("port") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("端口不是数字") from None
+        if port and not (0 < port < 65536):
+            raise ValueError(f"端口超出范围：{port}")
+        changed = store.set_exit_port(ids, port)
+        self._json(200, {"ok": True, "changed": changed, "port": port})
+
     def _store_rename(self, payload: dict) -> None:
         row_id = int(payload.get("id") or 0)
         name = str(payload.get("name") or "")
@@ -1136,12 +1236,18 @@ class Handler(BaseHTTPRequestHandler):
         if not ids:
             raise ValueError("复检名单里没有账号：先把要复检的号加进名单")
 
-        # 可用端口就是节点面板能列出来的那些（不探测，列表本身够用）
+        # 可用端口就是节点面板能列出来的那些（不探测，列表本身够用），
+        # 但要扣掉正常区正在用的端口：两区撞到同一个 listener 上，出口 IP
+        # 就分不清是复检敲门还是积分查询，风控特征会互相带过去。
         disc = recheck.discover_nodes(cfg, probe_now=False)
-        all_ports = [int(n.get("port") or 0) for n in (disc.get("nodes") or [])]
+        busy = store.exit_ports_in_use("normal")
+        all_ports = recheck.free_ports(
+            (n.get("port") or 0 for n in (disc.get("nodes") or [])), busy)
+        picked = recheck.free_ports(picked, busy)
         plan = recheck.assign_ports(mode, picked, all_ports, ids)
         if not plan:
-            raise ValueError("没有可用端口：先点「自动检测」确认 mihomo 端口能列出来")
+            raise ValueError("没有可用端口：先点「自动检测」确认 mihomo 端口能列出来，"
+                             "或检查端口是不是都被正常区占用了")
 
         changed = store.set_exit_map(plan)
         # 勾选状态也存下来：下次打开页面要能看到上次点的是哪几个
@@ -1203,6 +1309,7 @@ class Handler(BaseHTTPRequestHandler):
             max_gap=cfg["max_gap"],
         )
         accounts = [acc for _, acc in pairs]
+        attach_exit_proxies(pairs)
         results = runner.run(accounts)
 
         # 结果按输入顺序返回，pairs 也是同一个顺序，用下标对齐
@@ -1262,6 +1369,26 @@ PROBE_DEFAULTS = {
 }
 
 PROBE_CONFIG_PATH = ROOT / "config" / "probe.json"
+
+
+def attach_exit_proxies(pairs: list) -> None:
+    """给待校验的账号挂上它自己那一行的出口代理。
+
+    账户库里「出口」列写的是哪个端口，查积分就走哪条线——风控账号在库里
+    被勾选校验时同理，它自己配的出口一样生效。抽成模块级函数是为了让
+    「积分走出口」能单测，不必起 HTTP 服务。
+
+    exit_port=0 时**不动** acc.proxy：导入数据里可能自带代理，那是有效配置，
+    不该因为「没在本站分配出口」就被抹掉。
+    """
+    if not pairs:
+        return
+    cfg = recheck.load_config()
+    port_map = store.exit_ports_of([row_id for row_id, _ in pairs])
+    for row_id, acc in pairs:
+        port = int(port_map.get(row_id, 0) or 0)
+        if port:
+            acc.proxy = recheck.plan_port(cfg, port)["proxy"]
 
 
 def probe_config() -> dict:

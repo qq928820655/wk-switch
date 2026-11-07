@@ -535,7 +535,13 @@ function realmOf(name) {
 
 /* ---------- 账户库 ---------- */
 
-const storeState = { rows: [], profile: null, realm: '', q: '', batch: '', loaded: false, selected: new Set() };
+const storeState = {
+  rows: [], profile: null, realm: '', q: '', batch: '', loaded: false,
+  selected: new Set(),
+  // 出口下拉的选项来自 mihomo 节点表；busyRisk 是风控区已经占住的端口，
+  // 一键分配要避开它们，下拉里则照样列出（那是用户手动自定义的范围）。
+  nodes: [], available: [], busyRisk: [], exitsLoaded: false,
+};
 
 const REALM_PILL = { cn: 'warn', intl: 'brand' };
 const REALM_TEXT = { cn: '国内版', intl: '国际版' };
@@ -574,6 +580,9 @@ async function loadStore() {
 
   const data = await apiGet('/api/store/list?' + params.toString());
   if (!data.ok) throw new Error(data.error || '账户库读取失败');
+  // 节点表只拉一次：搜索框每敲一个字都去问池面板，面板没开时会白等 1 秒。
+  // 想重读时点「刷新节点」。
+  await loadStoreExits();
 
   storeState.rows = data.rows || [];
   storeState.loaded = true;
@@ -647,23 +656,179 @@ function fillBatchSelect(list) {
   sel.value = storeState.batch;
 }
 
+/* ---------- 账户库出口 ---------- */
+
+/** 读一次 mihomo 节点表 + 两区端口占用。失败不让账户库整页挂掉。 */
+async function loadStoreExits(force) {
+  if (storeState.exitsLoaded && !force) return;
+  try {
+    const data = await apiGet('/api/store/exits');
+    if (!data.ok) throw new Error(data.error || '读取节点表失败');
+    storeState.nodes = data.nodes || [];
+    storeState.available = data.available || [];
+    storeState.busyRisk = data.busy_risk || [];
+    storeState.exitsLoaded = true;
+    renderStoreExitHint();
+  } catch (err) {
+    storeState.nodes = [];
+    storeState.available = [];
+    storeState.busyRisk = [];
+    const el = $('#store-exit-hint');
+    if (el) {
+      el.textContent = `节点表读取失败：${err.message}（点「刷新节点」重试）`;
+      el.classList.add('bad');
+    }
+  }
+}
+
+function renderStoreExitHint() {
+  const el = $('#store-exit-hint');
+  if (!el) return;
+  el.classList.remove('bad');
+  const parts = [`可用端口 ${storeState.available.length} 个`];
+  if (storeState.busyRisk.length) {
+    parts.push(`风控占用 ${storeState.busyRisk.join('、')}（一键分配会避开）`);
+  }
+  parts.push('出口列可逐行改，直连 = 不走代理；查积分按这一列出站');
+  el.textContent = parts.join(' · ');
+}
+
+/**
+ * 状态列：风控态优先。
+ *
+ * 以前只画 token_state，一个已经在封号名单里的号照样显示绿色「有效」——
+ * 那一列回答的是「token 过没过期」，用户读成「这号正不正常」。现在进了
+ * 风控区就先报风控，凭据状态降成小字 + title，需要时还能查。
+ */
+function statusCell(r) {
+  const cred = `<span class="pill ${STATE_PILL[r.state] || 'mute'}">${esc(r.state_label)}</span>`;
+  if (!r.recheck_state) return cred;
+  const label = r.recheck_label || '封号中';
+  return `<span class="pill bad" title="凭据：${esc(r.state_label)}；风控区：${esc(label)}">${esc(label)}</span>
+    <small class="hint status-cred">凭据${esc(r.state_label)}</small>`;
+}
+
+/** 出口下拉：直连 + 节点表。手动改一行就是「自定义出口」。 */
+function storeExitCell(r) {
+  const cur = Number(r.exit_port || 0);
+  const narrow = window.matchMedia('(max-width: 720px)').matches;
+  const seen = new Set([0]);
+  const opts = ['<option value="0">直连</option>'];
+  storeState.nodes.forEach((n) => {
+    const port = Number(n.port || 0);
+    if (!port || seen.has(port)) return;
+    seen.add(port);
+    const name = n.name || n.listener || '';
+    // 风控占用只在一键分配时排除，手动选仍然允许：那是用户自己下的判断。
+    // 但选项里要写明，免得他以为这是个干净的槽。
+    const taken = storeState.busyRisk.includes(port) ? '（风控占用）' : '';
+    const text = narrow || !name ? String(port) : `${port} ${esc(name)}${taken}`;
+    opts.push(`<option value="${port}"${port === cur ? ' selected' : ''}>${text}</option>`);
+  });
+  // 库里存着本轮没列出来的端口（池子重排过、还没点检测）也要显示，
+  // 否则下拉静默跳回「直连」，看起来像分配丢了。
+  if (cur && !seen.has(cur)) {
+    opts.push(`<option value="${cur}" selected>${cur}（未检测到）</option>`);
+  }
+  const curName = (storeState.nodes.find((n) => Number(n.port) === cur) || {});
+  const label = cur ? `${cur} ${curName.name || curName.listener || ''}`.trim() : '直连';
+  return `<select class="store-exit-pick mono" data-id="${r.id}" title="出口：${esc(label)}">${opts.join('')}</select>`;
+}
+
+async function setStoreRowExit(id, port) {
+  const num = Number(port) || 0;
+  try {
+    await api('/api/store/exit', { ids: [Number(id)], port: num });
+    const row = storeState.rows.find((r) => r.id === Number(id));
+    if (row) row.exit_port = num;   // 不重绘整表，下拉焦点和滚动位置都要保住
+    toast(num ? `这一行改走 ${num}` : '这一行改回直连');
+  } catch (err) {
+    toast(err.message, true);
+    await loadStore();
+  }
+}
+
+/** 一键分配：勾了就只分勾的，没勾 = 当前全部正常账号。风控端口服务端会剔掉。 */
+async function assignStoreExits() {
+  const btn = $('#btn-store-assign');
+  const picked = [...storeState.selected];
+  const scope = picked.length ? `勾选的 ${picked.length} 个` : '全部正常账号';
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '分配中…';
+  try {
+    const data = await api('/api/store/assign', { mode: 'random', ids: picked });
+    await loadStore();
+    const excl = data.excluded || [];
+    toast(`${scope}：${data.assigned} 个已分到 ${(data.ports || []).length} 个端口` +
+      (excl.length ? `，避开风控端口 ${excl.join('、')}` : ''));
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+/** 一键直连：只动正常账号，风控那批的出口保持不动。 */
+async function clearStoreExits() {
+  const ids = storeState.selected.size
+    ? [...storeState.selected]
+    : storeState.rows.filter((r) => !r.recheck_state).map((r) => r.id);
+  const normal = ids.filter((id) => {
+    const r = storeState.rows.find((x) => x.id === id);
+    return r && !r.recheck_state;
+  });
+  if (!normal.length) {
+    toast('没有可改的正常账号', true);
+    return;
+  }
+  if (!confirm(`把 ${normal.length} 个正常账号的出口改回直连？风控账号不受影响。`)) return;
+  try {
+    await api('/api/store/exit', { ids: normal, port: 0 });
+    await loadStore();
+    toast(`${normal.length} 个账号改回直连`);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/**
+ * fixed 布局下 colgroup 的列数必须等于实际显示的列数。
+ *
+ * 窄屏用 CSS 藏掉六个 td，但 col 元素不会跟着消失：留着 12 个 col 的话，
+ * 可见的 7 个单元格会填进前 7 列，后 5 列还各占一份宽度，整张表被压到
+ * 左边 7/12。这里按屏宽整组重写 colgroup，两边始终对齐。
+ */
+function syncStoreCols() {
+  const cg = document.querySelector('#store-table colgroup');
+  if (!cg) return;
+  const narrow = window.matchMedia('(max-width: 720px)').matches;
+  const widths = narrow
+    ? [24, 88, 48, 58, 52, 76]              // 勾选/名称/版本/状态/积分/出口
+    : [36, 132, 64, 88, 62, 92, 148, 112, 86, 92, 44, 92];
+  cg.innerHTML = widths.map((w) => `<col style="width:${w}px">`).join('');
+}
+
 function renderStoreTable(rows) {
+  syncStoreCols();
   const body = $('#store-table tbody');
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="11" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
     $('#store-hint').textContent = '';
     return;
   }
 
   const sel = storeState.selected;
   body.innerHTML = rows.map((r) => `
-    <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}">
+    <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}${r.recheck_state ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="row-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
       <td title="最近更新 ${esc(r.updated_at)}"><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
       <td><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
       <td class="mono col-uid" title="${esc(r.uid)}">${esc(shortUid(r.uid))}</td>
-      <td><span class="pill ${STATE_PILL[r.state] || 'mute'}">${esc(r.state_label)}</span></td>
+      <td class="col-state">${statusCell(r)}</td>
       <td class="col-credit">${creditCell(r)}</td>
+      <td class="col-store-exit">${storeExitCell(r)}</td>
       <td class="col-batch">${batchCell(r)}</td>
       <td class="mono col-exp">${esc(r.expires) || '—'}</td>
       <td class="mono col-at" title="${esc(r.at)}">${esc(r.at)}</td>
@@ -1524,6 +1689,7 @@ function fillRecheckForm(cfg, disc) {
   $('#rc-gap').value = Math.round(cfg.gap_seconds || 3);
   $('#rc-timeout').value = Math.round(cfg.timeout || 25);
   $('#rc-auto-hour').value = cfg.auto_hour ?? 3;
+  $('#rc-model').value = cfg.chat_model || 'deepseek-v4.1-flash';
   const mihomo = cfg.mihomo || {};
   $('#rc-host').value = mihomo.host || '';
   $('#rc-ports').value = mihomo.ports || '';
@@ -1940,6 +2106,8 @@ async function saveRecheckCfg() {
     gap_seconds: Number($('#rc-gap').value) || 3,
     timeout: Number($('#rc-timeout').value) || 25,
     auto_hour: Number($('#rc-auto-hour').value) || 0,
+    // 裸模型名。留空时后端回默认值，不在这里硬编码第二份
+    chat_model: $('#rc-model').value.trim(),
     mihomo: {
       host: $('#rc-host').value.trim(),
       ports: $('#rc-ports').value.trim(),
@@ -2413,11 +2581,15 @@ function bind() {
     if (btn.dataset.act === 'delete') storeDelete(id, row.name);
   });
 
-  // 勾选：单行勾选框走 change 委托，表头全选同时控制两处（顶部条 + 表头）
+  // 勾选 + 逐行出口下拉：都走 change 委托，表格重绘不会丢事件
   $('#store-table tbody').addEventListener('change', (e) => {
     const box = e.target.closest('.row-check');
-    if (!box) return;
-    toggleSelect(Number(box.dataset.id), box.checked);
+    if (box) {
+      toggleSelect(Number(box.dataset.id), box.checked);
+      return;
+    }
+    const exit = e.target.closest('.store-exit-pick');
+    if (exit) setStoreRowExit(exit.dataset.id, exit.value);
   });
 
   document.querySelectorAll('#store-check-all, #store-check-all-top').forEach((box) => {
@@ -2426,6 +2598,24 @@ function bind() {
 
   $('#btn-sel-probe').addEventListener('click', probeSelected);
   $('#btn-probe-all').addEventListener('click', probeAll);
+  $('#btn-store-assign').addEventListener('click', assignStoreExits);
+  $('#btn-store-direct').addEventListener('click', clearStoreExits);
+  // 横竖屏切换会改列数和下拉文案（窄屏只写端口号），重画一次表格
+  let storeResizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(storeResizeTimer);
+    storeResizeTimer = setTimeout(() => {
+      if (!$('#view-store').classList.contains('hidden')) {
+        renderStoreTable(storeState.rows);
+      }
+    }, 150);
+  });
+  $('#btn-store-exits').addEventListener('click', () => {
+    loadStoreExits(true).then(() => {
+      renderStoreTable(storeState.rows);
+      toast('节点表已刷新');
+    });
+  });
   $('#btn-sel-export').addEventListener('click', exportSelected);
   $('#btn-sel-delete').addEventListener('click', deleteSelected);
   $('#btn-sel-clear').addEventListener('click', () => selectAll(false));

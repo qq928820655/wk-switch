@@ -901,6 +901,37 @@ def recheck_ids() -> list[int]:
     return [int(r[0]) for r in rows]
 
 
+def normal_ids() -> list[int]:
+    """不在复检名单里的行（正常区）。账户库「一键分配出口」的默认范围。
+
+    风控区那批号由复检页自己分配，两边各管各的：一个端口被两边同时用上，
+    就分不清这一条出口上跑的是复检敲门还是积分查询了。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM accounts WHERE IFNULL(recheck_state,'') = '' ORDER BY id"
+        ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def exit_ports_in_use(group: str = "") -> set[int]:
+    """某个区正在用的出口端口集合。
+
+    `group="risk"` 只看复检名单里的号，`"normal"` 只看正常号，空串看全库。
+    一键分配时拿**对方**的集合去扣可用端口，两边才不会撞到同一个端口上。
+    只看 > 0 的值：0 是直连，不是一个槽位。
+    """
+    sql = ("SELECT DISTINCT IFNULL(exit_port,0) AS p FROM accounts "
+           "WHERE IFNULL(exit_port,0) > 0")
+    if group == "risk":
+        sql += " AND IFNULL(recheck_state,'') != ''"
+    elif group == "normal":
+        sql += " AND IFNULL(recheck_state,'') = ''"
+    with connect() as conn:
+        rows = conn.execute(sql).fetchall()
+    return {int(r["p"]) for r in rows}
+
+
 def set_exit_port(ids: list[int], port: int) -> int:
     """把一批账号的出口钉到同一个端口。`port=0` 改回直连。"""
     if not ids:

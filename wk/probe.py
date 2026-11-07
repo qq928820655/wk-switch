@@ -718,10 +718,11 @@ CHAT_BASES_INTL = ("https://www.workbuddy.ai",)
 #: 不带前缀的版本在部分边缘节点也认，按 404 自动切换。
 CHAT_PATHS = ("/v2/chat/completions", "/chat/completions")
 
-#: 探测模型。面板侧写 `cn:hy3` / `global:hy3`，那个前缀是面板自己用来分池的，
-#: 转发到上游时被剥掉——上游认得的是裸 `hy3`。送带前缀的名字会拿到
-#: 11133 model_param_invalid，把「还封着」误报成「参数错误」。
-CHAT_MODEL = "hy3"
+#: 账户验证用的默认模型。复检、积分校验前后的对话敲门都送这个裸名字。
+#: 面板侧有时写 `cn:xxx` / `global:xxx`，那个前缀是面板自己分池用的，
+#: 转发到上游会被判成 11133 model_param_invalid，把「还封着」误报成
+#: 「参数错误」。配置里的 chat_model 会覆盖它，见 chat_probe 的 model 参数。
+CHAT_MODEL = "deepseek-v4.1-flash"
 
 #: 400 之后的降级请求体。上游的 400 绝大多数不是账号问题，而是这个 body
 #: 里有它不认的字段：某个版本不认 `stream`、有的网关把 `max_tokens` 卡在
@@ -830,7 +831,8 @@ def _clip(text: str, limit: int = 70) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "") -> dict:
+def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "",
+               model: str = "") -> dict:
     """发一次最小对话请求，判断这个号的对话链路还能不能用。
 
     返回：
@@ -868,8 +870,12 @@ def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "") -> dict:
 
     headers = _headers(acc)
     headers["Accept"] = "application/json"
+    # 同一份模型要同时用在正式请求和 400 之后的降级请求上。两处写成两个
+    # 常量，改配置时漏掉一处，降级那次就会拿旧模型去试，结论跟着飘。
+    chat_model = str(model or CHAT_MODEL).strip() or CHAT_MODEL
+    fallback = {**CHAT_BODY_FALLBACK, "model": chat_model}
     body = {
-        "model": CHAT_MODEL,
+        "model": chat_model,
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 5,
         "stream": False,
@@ -893,7 +899,7 @@ def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "") -> dict:
                 # 字段；过不了就把第一次的原话带出去（那是"上游为什么不收"
                 # 的唯一线索，换成我们的措辞只会更难查）。
                 retry_status, retry_payload = _post_json(
-                    url, dict(CHAT_BODY_FALLBACK), headers, timeout, proxy)
+                    url, dict(fallback), headers, timeout, proxy)
                 if retry_status != 400:
                     return _read_chat_reply(retry_status, retry_payload, url, started)
             return _read_chat_reply(status, payload, url, started)

@@ -453,5 +453,49 @@ class UsableTests(unittest.TestCase):
         self.assertTrue(callable(got))
 
 
+class ExitProxyTests(unittest.TestCase):
+    """积分查询按每行的 exit_port 出站。
+
+    风控账号也会出现在账户库列表里，被勾选校验时同样走这一层——这里
+    用 recheck_state 造一条这样的行，确认它没被漏掉。
+    """
+
+    def _attach(self, pairs, port_map):
+        import server
+        from unittest import mock
+        cfg = {"mihomo": {"host": "127.0.0.1"}}
+        with mock.patch.object(server.store, "exit_ports_of",
+                               return_value=port_map), \
+             mock.patch.object(server.recheck, "load_config",
+                               return_value=cfg), \
+             mock.patch.object(server.recheck, "plan_port",
+                               side_effect=lambda c, p: {
+                                   "proxy": f"http://127.0.0.1:{p}"}):
+            server.attach_exit_proxies(pairs)
+        return [acc.proxy for _, acc in pairs]
+
+    def test_exit_port_becomes_proxy(self):
+        a = Account(uid="a", access_token="t", realm="intl")
+        b = Account(uid="b", access_token="t", realm="intl")
+        self.assertEqual(self._attach([(1, a), (2, b)], {1: 17950, 2: 0}),
+                         ["http://127.0.0.1:17950", ""])
+
+    def test_risk_row_uses_its_own_exit(self):
+        a = Account(uid="risk", access_token="t", realm="intl")
+        a.recheck_state = "banned"
+        self.assertEqual(self._attach([(7, a)], {7: 17978}),
+                         ["http://127.0.0.1:17978"])
+
+    def test_zero_port_keeps_accounts_own_proxy(self):
+        a = Account(uid="a", access_token="t", realm="intl")
+        a.proxy = "http://own-proxy:8080"
+        self.assertEqual(self._attach([(1, a)], {1: 0}),
+                         ["http://own-proxy:8080"])
+
+    def test_empty_pairs_is_noop(self):
+        import server
+        self.assertIsNone(server.attach_exit_proxies([]))
+
+
 if __name__ == "__main__":
     unittest.main()
