@@ -71,6 +71,47 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(self.reply(500, {})["verdict"], probe.RECHECK_UNKNOWN)
 
 
+class BadRequestTests(unittest.TestCase):
+    """400 的说明要能回答「是不是我地址填错了」。
+
+    400 是「地址通了、凭据也过了，但上游不认这份请求」，和账号状态无关。
+    界面上只写「未确认」时，用户第一反应永远是去改地址——所以文案必须把
+    「地址和凭据都通」写出来，并且带上上游原话。
+    """
+
+    def reply(self, status, body):
+        return probe._read_chat_reply(status, body, "https://x/v2/chat/completions", 0.0)
+
+    def test_400_says_address_is_fine(self):
+        res = self.reply(400, {"code": 11133, "msg": "model_param_invalid"})
+        self.assertEqual(res["verdict"], probe.RECHECK_UNKNOWN)
+        self.assertIn("地址和凭据都通", res["detail"])
+        self.assertIn("不是账号状态", res["detail"])
+
+    def test_400_quotes_upstream(self):
+        res = self.reply(400, {"msg": "max_tokens must be >= 16"})
+        self.assertIn("max_tokens must be >= 16", res["detail"])
+
+    def test_400_known_code_hint(self):
+        res = self.reply(400, {"code": 11133})
+        self.assertIn("模型名或参数不被接受", res["detail"])
+
+    def test_400_unknown_code_still_explains(self):
+        res = self.reply(400, {"error": {"code": "invalid_request"}})
+        self.assertIn("请求体被上游拒绝", res["detail"])
+        self.assertIn("invalid_request", res["detail"])
+
+    def test_error_code_reads_nested(self):
+        self.assertEqual(probe._error_code({"error": {"code": "e1"}}), "e1")
+        self.assertEqual(probe._error_code({"code": 0}), "0")
+        self.assertEqual(probe._error_code({}), "")
+        self.assertEqual(probe._error_code("not a dict"), "")
+
+    def test_clip_collapses_whitespace(self):
+        self.assertEqual(probe._clip("  a\n\n b  "), "a b")
+        self.assertTrue(probe._clip("x" * 200, 10).endswith("…"))
+
+
 class MarkerTests(unittest.TestCase):
 
     def test_looks_restricted(self):
@@ -1241,6 +1282,163 @@ class PoolPanelTests(unittest.TestCase):
                                           "pool_token": " abc "}})
         self.assertEqual(cfg["mihomo"]["pool"], "http://h:8006")
         self.assertEqual(cfg["mihomo"]["pool_token"], "abc")
+
+
+class PortBindTests(unittest.TestCase):
+    """给端口换节点：池子只认「节点 → 端口」，端口被占就拒绝。
+
+    用户要的是「17950 改成走这个节点」，所以被占时得先把占用者挪到空端口。
+    这一层要是错了，两个后果都很糟：换不动（用户以为功能没做），或者把
+    占用者挤到 0 号位（那张卡片从此不显示）。
+    """
+
+    LISTEN_BASE = 17950
+
+    def _pool(self, nodes: list[dict], *, reject: set[str] | None = None):
+        """起一个能 status / nodes / ports/bind 的假池。
+
+        `nodes` 是 [{name, port}]，bind 会真的改内存里的映射——不真的改就
+        测不出「腾位之后目标端口真的空出来了」。
+        """
+        state = {n["name"]: n["port"] for n in nodes}
+        delays = {n["name"]: n.get("delay", 120) for n in nodes}
+        calls: list[dict] = []
+        reject = reject or set()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def _json(self, code, body):
+                raw = json.dumps(body, ensure_ascii=False).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):  # noqa: N802
+                if self.path == "/api/v1/status":
+                    return self._json(200, {"ok": True, "status": {
+                        "listen_base": self.server_base, "listen_max": 32}})
+                if self.path == "/api/v1/nodes":
+                    return self._json(200, {"ok": True, "nodes": [
+                        {"name": name, "type": "ss", "delay_ms": delays[name],
+                         "listener_port": port, "pinned": port is not None}
+                        for name, port in state.items()]})
+                self.send_error(404)
+
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                calls.append(body)
+                name = str(body.get("node") or "")
+                port = body.get("port")
+                if name not in state:
+                    return self._json(500, {"ok": False, "error": "节点不存在: " + name})
+                if name in reject:
+                    return self._json(500, {"ok": False, "error": "上游拒绝了这个节点"})
+                if port is None:
+                    state[name] = None
+                    return self._json(200, {"ok": True, "node": name, "port": None})
+                port = int(port)
+                holder = next((n for n, p in state.items() if p == port and n != name), None)
+                if holder:
+                    return self._json(500, {"ok": False,
+                                            "error": f"端口 {port} 正被 {holder} 使用"})
+                state[name] = port
+                return self._json(200, {"ok": True, "node": name, "port": port, "pinned": True})
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        Handler.server_base = self.LISTEN_BASE
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1], state, calls
+
+    def _cfg(self, port: int) -> dict:
+        return {"mihomo": {"host": "127.0.0.1", "pool": f"http://127.0.0.1:{port}",
+                           "pool_token": "tok", "secret": "", "ports": "17950-17955",
+                           "probe_url": "https://api.ipify.org", "timeout": 5.0,
+                           "enabled": True},
+                "exit_mode": "random", "exit_ports": [], "exit_pin": "",
+                "exit_custom": "", "batch_limit": 20, "min_interval": 0,
+                "gap_seconds": 0, "timeout": 5}
+
+    def test_pool_nodes_keeps_unassigned(self):
+        """没分到端口的节点也要在候选表里——能换的前提就是它此刻空闲。"""
+        port, _state, _calls = self._pool([
+            {"name": "香港住宅01", "port": 17950},
+            {"name": "日本-未分配", "port": None},
+        ])
+        got = recheck.pool_nodes(self._cfg(port))
+        self.assertTrue(got["ok"])
+        self.assertEqual(len(got["nodes"]), 2)
+        free = [n for n in got["nodes"] if n["name"] == "日本-未分配"][0]
+        self.assertEqual(free["port"], 0)
+        self.assertIsNotNone(free["delay_ms"])
+
+    def test_pool_nodes_reports_http_error(self):
+        cfg = self._cfg(1)      # 没人监听这个端口
+        got = recheck.pool_nodes(cfg, timeout=1.0)
+        self.assertFalse(got["ok"])
+        self.assertTrue(got["error"])
+
+    def test_bind_free_port(self):
+        port, state, calls = self._pool([
+            {"name": "香港住宅01", "port": 17950},
+            {"name": "日本-01", "port": None},
+        ])
+        got = recheck.bind_port(self._cfg(port), 17951, "日本-01")
+        self.assertEqual(got["port"], 17951)
+        self.assertIsNone(got["moved"])
+        self.assertEqual(state["日本-01"], 17951)
+        self.assertEqual(calls[-1], {"node": "日本-01", "port": 17951})
+
+    def test_bind_evicts_occupant(self):
+        """端口上已经有人时，先把占用者挪到空端口，再让目标节点占位。"""
+        port, state, calls = self._pool([
+            {"name": "香港住宅01", "port": 17950},
+            {"name": "日本-01", "port": None},
+            {"name": "新加坡-02", "port": None},
+        ])
+        got = recheck.bind_port(self._cfg(port), 17950, "日本-01")
+        self.assertEqual(got["port"], 17950)
+        self.assertEqual(got["moved"]["node"], "香港住宅01")
+        self.assertEqual(got["moved"]["to"], 17951)   # 17950 之后第一个空位
+        self.assertEqual(state["日本-01"], 17950)
+        self.assertEqual(state["香港住宅01"], 17951)
+        # 顺序不能反：先挪人再绑，否则第一步就被池子拒
+        self.assertEqual([c["node"] for c in calls], ["香港住宅01", "日本-01"])
+
+    def test_bind_rolls_back_when_target_rejected(self):
+        """目标节点被上游拒了，占用者要挪回原位，别留下两张错位的卡片。"""
+        port, state, _calls = self._pool([
+            {"name": "香港住宅01", "port": 17950},
+            {"name": "坏节点", "port": None},
+        ], reject={"坏节点"})
+        with self.assertRaises(ValueError):
+            recheck.bind_port(self._cfg(port), 17950, "坏节点")
+        self.assertEqual(state["香港住宅01"], 17950)
+
+    def test_bind_unknown_node(self):
+        port, _state, _calls = self._pool([{"name": "香港住宅01", "port": 17950}])
+        with self.assertRaises(ValueError):
+            recheck.bind_port(self._cfg(port), 17950, "不存在的节点")
+
+    def test_bind_without_pool_base(self):
+        cfg = self._cfg(1)
+        cfg["mihomo"]["pool"] = ""
+        cfg["mihomo"]["host"] = ""
+        with self.assertRaises(ValueError):
+            recheck.bind_port(cfg, 17950, "任意")
+
+    def test_bind_rejects_bad_port(self):
+        port, _state, _calls = self._pool([{"name": "香港住宅01", "port": 17950}])
+        with self.assertRaises(ValueError):
+            recheck.bind_port(self._cfg(port), 0, "香港住宅01")
 
 
 if __name__ == "__main__":

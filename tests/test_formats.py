@@ -209,6 +209,27 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.convert(self.accounts, {"dedupe_key": "none"})
         self.assertEqual(result.kept, 5)
 
+    def test_keep_both_is_idempotent(self) -> None:
+        """同一份数据跑两遍 convert，uid 不能越叠越长。
+
+        导入页每改一个选项就重跑一次 convert，而 keep_both 是原地改 uid 的：
+        拿上一轮的 `x-2` 当基座，再加后缀就成了 `x-2-2`，跑几次叠几层。
+        """
+        opts = {"dedupe_key": "uid", "dedupe_policy": "keep_both"}
+        first = [a.uid for a in pipeline.convert(self.accounts, opts).accounts]
+        second = [a.uid for a in pipeline.convert(self.accounts, opts).accounts]
+        third = [a.uid for a in pipeline.convert(self.accounts, opts).accounts]
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
+        self.assertIn("u-cn-1001-2", third)
+        self.assertNotIn("u-cn-1001-2-2", third)
+
+    def test_ref_never_leaks_into_export_payload(self) -> None:
+        """`ref` 是给界面认行的，不属于账号数据。"""
+        self.accounts[0].ref = "r1"
+        self.assertNotIn("ref", self.accounts[0].to_dict())
+        self.assertNotIn("ref", self.accounts[0].masked())
+
     def test_require_token_drops_empty(self) -> None:
         parsed = formats.parse_bytes("hub-export.json", load("hub-export.json"))
         rows = [dict(r) for r in parsed.rows]

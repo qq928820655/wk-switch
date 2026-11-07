@@ -397,6 +397,53 @@ def _explain_status(base: str, path: str, code: int) -> str:
     return f"{base}{path} 返回 HTTP {code}"
 
 
+def _api_post(base: str, path: str, headers: dict, body: Any,
+              timeout: float) -> tuple[Any, int, str]:
+    """POST 一个控制器端点，返回 (JSON, 状态码, 人话错误)。
+
+    和 `_api_get` 同一套约定：状态码 0 = 没走到 HTTP 层。错误体里的
+    `error` 字段原样带出来——池子拒绝绑定时的理由（端口被谁占了、节点
+    不存在）只有它知道，改写成人话反而丢掉线索。
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(base + path, data=data, method="POST",
+                                 headers={**headers, "Content-Type": "application/json"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            code = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            payload = json.loads(exc.read().decode("utf-8", "replace"))
+            if isinstance(payload, dict):
+                detail = str(payload.get("error") or payload.get("message") or "")
+        except (ValueError, OSError):
+            detail = ""
+        if detail:
+            return None, int(exc.code), detail
+        return None, int(exc.code), _explain_status(base, path, int(exc.code))
+    except urllib.error.URLError as exc:
+        return None, 0, f"{base}{path} {_why_unreachable(exc.reason, timeout)}"
+    except (TimeoutError, OSError) as exc:
+        return None, 0, f"{base}{path} {_why_unreachable(exc, timeout)}"
+    try:
+        return json.loads(raw), code, ""
+    except ValueError:
+        return None, code, f"{base}{path} 返回的不是 JSON"
+
+
+def _pool_header(mihomo: dict) -> dict:
+    """池面板的鉴权头。Token 填混是常态，所以 pool_token 空着时拿 secret 顶。"""
+    token = str(mihomo.get("pool_token") or "").strip() \
+        or str(mihomo.get("secret") or "").strip()
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-Token"] = token
+    return headers
+
+
 def _listener_map(items: Any) -> dict[int, dict]:
     """把 `[{name, port, proxy}]` 折成 `{端口: {name, proxy}}`。"""
     out: dict[int, dict] = {}
@@ -476,7 +523,7 @@ def _fetch_pool_nodes(mihomo: dict, base: str,
     headers = {"Accept": "application/json"}
     if token:
         headers["X-Token"] = token
-    data, code, err = _api_get(base, "/api/v1/nodes", headers, timeout)
+    data, code, err = _api_get(base, "/api/v1/nodes", _pool_header(mihomo), timeout)
     if code == 200 and isinstance(data, dict):
         out = _pool_map(data.get("nodes"))
         if out:
@@ -491,6 +538,145 @@ def _fetch_pool_nodes(mihomo: dict, base: str,
         # 污染「控制器未通」那条主错因
         return {}, ""
     return {}, ""
+
+
+def pool_nodes(cfg: dict, timeout: float = 3.0) -> dict:
+    """池子里的**全部**节点，含还没分到端口的那些。
+
+    为什么和 `_fetch_pool_nodes` 要分两份：那个函数只关心「端口 → 名字」，
+    没端口的节点进了表也没用，所以直接丢掉。但「给这个端口换个节点」要的
+    正是那些还没被占用的节点——能换的前提就是它此刻不在任何端口上。
+
+    `delay_ms` 是 None 表示这一轮没测过（`tested=False`），前端只把有延迟
+    的算「可联通」。
+    """
+    mihomo = cfg["mihomo"]
+    base = _pool_base(mihomo)
+    if not base:
+        return {"ok": False, "nodes": [], "error": "没填池面板地址，也没能从代理主机推出来"}
+
+    data, code, err = _api_get(base, "/api/v1/nodes", _pool_header(mihomo), timeout)
+    if code != 200 or not isinstance(data, dict):
+        return {"ok": False, "nodes": [], "error": err or f"{base} 返回 HTTP {code}"}
+
+    nodes: list[dict] = []
+    for item in (data.get("nodes") or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        delay = item.get("delay_ms")
+        nodes.append({
+            "name": name,
+            "type": str(item.get("type") or "").strip(),
+            "port": int(item.get("listener_port") or 0),
+            "pinned": bool(item.get("pinned")),
+            "delay_ms": int(delay) if isinstance(delay, (int, float)) else None,
+            "kind": node_kind(name),
+        })
+    return {"ok": True, "nodes": nodes, "error": ""}
+
+
+def pool_status(cfg: dict, timeout: float = 3.0) -> dict:
+    """池子的端口区间。换节点时要在区间里找一个空位，得先知道区间多大。"""
+    mihomo = cfg["mihomo"]
+    base = _pool_base(mihomo)
+    if not base:
+        return {}
+    data, code, _err = _api_get(base, "/api/v1/status", _pool_header(mihomo), timeout)
+    if code != 200 or not isinstance(data, dict):
+        return {}
+    st = data.get("status") if isinstance(data.get("status"), dict) else data
+    try:
+        lo = int(st.get("listen_base") or 0)
+        size = int(st.get("listen_max") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if not (0 < lo < 65536) or size <= 0:
+        return {}
+    return {"base": lo, "max": size}
+
+
+def _bind_raw(cfg: dict, node: str, port: int, timeout: float) -> dict:
+    mihomo = cfg["mihomo"]
+    base = _pool_base(mihomo)
+    body: dict[str, Any] = {"node": node}
+    if port:
+        body["port"] = int(port)
+    data, code, err = _api_post(base, "/api/v1/ports/bind", _pool_header(mihomo),
+                                body, timeout)
+    if code != 200 or not isinstance(data, dict):
+        raise ValueError(err or f"池面板返回 HTTP {code}")
+    if not data.get("ok"):
+        raise ValueError(str(data.get("error") or "池面板拒绝了这次绑定"))
+    return {
+        "node": node,
+        "port": int(data.get("port") or 0),
+        "pinned": bool(data.get("pinned")),
+    }
+
+
+def bind_port(cfg: dict, port: int, node: str, timeout: float = 10.0) -> dict:
+    """让指定端口改走指定节点（`POST /api/v1/ports/bind`）。
+
+    池子的接口是「把节点钉到端口」，而且**端口被占时会直接拒绝**。但用户
+    要的是「这个端口换成那个节点」——这两件事只有在目标节点恰好空闲时才
+    等价。所以这里多做一步：目标端口已经有人时，先把占用者挪到一个空端口，
+    再把目标节点钉进去。
+
+    挪走占用者是有代价的（它换了一条出口端口），所以返回值里带 `moved`，
+    界面要把「X 被挪到 17956」说出来——不然用户下次看到端口表对不上，
+    会以为是程序自己乱排。
+
+    绑定失败时尽量回滚：占用者已经挪走了就挪回原端口，免得一次失败的
+    操作留下两张位置都不对的卡片。
+    """
+    mihomo = cfg["mihomo"]
+    if not _pool_base(mihomo):
+        raise ValueError("没填 mihomo-pool 面板地址，改不了端口对应的节点")
+
+    name = str(node or "").strip()
+    if not name:
+        raise ValueError("没指定节点")
+    if not (0 < int(port) < 65536):
+        raise ValueError("端口超出范围")
+    port = int(port)
+
+    info = pool_nodes(cfg, timeout)
+    if not info.get("ok"):
+        raise ValueError(info.get("error") or "连不上池面板，改不了端口对应的节点")
+    nodes = info.get("nodes") or []
+    if name not in {n["name"] for n in nodes}:
+        raise ValueError(f"池子里没有这个节点：{name}")
+
+    occupant = next((n for n in nodes
+                     if int(n.get("port") or 0) == port and n["name"] != name), None)
+    moved = None
+
+    if occupant:
+        used = {int(n["port"]) for n in nodes if n.get("port")}
+        span = pool_status(cfg, timeout)
+        lo = span.get("base") or min(used or [port])
+        size = span.get("max") or 64
+        free = next((p for p in range(lo, lo + size) if p not in used), None)
+        if free is None:
+            raise ValueError(
+                f"端口区间 {lo}-{lo + size - 1} 已经排满，腾不出位置给 {occupant['name']}")
+        _bind_raw(cfg, occupant["name"], free, timeout)
+        moved = {"node": occupant["name"], "from": port, "to": free}
+
+    try:
+        res = _bind_raw(cfg, name, port, timeout)
+    except ValueError:
+        if moved:
+            try:
+                _bind_raw(cfg, moved["node"], port, timeout)
+            except ValueError:
+                pass  # 回滚也失败就保持现状，错误照原样抛给用户
+        raise
+
+    return {**res, "moved": moved}
 
 
 def _fetch_listeners(cfg: dict, ports: Iterable[int] | None = None,
@@ -910,6 +1096,9 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
     # （地址错 / 要 secret / 端点不存在），只说「未通」等于没给信息。
     names, api_error = _fetch_listeners(
         cfg, ports=ports, timeout=2.5 if probe_now else 1.0, deep=probe_now)
+    # 顺带把池子的全量节点表带上：卡片上的「改节点」要用它列候选。
+    # 面板没开时这一步返回 ok=False，不算错误——不影响端口检测本身。
+    pool = pool_nodes(cfg, timeout=2.5 if probe_now else 1.2)
 
     if not probe_now:
         nodes = [{"url": u, "ok": False, "exit_ip": "", "latency_ms": 0,
@@ -923,13 +1112,14 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
             "api": api_base(mihomo),
             "api_error": api_error,
             "named": bool(names),
+            "pool": pool,
         }
 
     if not urls:
         return {"host": mihomo["host"], "ports": [], "probed": True,
                 "nodes": [], "ok_count": 0,
                 "api": api_base(mihomo), "api_error": api_error,
-                "named": bool(names)}
+                "named": bool(names), "pool": pool}
 
     nodes = _label_nodes(probe_urls(urls, mihomo["probe_url"], mihomo["timeout"]), names)
 
@@ -942,6 +1132,7 @@ def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
         "api": api_base(mihomo),
         "api_error": api_error,
         "named": bool(names),
+        "pool": pool,
     }
 
 

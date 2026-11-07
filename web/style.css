@@ -351,6 +351,61 @@ table.grid td {
 table.grid tbody tr:hover td { background: #fafbff; }
 table.grid tbody tr:last-child td { border-bottom: 0; }
 
+/* ---------- 预览表的勾选 / 风控 ---------- */
+/* 勾选条：不勾的时候也要显示，因为「没勾 = 全部」这条规则本身需要被看见 */
+.pick-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 11px;
+  background: #fbfcff;
+}
+.pick-count { font-size: 12px; color: var(--ink-3); }
+.pick-count.on { color: var(--brand); font-weight: 550; }
+.pick-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+/* 勾选列压到最窄：它只是一个勾，不该占掉 uid 的宽度 */
+table.grid .col-pick { width: 34px; padding-right: 0; }
+table.grid .col-pick input { margin: 0; vertical-align: -2px; cursor: pointer; }
+table.grid .col-risk { width: 76px; }
+
+/* 勾中的行要能一眼扫到：只靠左边那个小勾，滚到表格下半屏就看不见了 */
+table.grid tbody tr.picked td { background: #f5f6ff; }
+table.grid tbody tr.picked:hover td { background: #eef0ff; }
+
+/* 风控三态：未标（灰）、风控（红）、正常（绿）。
+   三态而不是两态，是因为「跟随整批」本身是一个要保留的选项。 */
+.risk-chip {
+  padding: 1px 9px;
+  border-radius: 999px;
+  border: 1px dashed var(--line);
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.risk-chip:hover { border-color: var(--brand); color: var(--brand); }
+.risk-chip.on {
+  border-style: solid;
+  border-color: #f6c9c9;
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-weight: 550;
+}
+.risk-chip.safe {
+  border-style: solid;
+  border-color: #bfe6cd;
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-weight: 550;
+}
+
 .pill {
   display: inline-block;
   padding: 1px 9px;
@@ -849,7 +904,21 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 
   /* 表格横向滚动：列多的时候宁可滑动，也不要把文字挤成一列竖排 */
   .table-wrap { -webkit-overflow-scrolling: touch; }
-  #preview-table { min-width: 720px; }
+  /* 导入页预览表：勾选框和风控列是新加的，十一列在 414px 下必须让位。
+     砍掉「账号 / 到期 / AT / RT」——这四项在手机上没人核对，而「风控」
+     和「凭据状态」恰恰是勾选和判断时要看的两列，它们必须在第一屏。 */
+  #preview-table { min-width: 0; table-layout: fixed; }
+  #preview-table th:nth-child(5), #preview-table td:nth-child(5),
+  #preview-table th:nth-child(8), #preview-table td:nth-child(8),
+  #preview-table th:nth-child(9), #preview-table td:nth-child(9),
+  #preview-table th:nth-child(10), #preview-table td:nth-child(10) { display: none; }
+  #preview-table th, #preview-table td { padding: 7px 6px; }
+  #preview-table .col-pick { width: 28px; }
+  #preview-table .col-risk { width: 60px; }
+  .risk-chip { padding: 1px 6px; font-size: 10.5px; }
+  .pick-bar { gap: 8px; padding: 8px 10px; }
+  .pick-actions { width: 100%; margin-left: 0; }
+  .pick-actions .btn { flex: 1 1 auto; padding: 4px 8px; font-size: 11px; }
   #store-table { min-width: 720px; }
   .table-wrap.tall { max-height: 60vh; }
 
@@ -1316,6 +1385,90 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
   color: var(--ink-3);
 }
 .node.bad .node-tail { color: var(--bad); }
+
+/* 「改」按钮：给这个端口换节点。做成一枚细长的小按钮贴在右边缘，
+   不用图标是不想为一个功能引一套 icon font。 */
+.node-bind {
+  flex: none;
+  padding: 0 6px;
+  height: 18px;
+  line-height: 1;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color .12s, border-color .12s;
+}
+.node-bind:hover { color: var(--brand); border-color: var(--brand); }
+
+/* ---------- 端口换节点浮层 ---------- */
+.bind-pop {
+  position: fixed;
+  z-index: 60;
+  width: 300px;
+  max-height: 380px;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 12px 32px -8px rgba(20, 26, 45, .24);
+}
+.bind-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12.5px;
+}
+.bind-search {
+  width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fbfcff;
+  color: var(--ink);
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+}
+.bind-search:focus { border-color: var(--brand); background: #fff; }
+.bind-note { margin: 7px 0; font-size: 11px; line-height: 1.5; }
+.bind-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line-2);
+}
+.bind-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 4px;
+  border: 0;
+  border-bottom: 1px solid var(--line-2);
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  cursor: pointer;
+}
+.bind-item:hover { background: #f7f8ff; }
+.bind-item.cur { background: var(--brand-soft); }
+.bind-name {
+  font-size: 12px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bind-meta { flex: none; font-size: 10.5px; color: var(--ink-3); }
 
 /* 结论列：上游原话可能一长串，一行截断，全文挂在 title 上 */
 .rc-note {

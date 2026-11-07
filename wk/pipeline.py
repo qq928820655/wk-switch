@@ -151,7 +151,8 @@ def validate(accounts: list[Account], opts: dict) -> ConvertResult:
     return result
 
 
-def dedupe(accounts: list[Account], key: str, policy: str) -> tuple[list[Account], int]:
+def dedupe(accounts: list[Account], key: str, policy: str,
+           base_uids: dict[int, str] | None = None) -> tuple[list[Account], int]:
     """去重。
 
     key: uid | token | uid_token
@@ -159,16 +160,26 @@ def dedupe(accounts: list[Account], key: str, policy: str) -> tuple[list[Account
 
     keep_both 会把重复项改成 uid-2、uid-3 追加——这是唯一「不丢行」的策略，
     用在「同一账号两个环境各有一份凭据、都要保留」的场景。
+
+    `base_uids` 是 {id(acc): 原始 uid}。同一份数据会被反复 convert（改个
+    选项就重跑一遍），而 keep_both 是**原地改 uid** 的：第二次跑时组的第一个
+    元素 uid 已经是 `x-2`，再加后缀就成了 `x-2-2`，跑几次叠几层。传进来之后
+    一律拿最初那个 uid 当基，重复跑结果不变。
     """
     if key == "none" or not accounts:
         return accounts, 0
+
+    base = base_uids or {}
+
+    def uid_of(acc: Account) -> str:
+        return base.get(id(acc), acc.uid)
 
     def key_of(acc: Account) -> str:
         if key == "token":
             return acc.access_token or f"__noid__{id(acc)}"
         if key == "uid_token":
-            return acc.uid or acc.access_token or f"__noid__{id(acc)}"
-        return acc.uid or f"__noid__{id(acc)}"
+            return uid_of(acc) or acc.access_token or f"__noid__{id(acc)}"
+        return uid_of(acc) or f"__noid__{id(acc)}"
 
     buckets: dict[str, list[Account]] = {}
     order: list[str] = []
@@ -188,7 +199,9 @@ def dedupe(accounts: list[Account], key: str, policy: str) -> tuple[list[Account
             continue
         merged += len(group) - 1
         if policy == "keep_both":
-            base_uid = group[0].uid
+            base_uid = uid_of(group[0])
+            # 第一个保持原样（它可能已经被上一轮改成 x-2，还原回原始 uid）
+            group[0].uid = base_uid
             out.append(group[0])
             for n, acc in enumerate(group[1:], 2):
                 acc.uid = f"{base_uid}-{n}"
@@ -205,8 +218,20 @@ def dedupe(accounts: list[Account], key: str, policy: str) -> tuple[list[Account
 
 
 def convert(accounts: list[Account], opts: dict | None = None) -> ConvertResult:
-    """完整管线。opts 见 server.py 的 /api/convert 参数说明。"""
+    """完整管线。opts 见 server.py 的 /api/convert 参数说明。
+
+    `accounts` 里的对象会被**原地修改**（补 uid、keep_both 改 uid）。所以
+    调用方要传同一批对象进来；重复调用同一次 convert 现在是幂等的
+    （uid 快照在下面取）。
+    """
     opts = opts or {}
+    # 进 dedupe 之前把 uid 基座记下来：keep_both 原地改 uid，没有这份快照
+    # 就会一轮叠一层后缀。第一遍跑就把 base_uid 固化到对象上，之后不管重跑
+    # 多少次都拿同一个基座。
+    for a in accounts:
+        if not a.base_uid:
+            a.base_uid = a.uid
+    base_uids = {id(a): (a.base_uid or a.uid) for a in accounts}
     result = validate(accounts, opts)
     kept = fill_missing(result.accounts, result)
 
@@ -221,7 +246,7 @@ def convert(accounts: list[Account], opts: dict | None = None) -> ConvertResult:
 
     key = str(opts.get("dedupe_key") or "uid")
     policy = str(opts.get("dedupe_policy") or "keep_first")
-    kept, merged = dedupe(kept, key, policy)
+    kept, merged = dedupe(kept, key, policy, base_uids)
     result.merged = merged
     result.accounts = kept
 

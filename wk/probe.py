@@ -723,6 +723,15 @@ CHAT_PATHS = ("/v2/chat/completions", "/chat/completions")
 #: 11133 model_param_invalid，把「还封着」误报成「参数错误」。
 CHAT_MODEL = "hy3"
 
+#: 400 之后的降级请求体。上游的 400 绝大多数不是账号问题，而是这个 body
+#: 里有它不认的字段：某个版本不认 `stream`、有的网关把 `max_tokens` 卡在
+#: 最小 16。带一版最朴素的再敲一次，能区分「参数问题」和「这个号真被拒了」。
+CHAT_BODY_FALLBACK = {
+    "model": CHAT_MODEL,
+    "messages": [{"role": "user", "content": "ping"}],
+    "max_tokens": 16,
+}
+
 #: 账号级风控的特征。
 #: 实测正文（两套措辞都来自生产）：
 #:   {"code":11140,"msg":"request illegal",
@@ -788,6 +797,39 @@ def _body_text(body: Any) -> str:
     return " ".join(parts)
 
 
+def _error_code(body: Any) -> str:
+    """取上游的错误码。只认结构化字段，不从正文里正则捞——捞错一个数字
+    就会把 400 解释成完全无关的原因。"""
+    if not isinstance(body, dict):
+        return ""
+    for key in ("code", "codeName", "errorCode", "errCode"):
+        value = body.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, str)) and str(value).strip():
+            return str(value).strip()
+    err = body.get("error")
+    if isinstance(err, dict):
+        for key in ("code", "type"):
+            value = err.get(key)
+            if isinstance(value, (int, str)) and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+#: 400 的已知成因。只收实测见过的码，猜同义词会把「参数问题」说成「封号」。
+BAD_REQUEST_HINTS = {
+    "11133": "模型名或参数不被接受",
+    "11134": "请求参数不合法",
+    "11135": "请求体缺字段",
+}
+
+
+def _clip(text: str, limit: int = 70) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "") -> dict:
     """发一次最小对话请求，判断这个号的对话链路还能不能用。
 
@@ -846,12 +888,23 @@ def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "") -> dict:
                 break  # 这个 base 连不通，换下一个
             if status == 404:
                 continue  # 路径不对，试另一个前缀
+            if status == 400:
+                # 先按最朴素的 body 再敲一次。能过就说明刚才那份带了它不认的
+                # 字段；过不了就把第一次的原话带出去（那是"上游为什么不收"
+                # 的唯一线索，换成我们的措辞只会更难查）。
+                retry_status, retry_payload = _post_json(
+                    url, dict(CHAT_BODY_FALLBACK), headers, timeout, proxy)
+                if retry_status != 400:
+                    return _read_chat_reply(retry_status, retry_payload, url, started)
             return _read_chat_reply(status, payload, url, started)
 
         if status == 0:
             continue
 
-    out.update(detail="所有对话端点都不可达" if not last_error else "上游不可达",
+    # 一个都没打通时把试过的地址写出来：用户要判断的是「是不是地址配错了」，
+    # 只说「不可达」等于让他自己去猜我们打的是哪。
+    bases = "、".join(_chat_bases(acc))
+    out.update(detail=f"对话端点都不可达：{bases}",
                raw=last_error[:200])
     out["latency_ms"] = int((time.time() - started) * 1000)
     return out
@@ -889,6 +942,23 @@ def _read_chat_reply(status: int, payload: Any, url: str, started: float) -> dic
         # 多半是内容审核或权限，不能算「仍被封」，也不能算解封。
         out.update(verdict=RECHECK_UNKNOWN,
                    detail="HTTP 403，但正文没有风控特征，无法判定")
+        return out
+
+    if status == 400:
+        # 400 是「上游收到了、但不认这份请求」，和账号状态无关：地址是通的
+        # （不通会是 0 / 超时），凭据也过鉴权了（不认会是 401）。真正的
+        # 起因几乎都在 body 或模型名上，所以把上游原话和错误码一起给出，
+        # 让人自己判断是模型换了还是网关加了必填字段。
+        code = _error_code(payload)
+        hint = BAD_REQUEST_HINTS.get(code, "请求体被上游拒绝")
+        said = _clip(text, 60)
+        # 「地址和凭据都通」这句不能省：看到 400 的人第一反应是地址填错了，
+        # 而这恰恰是这个状态码唯一能排除的东西（地址错是连不上，凭据错是 401）。
+        detail = (f"HTTP 400，{hint}" + (f"（{code}）" if code else "")
+                  + "；地址和凭据都通，不是账号状态")
+        if said:
+            detail += f"；上游：{said}"
+        out.update(verdict=RECHECK_UNKNOWN, detail=detail)
         return out
 
     if status == 429:

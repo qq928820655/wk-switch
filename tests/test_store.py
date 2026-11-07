@@ -511,6 +511,44 @@ class RiskImportTests(StoreTestBase):
         self.assertEqual(row["risk_src"], "import")
 
 
+class RiskMapTests(StoreTestBase):
+    """逐行标风控：`risk_map={uid: True/False}` 覆盖整批开关。
+
+    一批里混两个已知封号的号是常态，整批一个开关表达不了。同时 False 必须
+    是「显式正常」而不是「没意见」——用户点「标为正常」就是要把它从风控区
+    拿出来，这是唯一的手动出口。
+    """
+
+    def test_map_marks_single_row(self) -> None:
+        store.upsert([self.acc("u-m1", "甲"), self.acc("u-m2", "乙")],
+                     batch="b1", risk_map={"u-m1": True})
+        rows = {r["uid"]: r for r in store.list_accounts()}
+        self.assertEqual(rows["u-m1"]["recheck_state"], "banned")
+        self.assertEqual(rows["u-m1"]["risk_src"], "import")
+        self.assertEqual(rows["u-m2"]["recheck_state"], "")
+
+    def test_map_beats_batch_flag(self) -> None:
+        """整批标了风控，其中一行显式标正常 → 那一行不进风控区。"""
+        store.upsert([self.acc("u-m3", "甲"), self.acc("u-m4", "乙")],
+                     batch="b1", risk=True, risk_map={"u-m4": False})
+        rows = {r["uid"]: r for r in store.list_accounts()}
+        self.assertEqual(rows["u-m3"]["recheck_state"], "banned")
+        self.assertEqual(rows["u-m4"]["recheck_state"], "")
+
+    def test_explicit_normal_pulls_out_of_risk_area(self) -> None:
+        store.upsert([self.acc("u-m5", "甲")], batch="b1", risk=True)
+        self.assertEqual(store.list_accounts(track="banned")[0]["uid"], "u-m5")
+        store.upsert([self.acc("u-m5", "甲")], batch="b2", risk_map={"u-m5": False})
+        self.assertEqual(store.list_accounts(track="banned"), [])
+        self.assertEqual(store.list_accounts()[0]["risk_src"], "")
+
+    def test_no_map_keeps_existing_state(self) -> None:
+        """什么都没标时不能把已有的 banned 冲掉——重复导入是常事。"""
+        store.upsert([self.acc("u-m6", "甲")], batch="b1", risk=True)
+        store.upsert([self.acc("u-m6", "甲")], batch="b2")
+        self.assertEqual(store.list_accounts()[0]["recheck_state"], "banned")
+
+
 class ExitPortTests(StoreTestBase):
     """每行一个出口端口（0 = 直连）。复检实际走哪条线全靠它。"""
 

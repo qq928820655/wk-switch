@@ -73,8 +73,17 @@ try:
     if extra:
         cmd("Runtime.evaluate", expression=extra)
         time.sleep(WAIT)
-    cmd("Runtime.evaluate", expression="window.scrollTo(0,0)")
-    time.sleep(0.5)
+    # 第 9 个参数：截图前滚到某个选择器。长页面（导入页有三段卡片）不滚
+    # 就只能拍到头两屏，验收时看不到真正要改的那块。
+    focus_sel = sys.argv[9] if len(sys.argv) > 9 else ""
+    if focus_sel:
+        cmd("Runtime.evaluate", expression=(
+            "(()=>{const el=document.querySelector(" + repr(focus_sel) + ");"
+            "if(el) el.scrollIntoView({block:'start'});})()"))
+        time.sleep(0.6)
+    else:
+        cmd("Runtime.evaluate", expression="window.scrollTo(0,0)")
+        time.sleep(0.5)
     data = cmd("Page.captureScreenshot", format="png")
     open(out, "wb").write(base64.b64decode(data["data"]))
     print("saved", out)

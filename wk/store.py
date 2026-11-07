@@ -321,7 +321,7 @@ def _realm_of(acc: Account) -> str:
 
 
 def upsert(accounts: Iterable[Account], batch: str = "", source: str = "",
-           risk: bool = False) -> dict[str, Any]:
+           risk: bool = False, risk_map: dict[str, bool] | None = None) -> dict[str, Any]:
     """按 (uid, realm) 写入或更新。返回新增/更新/跳过的计数。
 
     同一批里出现同一 uid 两次时，后一条覆盖前一条——「导入顺序即优先级」，
@@ -333,15 +333,22 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "",
     `risk=True` 表示这批账号导入前就已知处于风控状态，直接进风控区。
     不传就是正常账号。
 
+    逐行覆盖用 `risk_map = {uid: True/False}`：True 把这行标成风控，False
+    把这行**从风控区拿出来**（导入页里单行点「正常」用的就是它）。没在表里
+    的行走整批的 `risk`。两种粒度并存是因为现实里两种都会出现：整批从风控
+    系统导出的，和一批里混了两三个已知封号的。
+
     **导入字段里的风控措辞不再决定名单状态。** 以前 `banned_hint_of` 一命中
     就把整条塞进 banned：来源系统备注里带一句「请求被拦截」，整批号都会被
     拖进风控区，正常号跟着一起被当风控处理。现在措辞只作为备注证据留档，
-    进不进风控区由调用方显式传 `risk`，或者由后续验证（复检 / 探针）写回。
+    进不进风控区由调用方显式传 `risk` / `risk_map`，或者由后续验证
+    （复检 / 探针）写回。
     """
     stats = {"total": 0, "inserted": 0, "updated": 0, "skipped": 0,
              "risk": 0, "items": []}
     batch = batch or "batch-" + clock.compact()
     now = _now()
+    marks = risk_map or {}
 
     with connect() as conn:
         for acc in accounts:
@@ -357,9 +364,12 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "",
             payload = json.dumps(acc.to_dict(), ensure_ascii=False)
             # 只当证据用，不再据此改状态
             hint = banned_hint_of(acc)
-            mark = "banned" if risk else ""
-            src = "import" if risk else ""
-            if risk:
+            # 逐行标记优先于整批开关；False 是「显式正常」，不是「没意见」
+            explicit = uid in marks
+            row_risk = bool(marks[uid]) if explicit else bool(risk)
+            mark = "banned" if row_risk else ""
+            src = "import" if row_risk else ""
+            if row_risk:
                 stats["risk"] += 1
 
             row = conn.execute(
@@ -381,19 +391,26 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "",
                      acc.access_token, acc.refresh_token, acc.device_token, state,
                      acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
                      source or acc.source, payload, now, now,
-                     mark, 0, 0, (hint[:200] or None) if risk else None,
+                     mark, 0, 0, (hint[:200] or None) if row_risk else None,
                      batch, now, batch, now, src),
                 )
                 stats["inserted"] += 1
                 action = "inserted"
             else:
-                # 已有状态优先，除非这一批明确标了风控。不能无条件用新值覆盖：
-                # 复检结果（revived / auth）比导入动作新，覆盖会把刚解封的号
-                # 重新打回 banned。
+                # 已有状态优先，除非这一批（或这一行）明确给了风控判断。不能
+                # 无条件用新值覆盖：复检结果（revived / auth）比导入动作新，
+                # 覆盖会把刚解封的号重新打回 banned。
                 current_track = (row["recheck_state"] or "") if "recheck_state" in row.keys() else ""
                 current_src = (row["risk_src"] or "") if "risk_src" in row.keys() else ""
-                new_track = "banned" if risk else current_track
-                new_src = "import" if risk else current_src
+                if explicit:
+                    # 用户在这一行上按了「风控」/「正常」，就是要把状态改过来，
+                    # 包括把 banned 清掉——这是唯一能手动移出风控区的入口。
+                    new_track = "banned" if row_risk else ""
+                    new_src = "import" if row_risk else ""
+                elif risk:
+                    new_track, new_src = "banned", "import"
+                else:
+                    new_track, new_src = current_track, current_src
                 # token 换了就作废旧的校验结果：同一 uid 重新扫码后拿到的是新
                 # 凭据，旧积分属于上一个 token，留着会让人以为「刚校验过」。
                 # token 没变（重复导入同一份文件）则保留，省一次上游查询。
@@ -402,7 +419,7 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "",
                           acc.access_token, acc.refresh_token, acc.device_token, state,
                           acc.expires_at, acc.domain, acc.enterprise_id, int(acc.enabled),
                           source or acc.source, payload, now,
-                          new_track, (hint[:200] or None) if risk else None,
+                          new_track, (hint[:200] or None) if row_risk else None,
                           batch, now, batch, now, new_src)
                 if same_token:
                     conn.execute(
@@ -443,6 +460,7 @@ def upsert(accounts: Iterable[Account], batch: str = "", source: str = "",
                 "realm": realm,
                 "action": action,
                 "state": state,
+                "risk": row_risk,
             })
 
         conn.execute(

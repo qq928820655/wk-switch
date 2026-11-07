@@ -109,12 +109,28 @@
       <h2>结果预览</h2>
       <span class="hint" id="preview-hint"></span>
     </div>
+
+    <div class="pick-bar" id="pick-bar">
+      <label class="check">
+        <input type="checkbox" id="pick-all-top"> 全选
+      </label>
+      <span class="pick-count" id="pick-count">没勾选，导出和留存按全部算</span>
+      <div class="pick-actions">
+        <button class="btn small" id="btn-pick-risk" disabled>标为风控</button>
+        <button class="btn small" id="btn-pick-safe" disabled>标为正常</button>
+        <button class="btn small danger" id="btn-pick-drop" disabled>删除勾选</button>
+        <button class="link" id="btn-pick-clear" disabled>取消勾选</button>
+      </div>
+    </div>
+
     <div class="table-wrap">
       <table class="grid" id="preview-table">
         <thead>
           <tr>
+            <th class="col-pick"><input type="checkbox" id="pick-all" title="全选 / 全不选"></th>
             <th>#</th><th>uid</th><th>昵称</th><th>账号</th><th>区域</th>
             <th>凭据状态</th><th>到期</th><th>AT</th><th>RT</th>
+            <th class="col-risk">风控</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -512,6 +528,7 @@
     </div>
 
     <div class="node-list" id="rc-nodes"></div>
+    <p class="hint" id="rc-bind-hint" hidden></p>
   </section>
 
   <section class="card">
@@ -586,6 +603,18 @@
 </main>
 
 <div class="toast" id="toast"></div>
+
+<!-- 端口换节点：卡片上的「改」放出来的浮层。
+     不放进卡片本身，是因为卡片是四列网格，塞个下拉会把端口号挤没。 -->
+<div class="bind-pop" id="bind-pop" hidden>
+  <div class="bind-head">
+    <b id="bind-title">端口</b>
+    <button class="link" id="bind-close" title="关闭">关闭</button>
+  </div>
+  <input type="search" class="bind-search" id="bind-search" placeholder="搜节点名 / 地区 / 住宅" spellcheck="false">
+  <p class="hint bind-note" id="bind-note"></p>
+  <div class="bind-list" id="bind-list"></div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

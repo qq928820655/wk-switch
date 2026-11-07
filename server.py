@@ -66,6 +66,9 @@ def _rows_for_ui(accounts: list[Account], limit: int = 200) -> list[dict]:
         state = tok.token_state(acc.access_token, acc.expires_at, acc.refresh_token)
         out.append({
             "index": index,
+            # key 是这一行的稳定标识，勾选 / 删除 / 逐行标风控全认它。
+            # 不能拿 index：勾掉一行之后后面的都往前挪，前端手里的下标就错位了。
+            "key": acc.ref or f"#{index}",
             "uid": acc.uid,
             "nickname": acc.nickname,
             "email": acc.email or acc.phone,
@@ -239,6 +242,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_parse(payload)
             elif path == "/api/convert":
                 self._api_convert(payload)
+            elif path == "/api/rows/drop":
+                self._api_rows_drop(payload)
             elif path == "/api/export":
                 self._api_export(payload)
             elif path == "/api/store/import":
@@ -263,6 +268,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._recheck_config_set(payload)
             elif path == "/api/recheck/nodes":
                 self._recheck_nodes(payload)
+            elif path == "/api/recheck/bind":
+                self._recheck_bind(payload)
             elif path == "/api/recheck/track":
                 self._recheck_track(payload)
             elif path == "/api/recheck/assign":
@@ -433,10 +440,17 @@ class Handler(BaseHTTPRequestHandler):
         if errors:
             notes.extend(errors[:20])
 
+        # 每行发一个会话内唯一的 ref。勾选、删除、逐行标风控都靠它定位——
+        # 用下标不行（删一行后面全错位），用 uid 也不行（keep_both 会给重复
+        # 项改 uid，改一次键就漂一次）。
+        for seq, acc in enumerate(accounts, 1):
+            acc.ref = f"r{seq}"
+
         job_id = _new_id()
         _gc()
         with _lock:
-            _jobs[job_id] = {"accounts": accounts, "created": time.time()}
+            _jobs[job_id] = {"accounts": accounts, "dropped": set(),
+                             "created": time.time()}
 
         self._json(200, {
             "ok": True,
@@ -449,15 +463,43 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _load_job(self, payload: dict) -> list[Account]:
+        return self._visible(self._job_of(payload))
+
+    def _job_of(self, payload: dict) -> dict:
         job_id = str(payload.get("job") or "")
         with _lock:
             job = _jobs.get(job_id)
         if not job:
             raise ValueError("会话已过期，请重新导入文件")
-        return job["accounts"]
+        return job
+
+    def _visible(self, job: dict) -> list[Account]:
+        """当前还活着的账号——导入后在预览里被删掉的不算。
+
+        删除只在本会话生效（`job["dropped"]`），不碰用户原始文件；重新导入
+        一次就全回来了。
+        """
+        dropped = job.get("dropped") or set()
+        if not dropped:
+            return list(job["accounts"])
+        return [a for a in job["accounts"] if a.ref not in dropped]
+
+    def _pick_keys(self, payload: dict, accounts: list[Account]) -> list[Account]:
+        """按前端勾选的 key 过滤。没勾就是全部。
+
+        勾选为空必须等同于「全选」而不是「一个都不要」：用户没动勾选框时
+        直接点导出是常态，那时候空集合意味着「没表态」。
+        """
+        keys = payload.get("keys")
+        if not isinstance(keys, list) or not keys:
+            return accounts
+        wanted = {str(k) for k in keys if str(k).strip()}
+        picked = [a for a in accounts if a.ref in wanted]
+        return picked
 
     def _api_convert(self, payload: dict) -> None:
-        accounts = self._load_job(payload)
+        job = self._job_of(payload)
+        accounts = self._visible(job)
         opts = payload.get("opts") or {}
         if not isinstance(opts, dict):
             raise ValueError("opts 必须是对象")
@@ -483,20 +525,50 @@ class Handler(BaseHTTPRequestHandler):
             "stats": pipeline.summarize(result.accounts),
         })
 
-    def _api_export(self, payload: dict) -> None:
-        job_id = str(payload.get("job") or "")
+    def _api_rows_drop(self, payload: dict) -> None:
+        """把勾选的行从本次会话里删掉，然后重跑一次转换。
+
+        只删会话里的副本，用户手里的文件不动。删空不报错：全删完是一个合法
+        状态（用户就是想清干净重导），这时候返回空表让界面自己显示「没有账号」。
+        """
+        job = self._job_of(payload)
+        keys = payload.get("keys") or []
+        if not isinstance(keys, list) or not keys:
+            raise ValueError("没有选中要删除的行")
+
+        opts = payload.get("opts") or job.get("opts") or {}
         with _lock:
-            job = _jobs.get(job_id)
-        if not job:
-            raise ValueError("会话已过期，请重新导入文件")
+            job["dropped"].update(str(k) for k in keys if str(k).strip())
+            job["created"] = time.time()
+
+        accounts = self._visible(job)
+        result = pipeline.convert(list(accounts), opts) if accounts else None
+        with _lock:
+            job["converted"] = result.accounts if result else []
+            job["opts"] = opts
+
+        self._json(200, {
+            "ok": True,
+            "removed": len(keys),
+            "remaining": len(accounts),
+            "kept": result.kept if result else 0,
+            "preview": _rows_for_ui(result.accounts if result else []),
+            "stats": pipeline.summarize(result.accounts if result else []),
+            "issues": [i.to_dict() for i in (result.issues if result else [])],
+        })
+
+    def _api_export(self, payload: dict) -> None:
+        job = self._job_of(payload)
 
         profile_id = str(payload.get("profile") or "")
         opts = payload.get("opts") or job.get("opts") or {}
         accounts = job.get("converted")
         if accounts is None:
-            accounts = pipeline.convert(list(job["accounts"]), opts).accounts
+            accounts = pipeline.convert(self._visible(job), opts).accounts
+        # 勾了就只导勾的那些，没勾就是全部——空集合表示「没表态」，不是「都不要」
+        accounts = self._pick_keys(payload, accounts)
         if not accounts:
-            raise ValueError("转换结果为空，没有可导出的账号")
+            raise ValueError("勾选的账号里没有可导出的内容")
 
         realm_mode = str(payload.get("realm") or "all")
         outputs = self._build_exports(accounts, profile_id, realm_mode)
@@ -567,22 +639,42 @@ class Handler(BaseHTTPRequestHandler):
         或者用户自己清楚），直接进风控区；不传就是正常账号。**只有这里和
         后续验证能决定一个号进不进风控区**，导入文件里的备注措辞不再自动
         判定——那条路径会把整批正常号一起拖进风控区。
+
+        `marks` 是逐行覆盖：`{行 key: true/false}`。true 把这行标成风控，
+        false 把这行从风控区拿出来。行级标记优先于整批的 `risk`——一批里
+        混了两个已知封号的号是常态，只给整批一个开关表达不了。
         """
-        accounts = self._load_job(payload)
+        job = self._job_of(payload)
         opts = payload.get("opts") or {}
-        result = pipeline.convert(list(accounts), opts)
-        if not result.accounts:
-            raise ValueError("转换结果为空，没有可留存的账号")
+        accounts = job.get("converted")
+        if accounts is None:
+            accounts = pipeline.convert(self._visible(job), opts).accounts
+        accounts = self._pick_keys(payload, accounts)
+        if not accounts:
+            raise ValueError("勾选的账号里没有可留存的记录")
 
         source = str(payload.get("source") or "wk-switch")
         risk = bool(payload.get("risk"))
+
+        # key → uid：库里按 (uid, realm) 认人，不认我们这边的会话 ref
+        marks = payload.get("marks") or {}
+        risk_map: dict[str, bool] = {}
+        if isinstance(marks, dict):
+            by_ref = {a.ref: a for a in accounts if a.ref}
+            for ref, flag in marks.items():
+                acc = by_ref.get(str(ref))
+                if acc is not None:
+                    risk_map[acc.uid] = bool(flag)
+
         batch = "import-" + clock.compact()
-        stats = store.upsert(result.accounts, batch=batch, source=source, risk=risk)
+        stats = store.upsert(accounts, batch=batch, source=source,
+                             risk=risk, risk_map=risk_map)
         self._json(200, {
             "ok": True,
             "batch": batch,
             "risk": risk,
             "risk_count": stats.get("risk", 0),
+            "marked": len(risk_map),
             "inserted": stats["inserted"],
             "updated": stats["updated"],
             "skipped": stats["skipped"],
@@ -989,6 +1081,29 @@ class Handler(BaseHTTPRequestHandler):
             data["custom_nodes"] = nodes
             data["custom_ok"] = sum(1 for n in nodes if n.get("ok"))
         self._json(200, {"ok": True, **data})
+
+    def _recheck_bind(self, payload: dict) -> None:
+        """把一个节点钉到指定端口（就是卡片上的「改节点」）。
+
+        走池子自己的 `POST /api/v1/ports/bind`：它把「节点 → 端口」写进
+        `port_pins` 并立即重排，重载也不丢。绑定后端口映射可能整体挪动
+        （池子会重排没 pin 的节点），所以这里顺手把整张表重拉一遍再返回，
+        前端拿到的就是绑定之后的真实状态，不用自己猜。
+        """
+        cfg = recheck.load_config()
+        try:
+            port = int(payload.get("port") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("port 需要是端口号") from None
+        if not (0 < port < 65536):
+            raise ValueError("port 超出范围")
+        node = str(payload.get("node") or "").strip()
+        if not node:
+            raise ValueError("没指定节点")
+
+        res = recheck.bind_port(cfg, port, node)
+        data = recheck.discover_nodes(cfg, probe_now=False)
+        self._json(200, {"ok": True, **res, **data})
 
     def _recheck_assign(self, payload: dict) -> None:
         """按当前模式把端口分给名单里的账号。

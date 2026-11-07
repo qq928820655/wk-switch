@@ -170,6 +170,16 @@ class Account:
     profile_raw: Any = None
     env_line: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    #: 会话内稳定引用。导入时按行序打上 `r1` `r2`…，之后勾选、删除、逐行
+    #: 标记都认它。**不能拿 uid 当键**：`keep_both` 会给重复项改 uid（加
+    #: `-2` 后缀），改一次键就漂一次，用户勾好的行会突然对不上。
+    #: 这个字段不进 `to_dict()`，所以不会出现在任何导出文件里。
+    ref: str = ""
+    #: 进管线之前的原始 uid。`keep_both` 是原地改 uid 的，而导入页里每改一个
+    #: 选项就会重跑一遍 convert——没有这个基座，第二次跑会把 `x-2` 当成新
+    #: 的原始 uid 再加一层后缀，跑几次就叠成 `x-2-2-2`。
+    #: 同样不进 `to_dict()`。
+    base_uid: str = ""
 
     # ---- 派生属性 -------------------------------------------------
     @property
@@ -193,6 +203,11 @@ class Account:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        # ref / base_uid 是给界面认行和管线幂等用的，不属于账号数据。漏在
+        # 导出里会让目标项目多出两个谁也不认识的字段，也可能被别家当成 uid
+        # 的替代品读走。
+        data.pop("ref", None)
+        data.pop("base_uid", None)
         data["has_token"] = self.has_token
         data["is_envelope"] = self.is_envelope
         data["is_api_key"] = self.is_api_key

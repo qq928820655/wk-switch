@@ -14,6 +14,13 @@ const state = {
   converted: false,
   busy: false,
   profiles: [],
+  // 预览表里当前显示的行（服务端只给前 200 条），勾选/风控都按 key 认
+  rows: [],
+  // 勾选的行 key。空集合 = 「没表态」，导出和留存时按全部处理
+  picked: new Set(),
+  // {key: true/false}。true=风控，false=显式正常（把它从风控区拿出来）。
+  // 没有这个键 = 跟随「这批是风控账号」那个整批开关。
+  marks: new Map(),
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -188,10 +195,78 @@ function renderStats(stats) {
 
 /* ---------- 预览表 ---------- */
 
+/** 一行的风控标记该怎么显示。
+ *  三态：没标过（跟随整批）、标了风控、标了正常。 */
+function riskChip(r) {
+  const mark = state.marks.get(r.key);
+  if (mark === true) {
+    return '<button class="risk-chip on" data-risk-key="' + esc(r.key) +
+      '" title="已标为风控。点一下改成「正常」，再点回「跟随整批」">风控</button>';
+  }
+  if (mark === false) {
+    return '<button class="risk-chip safe" data-risk-key="' + esc(r.key) +
+      '" title="已标为正常：即使勾了「这批是风控账号」，这一行也不会进风控区">正常</button>';
+  }
+  return '<button class="risk-chip" data-risk-key="' + esc(r.key) +
+    '" title="跟随下面的「这批是风控账号」。点一下标为风控，再点标为正常，第三次取消">—</button>';
+}
+
+/** 风控标记的循环顺序：跟随整批 → 风控 → 正常 → 跟随整批。
+ *  不做「点一下直接切两态」是因为「跟随整批」本身是一个有意义的选项：
+ *  用户给整批勾了风控，个别号标成正常，剩下的还得跟着整批走。 */
+function cycleRisk(key) {
+  const cur = state.marks.get(key);
+  if (cur === undefined) state.marks.set(key, true);
+  else if (cur === true) state.marks.set(key, false);
+  else state.marks.delete(key);
+  renderPreview(state.rows, state.total);
+}
+
+function riskPayload() {
+  const out = {};
+  state.marks.forEach((flag, key) => { out[key] = !!flag; });
+  return out;
+}
+
+function selectedKeys() {
+  return [...state.picked];
+}
+
+/** 勾选状态变了就重画那一行的底色和上下两个全选框。 */
+function refreshPickBar() {
+  const total = state.rows.length;
+  const n = state.picked.size;
+  const label = $('#pick-count');
+  if (label) {
+    label.textContent = n
+      ? `已勾选 ${n} 条，导出和留存只处理这 ${n} 条`
+      : `没勾选，导出和留存按全部 ${total} 条算`;
+    label.classList.toggle('on', n > 0);
+  }
+
+  ['#pick-all', '#pick-all-top'].forEach((sel) => {
+    const box = $(sel);
+    if (!box) return;
+    box.checked = n > 0 && n >= total;
+    // 半选：浏览器只在 JS 里给了这个属性，HTML 没有对应写法
+    box.indeterminate = n > 0 && n < total;
+  });
+
+  const has = n > 0;
+  ['#btn-pick-risk', '#btn-pick-safe', '#btn-pick-drop', '#btn-pick-clear']
+    .forEach((sel) => { const b = $(sel); if (b) b.disabled = !has; });
+}
+
 function renderPreview(rows, total) {
+  state.rows = rows || [];
+  state.total = total || 0;
   const body = $('#preview-table tbody');
-  body.innerHTML = rows.map((r) => `
-    <tr>
+  body.innerHTML = state.rows.map((r) => {
+    const on = state.picked.has(r.key);
+    return `
+    <tr data-key="${esc(r.key)}" class="${on ? 'picked' : ''}">
+      <td class="col-pick"><input type="checkbox" class="pick-box" ${on ? 'checked' : ''}
+        aria-label="勾选第 ${r.index} 条"></td>
       <td class="mono">${r.index}</td>
       <td class="mono" title="${esc(r.uid)}">${esc(r.uid)}</td>
       <td>${esc(r.nickname) || '<span class="hint">—</span>'}</td>
@@ -201,11 +276,58 @@ function renderPreview(rows, total) {
       <td class="mono col-exp">${esc(r.expires) || '—'}</td>
       <td class="mono">${esc(r.at)}</td>
       <td>${r.rt ? '<span class="pill ok">有</span>' : '<span class="hint">—</span>'}</td>
-    </tr>`).join('');
+      <td class="col-risk">${riskChip(r)}</td>
+    </tr>`;
+  }).join('');
 
-  $('#preview-hint').textContent = total > rows.length
-    ? `显示前 ${rows.length} 条，共 ${total} 条`
+  $('#preview-hint').textContent = total > state.rows.length
+    ? `显示前 ${state.rows.length} 条，共 ${total} 条`
     : `共 ${total} 条`;
+
+  refreshPickBar();
+  refreshExportHint();
+}
+
+/** 导出提示里带上条数：没勾是全部，勾了就只有勾的那些。
+ *  用户问「到底导了几条」时，答案得先在按钮旁边写着。 */
+function refreshExportHint() {
+  const el = $('#export-hint');
+  if (!el || !state.profile) return;
+  const p = state.profiles.find((x) => x.id === state.profile);
+  const n = state.picked.size || state.total || 0;
+  const scope = state.picked.size ? `勾选的 ${n} 条` : `全部 ${n} 条`;
+  el.textContent = `将生成：${p ? p.name : ''}（${scope}）`;
+}
+
+/** 删除勾选的行。
+ *
+ *  删的是**这次会话里的副本**，用户拖进来的文件一个字节都不动——重新导入
+ *  一次就全回来了。所以这里不需要「删了就找不回」的强确认，但仍要问一句：
+ *  勾错一行就点下去的话，后面整段导出都少一个号。 */
+async function dropPicked() {
+  if (!state.job || !state.picked.size) return;
+  const keys = [...state.picked];
+  if (!confirm(`把勾选的 ${keys.length} 条从这次导入里删掉？\n\n只删会话里的副本，你手上的文件不动。`)) {
+    return;
+  }
+  try {
+    const data = await api('/api/rows/drop', {
+      job: state.job, keys, opts: collectOpts(),
+    });
+    state.picked.clear();
+    // 删掉的行连同它的风控标记一起清：key 是序号，留着会贴到下一批复用
+    // 同一批 key 的号上。
+    keys.forEach((k) => state.marks.delete(k));
+    renderPreview(data.preview || [], data.kept || 0);
+    renderStats(data.stats);
+    renderIssues(data.issues || []);
+    $('#convert-count').textContent = data.kept
+      ? `删掉 ${data.removed} 条 · 保留 ${data.kept} 条`
+      : '这次导入里已经没有账号了';
+    toast(`已删除 ${data.removed} 条，还剩 ${data.kept} 条`);
+  } catch (err) {
+    toast(err.message, true);
+  }
 }
 
 /* ---------- 问题清单 ---------- */
@@ -273,6 +395,11 @@ async function submitFiles(payload) {
     state.job = data.job;
     state.converted = false;
     state.profile = null;
+    // 换了一批文件，上一批的勾选和风控标记全部作废：key 是 `r1` `r2` 这种
+    // 序号，跨批复用会把标记贴到完全不相关的账号上。
+    state.picked.clear();
+    state.marks.clear();
+    state.total = data.total || 0;
 
     $('#sources').innerHTML = data.sources.map((s) => `
       <div class="src-chip">
@@ -361,8 +488,7 @@ async function loadProfiles() {
       el.classList.add('sel');
       state.profile = el.dataset.id;
       $('#btn-export').disabled = false;
-      const p = state.profiles.find((x) => x.id === state.profile);
-      $('#export-hint').textContent = `将生成：${p ? p.name : ''}`;
+      refreshExportHint();
     });
   });
 }
@@ -381,6 +507,8 @@ async function doExport() {
       profile: state.profile,
       realm: realmOf('export-realm'),
       opts: collectOpts(),
+      // 勾了就只导勾的；空数组表示没表态，服务端按全部处理
+      keys: selectedKeys(),
     });
     $('#downloads').innerHTML = data.files.map((f) => `
       <div class="dl">
@@ -811,11 +939,15 @@ async function saveToStore() {
   try {
     const data = await api('/api/store/import', {
       job: state.job, opts: collectOpts(), risk,
+      // 同上：勾选的才有份。marks 是逐行风控判断，覆盖整批的 risk
+      keys: selectedKeys(),
+      marks: riskPayload(),
     });
     const parts = [`新增 ${data.inserted}`, `更新 ${data.updated}`];
     if (data.skipped) parts.push(`跳过 ${data.skipped}`);
     // 风控批次要明说「进了哪」，否则用户以为存进正常区了
     if (data.risk) parts.push(`风控 ${data.risk_count || data.inserted + data.updated}`);
+    if (data.marked) parts.push(`逐行标记 ${data.marked} 条`);
     toast(`已留存：${parts.join(' · ')}`);
     storeState.loaded = false;
     storeState.batch = '';
@@ -1351,6 +1483,9 @@ const recheckState = {
   picked: new Set(),
   //: 上一轮是「测过」还是「没测」，重渲染卡片时要原样传回去
   probed: false,
+  //: 池子里的全部节点（含没分到端口的），卡片上的「改」用它列候选。
+  //: {ok, nodes: [{name, port, delay_ms, pinned, kind}], error}
+  pool: null,
 };
 
 async function loadRecheck() {
@@ -1410,7 +1545,7 @@ function fillRecheckForm(cfg, disc) {
     }
     $('#rc-detect-hint').textContent = line;
     $('#rc-detect-hint').classList.toggle('bad', disc.probed && !disc.named);
-    renderNodes(disc.nodes || [], disc.probed);
+    renderNodes(disc.nodes || [], disc.probed, disc.pool);
   }
 }
 
@@ -1429,9 +1564,12 @@ function currentExitMode() {
   return on ? on.value : 'random';
 }
 
-function renderNodes(nodes, probed) {
+function renderNodes(nodes, probed, pool) {
   recheckState.nodes = nodes || [];
   recheckState.probed = !!probed;
+  // pool 传 undefined 表示「这次没带」，保留上一次的候选表——重渲染卡片
+  // 不该把已经拿到的节点列表清空。
+  if (pool !== undefined) recheckState.pool = pool || null;
   const box = $('#rc-nodes');
   if (!recheckState.nodes.length) {
     box.innerHTML = '<p class="hint">没有配置端口</p>';
@@ -1596,8 +1734,136 @@ function nodeRows(nodes, probed) {
     const attr = portNum
       ? ` data-port="${portNum}" role="button" tabindex="0" aria-pressed="${on}"`
       : '';
-    return `<div class="${cls.join(' ')}" title="${esc(tip)}"${attr}>${portCell}${nameCell}${kindCell}${tail}</div>`;
+    // 「改」只在池面板可用时才给：没有候选表，点开也是一片空白。
+    // 也不能给 data-port——那会让外层的点卡片选中逻辑截走这次点击。
+    const canBind = portNum && recheckState.pool && recheckState.pool.ok;
+    const bindBtn = canBind
+      ? `<button class="node-bind" data-bind-port="${portNum}" title="给 ${portNum} 换个节点">改</button>`
+      : '';
+    return `<div class="${cls.join(' ')}" title="${esc(tip)}"${attr}>${portCell}${nameCell}${kindCell}${tail}${bindBtn}</div>`;
   }).join('');
+}
+
+/* ---------- 端口换节点 ---------- */
+
+const bindState = { port: 0, anchor: null };
+
+/** 卡片上的「改」：列出池子里测通的节点，点一个就钉到这个端口。
+ *
+ *  为什么不用 <select> 直接塞卡片里：卡片是四列网格，宽度按最长的节点名
+ *  算过，再塞个下拉会把端口号挤成两行。浮层还能带搜索——池子里几百个节点
+ *  时，原生下拉只能滚。 */
+function openBindPop(port, anchor) {
+  const pop = $('#bind-pop');
+  const pool = recheckState.pool;
+  const node = recheckState.nodes.find((n) => Number(n.port) === port);
+
+  bindState.port = port;
+  bindState.anchor = anchor;
+  $('#bind-title').textContent = `端口 ${port}` + (node && node.name ? ` · ${node.name}` : '');
+  $('#bind-search').value = '';
+
+  if (!pool || !pool.ok) {
+    $('#bind-note').textContent = (pool && pool.error)
+      ? `改不了：${pool.error}`
+      : '改不了：没连上池面板（填上地址和 MPOOL_TOKEN，或先点「自动检测」）';
+    $('#bind-list').innerHTML = '';
+  } else {
+    const usable = (pool.nodes || []).filter((n) => n.delay_ms != null);
+    $('#bind-note').textContent =
+      `池子里 ${(pool.nodes || []).length} 个节点，其中 ${usable.length} 个测通了；点一个就钉到这个端口`;
+    renderBindList('');
+  }
+
+  pop.hidden = false;
+  positionBindPop(anchor);
+  if (pool && pool.ok) $('#bind-search').focus();
+}
+
+function positionBindPop(anchor) {
+  const pop = $('#bind-pop');
+  const rect = anchor.getBoundingClientRect();
+  const w = pop.offsetWidth || 300;
+  const h = pop.offsetHeight || 320;
+  // 贴着按钮下方；下面放不下就翻到上方。左右都夹在视口里，卡片在最右列
+  // 时浮层不会跑出屏幕。
+  const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - w - 12));
+  let top = rect.bottom + 6;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, rect.top - h - 6);
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function closeBindPop() {
+  $('#bind-pop').hidden = true;
+  bindState.port = 0;
+  bindState.anchor = null;
+}
+
+function renderBindList(q) {
+  const box = $('#bind-list');
+  const pool = recheckState.pool;
+  if (!pool || !pool.ok) return;
+
+  const kw = String(q || '').trim().toLowerCase();
+  const rows = (pool.nodes || [])
+    // 只列测通的：没测过（delay_ms=null）的钉上去大概率不通，摆出来只会
+    // 让人一条条试。要重新测就点「自动检测」。
+    .filter((n) => n.delay_ms != null)
+    .filter((n) => !kw
+      || String(n.name || '').toLowerCase().includes(kw)
+      || String(n.kind || '').toLowerCase().includes(kw))
+    // 空闲的排前面：占用中的节点钉过去会被池子拒绝（端口冲突），
+    // 排在后面让人先看到能用的
+    .sort((a, b) => (a.port ? 1 : 0) - (b.port ? 1 : 0) || a.delay_ms - b.delay_ms);
+
+  if (!rows.length) {
+    box.innerHTML = '<p class="hint">没有匹配的可联通节点。先在池面板里测一轮，或换个关键词。</p>';
+    return;
+  }
+
+  box.innerHTML = rows.slice(0, 300).map((n) => {
+    const cur = Number(n.port) === bindState.port;
+    const meta = [
+      n.kind,
+      n.port ? `占 ${n.port}` : '空闲',
+      `${n.delay_ms} ms`,
+    ].filter(Boolean).join(' · ');
+    return `<button class="bind-item${cur ? ' cur' : ''}" data-node="${esc(n.name)}">
+      <span class="bind-name">${esc(n.name)}</span>
+      <span class="bind-meta">${esc(meta)}</span>
+    </button>`;
+  }).join('');
+}
+
+async function doBind(name) {
+  const port = bindState.port;
+  if (!port || !name) return;
+  const cur = recheckState.nodes.find((n) => Number(n.port) === port);
+  if (cur && (cur.name || '') === name) {
+    toast(`端口 ${port} 本来就走 ${name}`);
+    closeBindPop();
+    return;
+  }
+  try {
+    const data = await api('/api/recheck/bind', { port, node: name });
+    // 绑定后池子会重排其它节点，端口映射可能整体变了，所以整张表要重画，
+    // 不能只改这一张卡片。
+    renderNodes(data.nodes || [], data.probed, data.pool);
+    syncExitSelects();
+    closeBindPop();
+    // 占用者被挪走这件事必须说出来：不说的话，用户下次看到端口表里
+    // 某个节点换了位置会以为是程序乱排
+    if (data.moved) {
+      toast(`端口 ${port} 已改走 ${name}；${data.moved.node} 挪到 ${data.moved.to}`);
+    } else {
+      toast(`端口 ${port} 已改走 ${name}`);
+    }
+  } catch (err) {
+    // 池子的拒绝理由（端口被谁占了 / 节点不存在）比任何转述都准，原样显示
+    $('#bind-note').textContent = err.message;
+    toast(err.message, true);
+  }
 }
 
 function renderTrackCounts(stats) {
@@ -1725,7 +1991,7 @@ async function detectNodes() {
     }
     $('#rc-detect-hint').textContent = line;
     $('#rc-detect-hint').classList.toggle('bad', !data.named || !data.ok_count);
-    renderNodes(data.nodes || [], true);
+    renderNodes(data.nodes || [], true, data.pool);
   } catch (err) {
     // 以前这里没有 catch：接口 500 时按钮恢复、提示停在「正在检测…」，
     // 看起来像卡死。
@@ -1877,6 +2143,55 @@ function bind() {
 
   $('#btn-export').addEventListener('click', doExport);
 
+  /* --- 预览表的勾选 / 风控 / 删除 --- */
+  // 全选框有两个（表头和工具栏），行为一致：勾上 = 当前显示的全选
+  ['#pick-all', '#pick-all-top'].forEach((sel) => {
+    const box = $(sel);
+    if (!box) return;
+    box.addEventListener('change', () => {
+      state.picked.clear();
+      if (box.checked) state.rows.forEach((r) => state.picked.add(r.key));
+      renderPreview(state.rows, state.total);
+    });
+  });
+
+  // 行内勾选：委托，因为 tbody 每次都是重建的
+  $('#preview-table').addEventListener('change', (e) => {
+    const box = e.target.closest('.pick-box');
+    if (!box) return;
+    const tr = box.closest('tr');
+    const key = tr && tr.dataset.key;
+    if (!key) return;
+    if (box.checked) state.picked.add(key);
+    else state.picked.delete(key);
+    tr.classList.toggle('picked', box.checked);
+    refreshPickBar();
+  });
+
+  // 风控列：点一下循环「跟随整批 → 风控 → 正常」
+  $('#preview-table').addEventListener('click', (e) => {
+    const chip = e.target.closest('.risk-chip');
+    if (!chip) return;
+    cycleRisk(chip.dataset.riskKey);
+  });
+
+  // 批量给勾选的行打标记
+  $('#btn-pick-risk').addEventListener('click', () => {
+    state.picked.forEach((key) => state.marks.set(key, true));
+    renderPreview(state.rows, state.total);
+    toast(`已把 ${state.picked.size} 条标为风控`);
+  });
+  $('#btn-pick-safe').addEventListener('click', () => {
+    state.picked.forEach((key) => state.marks.set(key, false));
+    renderPreview(state.rows, state.total);
+    toast(`已把 ${state.picked.size} 条标为正常`);
+  });
+  $('#btn-pick-clear').addEventListener('click', () => {
+    state.picked.clear();
+    renderPreview(state.rows, state.total);
+  });
+  $('#btn-pick-drop').addEventListener('click', dropPicked);
+
   /* --- 视图切换 --- */
   document.querySelectorAll('.tab').forEach((tab) => {
     tab.addEventListener('click', () => switchView(tab.dataset.view));
@@ -1922,6 +2237,14 @@ function bind() {
   });
   // 点卡片选端口：事件委托，卡片是 innerHTML 重建的，逐张绑会丢
   $('#rc-nodes').addEventListener('click', (e) => {
+    // 「改」按钮在卡片里面，必须拦在选中逻辑之前：它没有 data-port，
+    // 但 closest('.node[data-port]') 会顺着往上找到外层卡片。
+    const bind = e.target.closest('.node-bind');
+    if (bind) {
+      e.stopPropagation();
+      openBindPop(Number(bind.dataset.bindPort), bind);
+      return;
+    }
     const card = e.target.closest('.node[data-port]');
     if (!card) return;
     togglePort(card.dataset.port).catch((err) => toast(err.message, true));
@@ -1959,6 +2282,30 @@ function bind() {
   $('#btn-rc-sel-clear').addEventListener('click', () => {
     recheckState.selected.clear();
     renderRecheckTable();
+  });
+
+  /* --- 端口换节点浮层 --- */
+  $('#bind-close').addEventListener('click', closeBindPop);
+  $('#bind-search').addEventListener('input', (e) => renderBindList(e.target.value));
+  $('#bind-list').addEventListener('click', (e) => {
+    const item = e.target.closest('.bind-item');
+    if (!item) return;
+    doBind(item.dataset.node);
+  });
+  // 点别处 / 按 Esc 收起。用捕获阶段，免得被页面里别的 stopPropagation 挡掉
+  document.addEventListener('mousedown', (e) => {
+    const pop = $('#bind-pop');
+    if (pop.hidden) return;
+    if (pop.contains(e.target)) return;
+    if (bindState.anchor && bindState.anchor.contains(e.target)) return;
+    closeBindPop();
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('#bind-pop').hidden) closeBindPop();
+  });
+  // 窗口尺寸变了浮层会错位，直接收起来最省事
+  window.addEventListener('resize', () => {
+    if (!$('#bind-pop').hidden) closeBindPop();
   });
   $('#btn-rc-add').addEventListener('click', () => {
     const id = Number($('#rc-add-select').value);
