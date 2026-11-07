@@ -220,6 +220,8 @@
       <div class="sel-actions">
         <button class="btn small" id="btn-sel-probe" disabled>校验选中</button>
         <button class="btn small" id="btn-sel-export" disabled>导出选中</button>
+        <button class="btn small" id="btn-sel-risk" disabled title="把选中的号直接移进「封号中」名单，不用重新导入">标为风控</button>
+        <button class="btn small ghost" id="btn-sel-unrisk" disabled title="把选中的号移出复检名单，回到正常账号">移出风控</button>
         <button class="btn small danger" id="btn-sel-delete" disabled>删除选中</button>
         <button class="link" id="btn-sel-clear" disabled>取消</button>
       </div>
@@ -600,9 +602,15 @@
   <section class="card">
     <div class="card-head">
       <h2>把账号加进名单</h2>
-      <span class="hint">导入时勾了「这批是风控账号」的直接进来；这里补手工发现的</span>
+      <span class="hint">加入的是上面选中的那一档（默认「封号中」）；在别的档里的号也能选，选了就挪过来</span>
     </div>
     <div class="export-bar">
+      <label class="search-box rc-add-search-box">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
+        </svg>
+        <input type="search" id="rc-add-search" placeholder="先搜名称 / uid / 邮箱，再选账号">
+      </label>
       <select id="rc-add-select" class="rc-pick">
         <option value="">从账户库里选一个账号…</option>
       </select>

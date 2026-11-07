@@ -654,5 +654,135 @@ class GroupPortsTests(StoreTestBase):
         self.assertEqual(store.exit_ports_in_use("normal"), {17960})
 
 
+class PickerRowsTests(StoreTestBase):
+    """复检页「把账号加进名单」下拉：跨档可见、大库可搜、挪进去查得到。"""
+
+    def _ids(self):
+        return {r["uid"]: r["id"] for r in store.list_accounts()}
+
+    def test_other_tracks_stay_selectable(self):
+        """只在目标档里排除：待复检 / 正常账号都要能选进封号中。"""
+        store.upsert([self.acc("u-p1", "甲"), self.acc("u-p2", "乙"),
+                      self.acc("u-p3", "丙")])
+        ids = self._ids()
+        store.set_track([ids["u-p2"]], "pending")
+        store.set_track([ids["u-p3"]], "banned")
+
+        got = store.picker_rows("banned")
+        self.assertEqual({r["id"] for r in got}, {ids["u-p1"], ids["u-p2"]})
+        labels = {r["id"]: r["state_label"] for r in got}
+        self.assertEqual(labels[ids["u-p1"]], "正常账号")
+        self.assertEqual(labels[ids["u-p2"]], "待复检")
+        # 切到待复检档时，封号中的号也要能挪过来
+        self.assertIn(ids["u-p3"], {r["id"] for r in store.picker_rows("pending")})
+
+    def test_move_from_normal_to_banned_is_visible(self):
+        """用户报的现象：正常号标成风控后，封号中这一档必须查得到。"""
+        store.upsert([self.acc("u-m1", "挪过来的号")])
+        rid = store.list_accounts()[0]["id"]
+        store.set_track([rid], "banned", "手工加入")
+        self.assertEqual([r["id"] for r in store.list_accounts(track="banned")], [rid])
+        self.assertEqual(store.recheck_ids(), [rid])
+        self.assertEqual(store.normal_ids(), [])
+        # 已经在目标档，下拉里不必重复列
+        self.assertNotIn(rid, {r["id"] for r in store.picker_rows("banned")})
+
+    def test_search_finds_accounts_past_default_limit(self):
+        """账户库默认只给 500 行，下拉不能把老号弄丢。"""
+        bulk = [self.acc(f"u-bulk-{i}", f"批量-{i:04d}") for i in range(505)]
+        bulk.append(self.acc("u-old", "老号-尾巴"))
+        store.upsert(bulk)
+        self.assertGreater(len(store.list_accounts(limit=5000)), 500)
+        got = store.picker_rows("banned", query="老号-尾巴")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["name"], "老号-尾巴")
+
+    def test_retrack_from_revived_resets_counter(self):
+        """从「已解封」划回名单要清零计数，否则刚加就被最小间隔跳过。"""
+        store.upsert([self.acc("u-rt1", "甲")])
+        rid = store.list_accounts()[0]["id"]
+        store.set_track([rid], "banned")
+        with store.connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET recheck_state='revived', recheck_count=7, "
+                "recheck_at=12345 WHERE id=?", (rid,))
+        store.set_track([rid], "banned")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["recheck_state"], "banned")
+        self.assertEqual(row["recheck_count"], 0)
+        self.assertEqual(row["recheck_at"], 0)
+
+
+class RecheckApiTests(StoreTestBase):
+    """直接调 Handler 的取数方法，验证 URL / payload 参数解析，不启 HTTP 服务。"""
+
+    def _ids(self):
+        return {r["uid"]: r["id"] for r in store.list_accounts()}
+
+    def _call_get(self, method: str, path: str):
+        import server
+
+        class Fake:
+            def __init__(self, p):
+                self.path = p
+                self.out = None
+
+            def _json(self, status, payload):
+                self.out = (status, payload)
+
+        fake = Fake(path)
+        getattr(server.Handler, method)(fake)
+        return fake.out
+
+    def _call_post(self, method: str, payload: dict):
+        import server
+
+        class Fake:
+            def __init__(self):
+                self.out = None
+
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        fake = Fake()
+        getattr(server.Handler, method)(fake, payload)
+        return fake.out
+
+    def test_picker_route_uses_requested_track_and_query(self):
+        store.upsert([self.acc("u-a1", "甲"), self.acc("u-a2", "乙")])
+        ids = self._ids()
+        store.set_track([ids["u-a1"]], "pending")
+
+        status, data = self._call_get(
+            "_recheck_picker", "/api/recheck/picker?track=pending")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["track"], "pending")
+        self.assertEqual({r["id"] for r in data["rows"]}, {ids["u-a2"]})
+
+        status, data = self._call_get(
+            "_recheck_picker", "/api/recheck/picker?track=banned&q=乙")
+        self.assertEqual(status, 200)
+        self.assertEqual({r["id"] for r in data["rows"]}, {ids["u-a2"]})
+
+    def test_track_route_returns_rows_of_requested_track(self):
+        """加进哪一档，响应就给哪一档的表，界面不用再猜。"""
+        store.upsert([self.acc("u-a3", "甲"), self.acc("u-a4", "乙")])
+        ids = self._ids()
+        status, data = self._call_post("_recheck_track", {
+            "ids": [ids["u-a3"]], "state": "pending", "track": "pending",
+            "note": "手工加入",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["track"], "pending")
+        self.assertEqual([r["id"] for r in data["rows"]], [ids["u-a3"]])
+        self.assertEqual(store.list_accounts(track="banned"), [])
+
+        status, data = self._call_post("_recheck_track", {
+            "ids": [ids["u-a3"]], "state": "banned", "track": "banned",
+        })
+        self.assertEqual(data["track"], "banned")
+        self.assertEqual([r["id"] for r in data["rows"]], [ids["u-a3"]])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -934,8 +934,30 @@ function refreshSelBar() {
   $('#sel-count').textContent = picked ? `已选 ${picked} 条` : '未选择';
   $('#btn-sel-probe').disabled = picked === 0;
   $('#btn-sel-export').disabled = picked === 0;
+  $('#btn-sel-risk').disabled = picked === 0;
+  $('#btn-sel-unrisk').disabled = picked === 0;
   $('#btn-sel-delete').disabled = picked === 0;
   $('#btn-sel-clear').disabled = picked === 0;
+}
+
+/** 账户库里直接把选中的号移进 / 移出风控区。
+ *  以前只能绕「重新导入 → 逐行标风控 → 保存」，中间任何一步没勾到，
+ *  号就留在正常区而不在名单里。这里按行 id 改，落库后立刻重画。 */
+async function setStoreRisk(state) {
+  const ids = [...storeState.selected];
+  if (!ids.length) return;
+  try {
+    const data = await api('/api/recheck/track', {
+      ids, state, note: state ? '账户库标记' : '', track: 'banned',
+    });
+    storeState.selected.clear();
+    await loadStore();
+    toast(state
+      ? `已标为风控：${data.changed} 条，在复检名单「封号中」这一档`
+      : `已移出风控：${data.changed} 条`);
+  } catch (err) {
+    toast(err.message, true);
+  }
 }
 
 function toggleSelect(id, on) {
@@ -1654,13 +1676,16 @@ const recheckState = {
 };
 
 async function loadRecheck() {
+  // 下拉只认档位，不依赖设置和节点表：先发出去，别等 config / list 两个
+  // 串行请求都回来才填。首屏空下拉会被读成「号没了」。
+  const picker = loadRecheckPicker();
   const data = await apiGet('/api/recheck/config');
   if (!data.ok) throw new Error(data.error || '读取复检设置失败');
   recheckState.cfg = data.config;
   fillRecheckForm(data.config, data.nodes);
   renderTrackCounts(data.stats);
   await loadRecheckRows();
-  loadRecheckPicker();
+  await picker;
 }
 
 async function loadRecheckRows() {
@@ -2228,23 +2253,36 @@ async function runRecheck(force, ids) {
 async function trackSelected(state) {
   const ids = [...recheckState.selected];
   if (!ids.length) return;
-  const data = await api('/api/recheck/track', { ids, state });
+  const data = await api('/api/recheck/track', { ids, state, track: recheckState.track });
   recheckState.selected.clear();
   renderTrackCounts(data.stats);
   await loadRecheckRows();
   toast(state ? `已加入名单：${data.changed} 条` : `已移出名单：${data.changed} 条`);
 }
 
-/* 手工把某个号拖进名单：下拉里列出全部账号，选一个加 */
+/* 手工把某个号拖进名单：下拉里列出「可加入当前档」的账号。
+   只排除已经在目标档里的号，在别的档里的号照样列（带档位标签）——
+   用户把号从正常区挪进风控区之后，名单里看不见、下拉里也选不到，
+   看起来就是号被删了。搜索走后端，能覆盖账户库默认 500 行之外的老号。 */
+let pickerTimer = null;
 async function loadRecheckPicker() {
   const select = $('#rc-add-select');
+  const params = new URLSearchParams();
+  params.set('track', recheckState.track || 'banned');
+  const q = ($('#rc-add-search') && $('#rc-add-search').value || '').trim();
+  if (q) params.set('q', q);
   try {
-    const data = await apiGet('/api/store/list?');
+    const data = await apiGet('/api/recheck/picker?' + params.toString());
     if (!data.ok) return;
-    const rows = (data.rows || []).filter((r) => !r.recheck_state);
+    const rows = data.rows || [];
     const keep = select.value;
-    select.innerHTML = '<option value="">从账户库里选一个账号…</option>'
-      + rows.map((r) => `<option value="${r.id}">${esc(r.name)} · ${esc(r.realm_label || '')}</option>`).join('');
+    const head = rows.length
+      ? '<option value="">从账户库里选一个账号…</option>'
+      : `<option value="">${q ? '没搜到账号' : '这一档已包含全部账号'}</option>`;
+    select.innerHTML = head + rows.map((r) => {
+      const tag = r.state_label || '正常账号';
+      return `<option value="${r.id}">${esc(r.name)} · ${esc(r.realm_label || '')} · ${esc(tag)}</option>`;
+    }).join('');
     if (keep) select.value = keep;
   } catch (err) {
     // 选人列表拿不到不影响主流程，静默
@@ -2475,21 +2513,41 @@ function bind() {
   window.addEventListener('resize', () => {
     if (!$('#bind-pop').hidden) closeBindPop();
   });
-  $('#btn-rc-add').addEventListener('click', () => {
+  $('#btn-rc-add').addEventListener('click', async () => {
     const id = Number($('#rc-add-select').value);
     if (!id) {
       toast('先选一个账号', true);
       return;
     }
-    api('/api/recheck/track', { ids: [id], state: 'pending', note: '手工加入' })
-      .then((data) => {
-        $('#rc-add-select').value = '';
-        renderTrackCounts(data.stats);
-        return loadRecheckRows();
-      })
-      .then(() => toast('已加入复检名单'))
-      .catch((err) => toast(err.message, true));
+    // 加入的目标 = 页面正在看的那一档。以前写死 pending，而表格默认显示
+    // banned，加完号就像没生效；现在同时把表格切到目标档并清掉搜索词。
+    const track = recheckState.track || 'banned';
+    try {
+      const data = await api('/api/recheck/track', {
+        ids: [id], state: track, note: '手工加入', track,
+      });
+      const radio = document.querySelector(`input[name="rc-track"][value="${track}"]`);
+      if (radio) radio.checked = true;
+      recheckState.q = '';
+      const listSearch = $('#rc-search');
+      if (listSearch) listSearch.value = '';
+      $('#rc-add-select').value = '';
+      renderTrackCounts(data.stats);
+      await loadRecheckRows();
+      await loadRecheckPicker();
+      toast(`已加入「${RECHECK_TEXT[track] || '复检名单'}」：${data.changed} 条`);
+    } catch (err) {
+      toast(err.message, true);
+    }
   });
+
+  const rcAddSearch = $('#rc-add-search');
+  if (rcAddSearch) {
+    rcAddSearch.addEventListener('input', () => {
+      clearTimeout(pickerTimer);
+      pickerTimer = setTimeout(() => loadRecheckPicker(), 200);
+    });
+  }
 
   // 名单档位切换与搜索：切了立刻重查
   document.querySelectorAll('input[name="rc-track"]').forEach((el) => {
@@ -2497,6 +2555,8 @@ function bind() {
       if (!el.checked) return;
       recheckState.track = el.value;
       loadRecheckRows().catch((err) => toast(err.message, true));
+      // 下拉按目标档过滤，切档后要重列：在「已解封」档要能选到封号中的号
+      loadRecheckPicker();
     });
   });
   let rcTimer = null;
@@ -2617,6 +2677,8 @@ function bind() {
     });
   });
   $('#btn-sel-export').addEventListener('click', exportSelected);
+  $('#btn-sel-risk').addEventListener('click', () => setStoreRisk('banned'));
+  $('#btn-sel-unrisk').addEventListener('click', () => setStoreRisk(''));
   $('#btn-sel-delete').addEventListener('click', deleteSelected);
   $('#btn-sel-clear').addEventListener('click', () => selectAll(false));
 

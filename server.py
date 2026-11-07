@@ -16,7 +16,7 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from wk import (auth, clock, formats, pipeline, probe, recheck, store,
                 update as updater, version)
@@ -213,6 +213,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/recheck/list":
             self._recheck_list()
+            return
+        if path == "/api/recheck/picker":
+            self._recheck_picker()
             return
         if path.startswith("/api/download/"):
             self._download(path[len("/api/download/"):])
@@ -1056,10 +1059,33 @@ class Handler(BaseHTTPRequestHandler):
             "track_labels": store.RECHECK_LABELS,
         })
 
+    def _recheck_picker(self) -> None:
+        """「把账号加进名单」下拉的数据源。
+
+        `track` 是页面当前选中的目标档位：已经在目标档里的号不必重复列，
+        在其它档里的号必须能选——用户常把号在「待复检 / 已解封 / 封号中」
+        之间来回挪，一刀切过滤会让号凭空消失。搜索走 store 侧，能覆盖
+        账户库默认 500 行之外的老号。
+        """
+        query = parse_qs(urlparse(self.path).query)
+        track = (query.get("track") or ["banned"])[0]
+        if track not in ("banned", "pending", "revived", "auth"):
+            track = "banned"
+        keyword = (query.get("q") or [""])[0]
+        try:
+            limit = int((query.get("limit") or ["2000"])[0] or 2000)
+        except ValueError:
+            limit = 2000
+        rows = store.picker_rows(track=track, query=keyword, limit=limit)
+        self._json(200, {
+            "ok": True,
+            "track": track,
+            "rows": rows,
+            "total": len(rows),
+        })
+
     def _recheck_list(self) -> None:
         """名单行。默认只出 banned——「封号复检」页要的就是这一批。"""
-        from urllib.parse import parse_qs
-
         query = parse_qs(urlparse(self.path).query)
         realm = (query.get("realm") or [""])[0]
         keyword = (query.get("q") or [""])[0]
@@ -1281,22 +1307,32 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _recheck_track(self, payload: dict) -> None:
-        """手工加进 / 移出名单。state 为空串表示移出。"""
+        """手工加进 / 移出名单。state 为空串表示移出。
+
+        `track` 是调用方正在看的那档，响应里的 rows 也按它给：以前写死
+        banned，用户在「待复检」档加完号拿到一份封号中的表，界面只能再查
+        一次，看起来就像没生效。
+        """
         ids = payload.get("ids") or []
         if not isinstance(ids, list) or not ids:
             raise ValueError("没有选中账号")
+        tracks = ("banned", "pending", "revived", "auth")
+        track = str(payload.get("track") or "banned")
+        if track not in tracks:
+            track = "banned"
         state = str(payload.get("state") or "")
         note = str(payload.get("note") or "")
         changed = store.set_track(
             [int(i) for i in ids if str(i).isdigit()],
-            state if state in store.RECHECK_LABELS else "",
+            state if state in tracks else "",
             note,
         )
         self._json(200, {
             "ok": True,
             "changed": changed,
+            "track": track,
             "stats": store.recheck_stats(),
-            "rows": store.list_accounts(track="banned"),
+            "rows": store.list_accounts(track=track),
         })
 
     def _run_probe(self, pairs: list) -> dict:

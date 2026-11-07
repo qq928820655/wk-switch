@@ -637,6 +637,34 @@ def stats() -> dict[str, Any]:
     }
 
 
+def picker_rows(track: str = "banned", query: str = "",
+                limit: int = 2000) -> list[dict]:
+    """「把账号加进名单」下拉的数据源。
+
+    只排除**已经在目标档位**的账号：在别的档位的、以及压根不在名单里的都要
+    能选。以前按「recheck_state 非空」一刀切，用户把号从正常区挪进风控区
+    之后，名单里看不到、下拉里也选不到，看起来像被删了。
+
+    账户库默认只给 500 行，库一大就有一半号永远进不了这个下拉；这里单独
+    放宽到 2000 并支持按名称 / uid / 邮箱搜。复杂度 O(n)，n = 库里行数，
+    瓶颈在 list_accounts 的整表脱敏，够用到几千条；再大就该走分页了。
+    """
+    rows = list_accounts(query=query, limit=max(1, min(int(limit or 2000), 5000)))
+    out = []
+    for r in rows:
+        state = r["recheck_state"] or ""
+        if state == track:
+            continue
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "realm_label": r["realm_label"],
+            "state": state,
+            "state_label": RECHECK_LABELS.get(state, "正常账号"),
+        })
+    return out
+
+
 def recheck_stats() -> dict[str, Any]:
     """复检名单的计数。标签页徽章与设置卡片用。"""
     with connect() as conn:
@@ -868,8 +896,16 @@ def set_track(ids: list[int], state: str, note: str = "") -> int:
         if state:
             # 风控来源记 manual：这批不是导入时标的风控，也不是复检判出来的，
             # 是用户自己划进来的。三种来源分开记，页面上才看得出该不该去敲门。
+            # 从「已解封 / 凭据失效」重新划回名单时，旧的敲门次数和时间要
+            # 归零：留着会被最小间隔直接跳过，用户刚加进来的号一次都不测。
+            # SQLite 的 UPDATE 表达式读的都是旧值，和 SET 的书写顺序无关。
             cur = conn.execute(
-                f"UPDATE accounts SET recheck_state = ?, "
+                f"UPDATE accounts SET "
+                f"recheck_count = CASE WHEN IFNULL(recheck_state,'') IN ('revived','auth') "
+                f"                     THEN 0 ELSE recheck_count END, "
+                f"recheck_at = CASE WHEN IFNULL(recheck_state,'') IN ('revived','auth') "
+                f"                  THEN 0 ELSE recheck_at END, "
+                f"recheck_state = ?, "
                 f"recheck_note = COALESCE(?, recheck_note), "
                 f"risk_src = CASE WHEN IFNULL(risk_src,'') = '' THEN 'manual' "
                 f"                 ELSE risk_src END "
