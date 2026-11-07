@@ -124,6 +124,13 @@ DEFAULTS: dict[str, Any] = {
     #: 都送这个裸名字；面板侧那种 `cn:xxx` / `global:xxx` 前缀是分池用的，
     #: 转发到上游会被判成 model_param_invalid。
     "chat_model": "deepseek-v4.1-flash",
+    #: 400 时的候选模型。空串 = 用 chat_model + 内置兜底链（含 intl 的
+    #: -sg 别名）；逗号分隔可自定义，按写的顺序试。
+    "chat_models": "",
+    #: 400/404 时的候选对话路径。空串 = 内置三条（v2 / v1 / 无前缀）。
+    "chat_paths": "",
+    #: 一次探测最多发几个请求。只有 400/404 才继续，防止把上游敲出限流。
+    "chat_max_attempts": 8,
     #: 出口策略：random / same / custom。见模块顶部那张表。
     "exit_mode": "random",
     #: same 模式固定走这个出口。空 = 不下发代理（账号自带优先，其次直连）。
@@ -225,6 +232,17 @@ def _coerce(cfg: dict) -> dict:
     # 上游换模型是常事，写死一个列表反而会让新模型配不进去。空值回默认。
     model = str(cfg.get("chat_model") or "").strip()
     cfg["chat_model"] = (model[:80] or DEFAULTS["chat_model"])
+    # 候选链允许写成逗号分隔字符串或数组；空串表示用内置链（含 intl 别名）。
+    for key, width in (("chat_models", 400), ("chat_paths", 400)):
+        value = cfg.get(key)
+        if isinstance(value, (list, tuple)):
+            value = ",".join(str(x) for x in value)
+        cfg[key] = str(value or "").strip()[:width]
+    try:
+        cfg["chat_max_attempts"] = min(16, max(1, int(
+            cfg.get("chat_max_attempts") or DEFAULTS["chat_max_attempts"])))
+    except (TypeError, ValueError):
+        cfg["chat_max_attempts"] = DEFAULTS["chat_max_attempts"]
     try:
         cfg["min_interval"] = max(600, int(cfg.get("min_interval") or DEFAULTS["min_interval"]))
     except (TypeError, ValueError):
@@ -1415,9 +1433,12 @@ class Runner:
                 time.sleep(self.cfg["gap_seconds"])
 
             plan = self._plan(row_id, ports)
-            res = probe.chat_probe(acc, timeout=self.cfg["timeout"],
-                                   proxy=plan["proxy"],
-                                   model=self.cfg.get("chat_model", ""))
+            res = probe.chat_probe(
+                acc, timeout=self.cfg["timeout"], proxy=plan["proxy"],
+                model=self.cfg.get("chat_model", ""),
+                models=self.cfg.get("chat_models") or None,
+                paths=self.cfg.get("chat_paths") or None,
+                max_attempts=self.cfg.get("chat_max_attempts") or 0)
             item = {
                 "id": row_id,
                 "verdict": res["verdict"],
@@ -1431,6 +1452,9 @@ class Runner:
                 "proxy_ip": plan["exit_ip"],
                 "exit_mode": plan["mode"],
                 "checked_at": int(time.time()),
+                # 400 时逐次尝试的模型/路径/上游原话，给界面做「为什么还 400」
+                "attempts": res.get("attempts") or [],
+                "model": res.get("model") or "",
             }
             results.append(item)
             if on_result:

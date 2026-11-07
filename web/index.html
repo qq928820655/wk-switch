@@ -461,6 +461,18 @@
                placeholder="deepseek-v4.1-flash"
                title="复检与账户验证送的裸模型名，别带 cn: / global: 前缀">
       </label>
+      <label class="field">
+        <span>候选模型（逗号分隔，留空用内置）</span>
+        <input type="text" id="rc-models" spellcheck="false"
+               placeholder="deepseek-v4.1-flash, deepseek-v4.1-flash-sg, hy3"
+               title="400 时按顺序换模型再试；国际版会自动把裸名换成 -sg 别名插在后面">
+      </label>
+      <label class="field">
+        <span>候选对话路径（逗号分隔，留空用内置）</span>
+        <input type="text" id="rc-paths" spellcheck="false"
+               placeholder="/v2/chat/completions, /v1/chat/completions, /chat/completions"
+               title="404 时换下一条路径；400 时也会逐条试">
+      </label>
     </div>
 
     <div class="export-bar">
@@ -574,6 +586,7 @@
       <span class="sel-count" id="rc-sel-count">未选择</span>
       <div class="sel-actions">
         <button class="btn small" id="btn-rc-sel-probe" disabled>复检选中</button>
+        <button class="btn small" id="btn-rc-diagnose" disabled title="对选中的第一个号发一次对话探测，列出每种模型/请求体/路径的状态码和上游原话，不写库">诊断 400</button>
         <button class="btn small" id="btn-rc-sel-exit" disabled>分配出口</button>
         <button class="btn small" id="btn-rc-sel-remove" disabled>移出名单</button>
         <button class="link" id="btn-rc-sel-clear" disabled>取消</button>
@@ -596,7 +609,7 @@
       </table>
     </div>
     <p class="hint" id="rc-hint"></p>
-    <p class="hint probe-hint" id="rc-result" hidden></p>
+    <div class="hint probe-hint" id="rc-result" hidden></div>
   </section>
 
   <section class="card">

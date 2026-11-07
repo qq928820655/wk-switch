@@ -1715,6 +1715,8 @@ function fillRecheckForm(cfg, disc) {
   $('#rc-timeout').value = Math.round(cfg.timeout || 25);
   $('#rc-auto-hour').value = cfg.auto_hour ?? 3;
   $('#rc-model').value = cfg.chat_model || 'deepseek-v4.1-flash';
+  $('#rc-models').value = cfg.chat_models || '';
+  $('#rc-paths').value = cfg.chat_paths || '';
   const mihomo = cfg.mihomo || {};
   $('#rc-host').value = mihomo.host || '';
   $('#rc-ports').value = mihomo.ports || '';
@@ -2111,8 +2113,8 @@ function trimNote(text) {
 function syncRecheckSelection() {
   const n = recheckState.selected.size;
   $('#rc-sel-count').textContent = n ? `已选 ${n} 条` : '未选择';
-  ['#btn-rc-sel-probe', '#btn-rc-sel-exit', '#btn-rc-sel-remove',
-   '#btn-rc-sel-clear'].forEach((k) => {
+  ['#btn-rc-sel-probe', '#btn-rc-diagnose', '#btn-rc-sel-exit',
+   '#btn-rc-sel-remove', '#btn-rc-sel-clear'].forEach((k) => {
     $(k).disabled = n === 0;
   });
 }
@@ -2133,6 +2135,9 @@ async function saveRecheckCfg() {
     auto_hour: Number($('#rc-auto-hour').value) || 0,
     // 裸模型名。留空时后端回默认值，不在这里硬编码第二份
     chat_model: $('#rc-model').value.trim(),
+    // 留空 = 后端用内置链（含国际版 -sg 别名），不在这里复制一份默认值
+    chat_models: $('#rc-models').value.trim(),
+    chat_paths: $('#rc-paths').value.trim(),
     mihomo: {
       host: $('#rc-host').value.trim(),
       ports: $('#rc-ports').value.trim(),
@@ -2206,6 +2211,46 @@ function shortApiError(text) {
   // 地址就只剩「返回 401：…」，看不出是哪一步断的。换成 flex 换行后
   // 宽度不再是问题，原样显示。
   return raw;
+}
+
+/** 单号诊断：把 400 的逐次尝试和上游原话摊开，不写库。
+ *  复检本身会改名单状态，排查「为什么还是 400」时不该带这个副作用。 */
+async function diagnoseSelected() {
+  const ids = [...recheckState.selected];
+  if (!ids.length) { toast('先选一个账号', true); return; }
+  const out = $('#rc-result');
+  out.hidden = false;
+  out.classList.remove('bad');
+  out.textContent = '正在诊断：逐个试模型 / 请求体 / 路径…';
+  try {
+    const data = await api('/api/recheck/diagnose', { ids: [ids[0]] });
+    renderDiagnose(data);
+  } catch (err) {
+    out.classList.add('bad');
+    out.textContent = err.message;
+  }
+}
+
+function renderDiagnose(data) {
+  const out = $('#rc-result');
+  const r = data.result || {};
+  const cfg = data.config || {};
+  const tries = r.attempts || [];
+  const rows = tries.map((a, i) => `
+    <tr><td class="mono">${i + 1}</td><td class="mono">${esc(a.model)}</td>
+    <td class="mono">${esc(a.body)}</td><td class="mono">${esc(a.url)}</td>
+    <td class="mono">${esc(String(a.status))}</td><td>${esc(a.reply || '')}</td></tr>`).join('');
+  const verdict = r.verdict === 'revived' ? '对话已通' : (r.detail || '没拿到可用应答');
+  out.innerHTML = `
+    <div class="diag-head"><b>诊断 #${esc(String(data.id))}</b>：${esc(verdict)}
+      <span class="hint">主模型 ${esc(cfg.chat_model || '')}｜候选 ${esc(cfg.chat_models || '内置')}｜路径 ${esc(cfg.chat_paths || '内置')}｜出口 ${esc(String(cfg.exit_port || '直连'))}｜打通于 ${esc(r.model || '—')} / ${esc(r.body || '—')}</span>
+    </div>
+    <div class="diag-wrap"><table class="grid diag-table">
+      <thead><tr><th>#</th><th>模型</th><th>请求体</th><th>地址</th><th>状态</th><th>上游原话</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="empty-cell">没发出请求（本地就跳过了）</td></tr>'}</tbody>
+    </table></div>
+    <p class="hint">共 ${tries.length} 次尝试；这次诊断不写库，名单状态和次数都没变。</p>`;
+  out.classList.toggle('bad', r.verdict === 'unknown');
 }
 
 async function runRecheck(force, ids) {
@@ -2477,6 +2522,9 @@ function bind() {
   });
   $('#btn-rc-sel-probe').addEventListener('click', () => {
     runRecheck(true, [...recheckState.selected]).catch((err) => toast(err.message, true));
+  });
+  $('#btn-rc-diagnose').addEventListener('click', () => {
+    diagnoseSelected().catch((err) => toast(err.message, true));
   });
   $('#btn-rc-sel-exit').addEventListener('click', () => {
     assignExits([...recheckState.selected])

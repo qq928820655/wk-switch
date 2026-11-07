@@ -282,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._recheck_bind(payload)
             elif path == "/api/recheck/track":
                 self._recheck_track(payload)
+            elif path == "/api/recheck/diagnose":
+                self._recheck_diagnose(payload)
             elif path == "/api/recheck/assign":
                 self._recheck_assign(payload)
             elif path == "/api/recheck/exit":
@@ -1151,6 +1153,8 @@ class Handler(BaseHTTPRequestHandler):
                     "proxy_ip": item.get("proxy_ip", ""),
                     "exit_mode": item.get("exit_mode", ""),
                     "skipped": item.get("skipped", False),
+                    "attempts": item.get("attempts") or [],
+                    "model": item.get("model", ""),
                 }
                 for item in results
             ],
@@ -1304,6 +1308,46 @@ class Handler(BaseHTTPRequestHandler):
             "changed": changed,
             "port": port,
             "rows": store.list_accounts(track=str(payload.get("track") or "banned")),
+        })
+
+    def _recheck_diagnose(self, payload: dict) -> None:
+        """单号诊断：把 400 的逐次尝试和上游原话原样回给界面，不写库。
+
+        复检会改名单状态和计数，排查「为什么还是 400」时不该带这个副作用。
+        出口按行从库里取，保证诊断和真复检走的是同一条线。
+        """
+        ids = payload.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("先选一个账号")
+        try:
+            row_id = int(ids[0])
+        except (TypeError, ValueError):
+            raise ValueError("账号 id 不是数字") from None
+        pairs = store.load_for_probe(ids=[row_id])
+        if not pairs:
+            raise ValueError("这个账号不在库里")
+        rid, acc = pairs[0]
+        cfg = recheck.load_config()
+        port = int(store.exit_ports_of([rid]).get(rid) or 0)
+        if port:
+            acc.proxy = recheck.plan_port(cfg, port)["proxy"]
+        res = probe.chat_probe(
+            acc, timeout=cfg["timeout"],
+            model=cfg.get("chat_model", ""),
+            models=cfg.get("chat_models") or None,
+            paths=cfg.get("chat_paths") or None,
+            max_attempts=cfg.get("chat_max_attempts") or 0)
+        self._json(200, {
+            "ok": True,
+            "id": rid,
+            "config": {
+                "chat_model": cfg.get("chat_model", ""),
+                "chat_models": cfg.get("chat_models", ""),
+                "chat_paths": cfg.get("chat_paths", ""),
+                "chat_max_attempts": cfg.get("chat_max_attempts", 0),
+                "exit_port": port,
+            },
+            "result": res,
         })
 
     def _recheck_track(self, payload: dict) -> None:

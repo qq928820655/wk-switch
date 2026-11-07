@@ -1207,6 +1207,15 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 }
 .probe-hint.bad { color: var(--bad); }
 
+/* 400 诊断：逐次尝试表。容器横向滚动，窄屏也不把上游原话挤没 */
+.diag-head { line-height: 1.6; color: var(--ink); }
+.diag-head .hint { display: block; margin-top: 4px; }
+.diag-wrap { overflow-x: auto; margin-top: 10px; }
+.diag-table { min-width: 760px; color: var(--ink); font-size: 12px; }
+.diag-table th { white-space: nowrap; }
+.diag-table td { vertical-align: top; word-break: break-all; }
+.probe-hint.bad .diag-head b { color: var(--bad); }
+
 /* 窄屏下积分列缩到最小，进度条隐藏——只留数字，横向空间不够 */
 @media (max-width: 720px) {
   .col-credit { width: 72px; }

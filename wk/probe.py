@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import socket
 import ssl
 import threading
@@ -204,7 +205,7 @@ def _post_json(url: str, body: dict, headers: dict, timeout: float,
             try:
                 return resp.status, json.loads(raw.decode("utf-8", "replace"))
             except (ValueError, UnicodeDecodeError):
-                return resp.status, {"_raw": raw[:400].decode("utf-8", "replace")}
+                return resp.status, {"_raw": raw[:2000].decode("utf-8", "replace")}
     except urllib.error.HTTPError as exc:
         raw = b""
         try:
@@ -214,7 +215,7 @@ def _post_json(url: str, body: dict, headers: dict, timeout: float,
         try:
             parsed = json.loads(raw.decode("utf-8", "replace"))
         except (ValueError, UnicodeDecodeError):
-            parsed = {"_raw": raw[:400].decode("utf-8", "replace")}
+            parsed = {"_raw": raw[:2000].decode("utf-8", "replace")}
         return exc.code, parsed
 
 
@@ -714,9 +715,10 @@ def summarize(results: Iterable[dict]) -> dict:
 CHAT_BASES_CN = ("https://copilot.tencent.com", "https://www.workbuddy.cn")
 CHAT_BASES_INTL = ("https://www.workbuddy.ai",)
 
-#: 上游对话路径。hub 的 `CHAT_PATH = "/v2/chat/completions"`（wb_proxy.py:303），
-#: 不带前缀的版本在部分边缘节点也认，按 404 自动切换。
-CHAT_PATHS = ("/v2/chat/completions", "/chat/completions")
+#: 上游对话路径。hub 的 `CHAT_PATH = "/v2/chat/completions"`（wb_proxy.py），
+#: OpenAI 兼容口 `/v1/chat/completions` 在部分边缘节点/中转上才是唯一认的，
+#: 不带前缀的版本也留着。按 404 自动切换。
+CHAT_PATHS = ("/v2/chat/completions", "/v1/chat/completions", "/chat/completions")
 
 #: 账户验证用的默认模型。复检、积分校验前后的对话敲门都送这个裸名字。
 #: 面板侧有时写 `cn:xxx` / `global:xxx`，那个前缀是面板自己分池用的，
@@ -724,9 +726,30 @@ CHAT_PATHS = ("/v2/chat/completions", "/chat/completions")
 #: 「参数错误」。配置里的 chat_model 会覆盖它，见 chat_probe 的 model 参数。
 CHAT_MODEL = "deepseek-v4.1-flash"
 
-#: 400 之后的降级请求体。上游的 400 绝大多数不是账号问题，而是这个 body
-#: 里有它不认的字段：某个版本不认 `stream`、有的网关把 `max_tokens` 卡在
-#: 最小 16。带一版最朴素的再敲一次，能区分「参数问题」和「这个号真被拒了」。
+#: 国际版出站别名。hub `wb_proxy.py` 的 `INTL_MODEL_ALIASES` 原文：
+#: 「The intl exit renamed deepseek-v4.1-flash to the '-sg' build in 2026-11:
+#: the desktop client's own catalogue ... lists only deepseek-v4.1-flash-sg,
+#: while a request for the old base id answers code 6004」。
+#: 面板探针和窗口探针自己拼 outbound body 时必须先套这层别名，我们同样是
+#: 探针。发裸名会被网关拒（400 或 200+6004），这就是「改了请求体还是 400」
+#: 的根因：400 之后的降级只换了 body，模型名从头到尾没变过。
+INTL_MODEL_ALIASES = {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash-sg",
+}
+
+#: 兜底模型。本项目早期探针用的裸名，端点/路径实测过（假 token 回 401）。
+#: 候选链里放在用户指定值及其 intl 别名之后。
+CHAT_MODEL_CHAIN = ("hy3",)
+
+#: 400 时按「请求体形态 × 模型」逐个试。顺序上先换 body，再换模型，
+#: 保证 intl 别名在第二次请求就能被试到，不必等四五种 body 试完。
+CHAT_BODY_VARIANTS = ("standard", "plain", "minimal", "completion")
+
+#: 一次探测最多发几个请求。400 才继续前进，401/403/200/429 立刻返回。
+CHAT_MAX_ATTEMPTS = 8
+
+#: 400 之后的降级请求体。保留这一版给外部脚本/老代码引用；实际降级由
+#: `_chat_body` 按 CHAT_BODY_VARIANTS 生成。
 CHAT_BODY_FALLBACK = {
     "model": CHAT_MODEL,
     "messages": [{"role": "user", "content": "ping"}],
@@ -763,6 +786,104 @@ def _chat_bases(acc: Account) -> tuple[str, ...]:
     return CHAT_BASES_CN if (acc.realm or "").lower() == "cn" else CHAT_BASES_INTL
 
 
+def intl_model_alias(name: str, realm: str = "") -> str:
+    """国际版出站模型 id。别名只在 intl 生效，cn 保持裸名。"""
+    if str(realm or "").lower() != "intl":
+        return str(name or "")
+    return INTL_MODEL_ALIASES.get(str(name or "").strip().lower(), str(name or ""))
+
+
+def model_chain(model: str = "", models: Any = None, realm: str = "") -> list[str]:
+    """候选模型链：用户指定值优先，紧跟它的 intl 别名，再补兜底模型。
+
+    400 绝大多数是模型 id 或请求体形态被上游拒。以前只换请求体、模型名
+    从头到尾不变，所以永远 400；这里把别名放在第二次请求就能试到的位置。
+    """
+    if models:
+        raw = (models.replace("\n", ",").split(",") if isinstance(models, str)
+               else [str(x) for x in models])
+    else:
+        raw = [model or CHAT_MODEL, *CHAT_MODEL_CHAIN]
+    out: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if not name:
+            continue
+        for candidate in (name, intl_model_alias(name, realm)):
+            if candidate and candidate not in out:
+                out.append(candidate)
+    return out or [CHAT_MODEL]
+
+
+def path_chain(paths: Any = None) -> tuple[str, ...]:
+    """候选对话路径。配置可传逗号分隔字符串或数组。"""
+    if not paths:
+        return CHAT_PATHS
+    raw = (paths.replace("\n", ",").split(",") if isinstance(paths, str)
+           else [str(x) for x in paths])
+    out: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if not text.startswith("/"):
+            text = "/" + text
+        if text not in out:
+            out.append(text)
+    return tuple(out) or CHAT_PATHS
+
+
+def _chat_body(model: str, variant: str) -> dict:
+    """按形态生成最小对话请求体。复杂度 O(1)。
+
+    standard 是原来的形态；plain 去掉 stream 并把 max_tokens 提到 16；
+    minimal 只留 model+messages；completion 用新字段名（部分网关不认
+    max_tokens，改叫 max_completion_tokens）。
+    """
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    if variant == "standard":
+        body["max_tokens"] = 5
+        body["stream"] = False
+    elif variant == "plain":
+        body["max_tokens"] = 16
+    elif variant == "completion":
+        body["max_completion_tokens"] = 16
+    return body
+
+
+def _html_hint(raw: str) -> str:
+    """从 HTML 错误页里抠出人话。
+
+    只截前 400 字节时，拿到的全是 `<style>` 里的 CSS，看不到错误原因。
+    这里先摘 meta[error] 的 content 和 `<title>`，再剥标签取正文。
+    """
+    text = str(raw or "")
+    if "<" not in text:
+        return text[:400]
+    parts: list[str] = []
+    meta = re.search(
+        r'<meta[^>]+(?:name|property)=["\'][^"\']*error[^"\']*["\'][^>]+'
+        r'content=["\']([^"\']+)', text, re.I)
+    if not meta:
+        meta = re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+'
+            r'(?:name|property)=["\'][^"\']*error', text, re.I)
+    if meta:
+        parts.append(meta.group(1).strip())
+    title = re.search(r'<title>(.*?)</title>', text, re.I | re.S)
+    if title:
+        parts.append(" ".join(title.group(1).split())[:120])
+    cleaned = re.sub(r'<(style|script)\b[^>]*>.*?</\1>', ' ', text,
+                     flags=re.I | re.S)
+    plain = " ".join(re.sub(r'<[^>]+>', ' ', cleaned).split())
+    if plain:
+        parts.append(plain[:220])
+    return " | ".join(parts)[:400]
+
+
 def looks_restricted(text: str) -> bool:
     """正文里有没有账号级风控的特征。
 
@@ -794,7 +915,7 @@ def _body_text(body: Any) -> str:
             parts.append(str(value))
     raw = body.get("_raw")
     if isinstance(raw, str):
-        parts.append(raw)
+        parts.append(_html_hint(raw))
     return " ".join(parts)
 
 
@@ -823,6 +944,8 @@ BAD_REQUEST_HINTS = {
     "11133": "模型名或参数不被接受",
     "11134": "请求参数不合法",
     "11135": "请求体缺字段",
+    # hub 里旧 intl 模型 id 的回执：不是限流，是模型 id 已经换成了 -sg
+    "6004": "旧模型 id 已下线（国际版要 -sg 后缀）",
 }
 
 
@@ -832,19 +955,20 @@ def _clip(text: str, limit: int = 70) -> str:
 
 
 def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "",
-               model: str = "") -> dict:
-    """发一次最小对话请求，判断这个号的对话链路还能不能用。
+               model: str = "", models: Any = None, paths: Any = None,
+               max_attempts: int = 0) -> dict:
+    """发最小对话请求，判断这个号的对话链路还能不能用。
 
-    返回：
-      verdict    revived / banned / auth / unknown / skipped
-      detail     一句话结论（给界面显示）
-      raw       上游原话（截断 200 字，排查用）
-      status    HTTP 状态码
-      endpoint  实际打通的地址
-      latency_ms
+    400 不是账号状态，是「上游不认这份请求」。以前只换请求体、模型名不变，
+    国际版发裸 `deepseek-v4.1-flash` 就会一直 400。这里按
+    「请求体形态 × 候选模型（含 intl 的 -sg 别名） × 候选路径」逐次试，
+    直到拿到非 400 的应答；每次尝试都记进 `attempts` 给诊断页看。
 
-    成本：max_tokens=5、单轮、不流式。这个请求会真扣一点点额度，所以复检
-    频率必须由调用方控制——本函数不做节流，`wk/recheck.py` 负责。
+    返回：verdict / detail / raw / status / endpoint / latency_ms / attempts
+          / model（真正打通的那个模型）/ body（真正打通的请求体形态）。
+
+    成本：最多 `max_attempts` 次请求（默认 8），只有 400 / 404 才继续向前，
+    401、403、429、200 立刻返回。复检频率由 `wk/recheck.py` 控制。
     """
     started = time.time()
     out: dict[str, Any] = {
@@ -854,6 +978,9 @@ def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "",
         "status": 0,
         "endpoint": "",
         "latency_ms": 0,
+        "attempts": [],
+        "model": "",
+        "body": "",
     }
 
     token = str(acc.access_token or "").strip()
@@ -870,49 +997,83 @@ def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "",
 
     headers = _headers(acc)
     headers["Accept"] = "application/json"
-    # 同一份模型要同时用在正式请求和 400 之后的降级请求上。两处写成两个
-    # 常量，改配置时漏掉一处，降级那次就会拿旧模型去试，结论跟着飘。
     chat_model = str(model or CHAT_MODEL).strip() or CHAT_MODEL
-    fallback = {**CHAT_BODY_FALLBACK, "model": chat_model}
-    body = {
-        "model": chat_model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 5,
-        "stream": False,
-    }
+    realm = str(acc.realm or "").lower()
+    chain = model_chain(chat_model, models, realm)
+    candidates = path_chain(paths)
+    budget = max(1, min(int(max_attempts or CHAT_MAX_ATTEMPTS), 16))
+
+    # 组合顺序：外层是请求体形态，内层是模型。这样第二次请求就是同一个
+    # body 换 intl 别名，不必先把四种 body 全试一遍才轮到模型。
+    combos: list[tuple[str, str]] = []
+    for variant in CHAT_BODY_VARIANTS:
+        for name in chain:
+            combos.append((name, variant))
+    first = (chain[0], "standard")
+    combos = [first] + [c for c in combos if c != first]
+
     proxy = proxy or acc.proxy
-
+    attempts: list[dict[str, Any]] = []
     last_error = ""
+    first_400: tuple[str, Any] | None = None
+    status = 0
+
     for base in _chat_bases(acc):
-        for path in CHAT_PATHS:
+        unreachable = False
+        for path in candidates:
             url = base + path
-            try:
-                status, payload = _post_json(url, body, headers, timeout, proxy)
-            except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                status, payload = 0, {}
-                break  # 这个 base 连不通，换下一个
-            if status == 404:
-                continue  # 路径不对，试另一个前缀
-            if status == 400:
-                # 先按最朴素的 body 再敲一次。能过就说明刚才那份带了它不认的
-                # 字段；过不了就把第一次的原话带出去（那是"上游为什么不收"
-                # 的唯一线索，换成我们的措辞只会更难查）。
-                retry_status, retry_payload = _post_json(
-                    url, dict(fallback), headers, timeout, proxy)
-                if retry_status != 400:
-                    return _read_chat_reply(retry_status, retry_payload, url, started)
-            return _read_chat_reply(status, payload, url, started)
+            for name, variant in combos:
+                if len(attempts) >= budget:
+                    break
+                body = _chat_body(name, variant)
+                try:
+                    status, payload = _post_json(url, body, headers, timeout, proxy)
+                except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    status = 0
+                    attempts.append({"url": url, "model": name, "body": variant,
+                                     "status": 0, "reply": last_error[:200]})
+                    break  # 这个 base 连不通，换下一个
+                attempts.append({
+                    "url": url, "model": name, "body": variant, "status": status,
+                    "reply": _clip(_body_text(payload), 200),
+                })
+                if status == 404:
+                    break  # 路径不存在，换下一个候选路径
+                if status != 400:
+                    res = _read_chat_reply(status, payload, url, started)
+                    res["attempts"] = attempts
+                    res["model"] = name
+                    res["body"] = variant
+                    return res
+                if first_400 is None:
+                    first_400 = (url, payload)
+            if status == 0:
+                unreachable = True
+                break
+            if len(attempts) >= budget:
+                break
+        # 拿到过 HTTP 应答就不用换 base：换 base 只会把同一批 400 重发一遍
+        if not unreachable:
+            break
 
-        if status == 0:
-            continue
-
+    out["attempts"] = attempts
+    out["latency_ms"] = int((time.time() - started) * 1000)
+    if first_400 is not None:
+        url, payload = first_400
+        res = _read_chat_reply(400, payload, url, started)
+        res["attempts"] = attempts
+        res["model"] = chain[0]
+        res["detail"] += f"；已试 {len(attempts)} 种模型/请求体/路径组合都没过"
+        return res
+    if attempts and all(a["status"] == 404 for a in attempts):
+        out.update(detail="对话路径都返回 404：" + "、".join(candidates),
+                   raw="")
+        return out
     # 一个都没打通时把试过的地址写出来：用户要判断的是「是不是地址配错了」，
     # 只说「不可达」等于让他自己去猜我们打的是哪。
     bases = "、".join(_chat_bases(acc))
-    out.update(detail=f"对话端点都不可达：{bases}",
-               raw=last_error[:200])
-    out["latency_ms"] = int((time.time() - started) * 1000)
+    out.update(detail=f"对话端点都不可达：{bases}", raw=last_error[:200])
     return out
 
 
@@ -957,7 +1118,9 @@ def _read_chat_reply(status: int, payload: Any, url: str, started: float) -> dic
         # 让人自己判断是模型换了还是网关加了必填字段。
         code = _error_code(payload)
         hint = BAD_REQUEST_HINTS.get(code, "请求体被上游拒绝")
-        said = _clip(text, 60)
+        # 上游原话是唯一能定位「哪个字段不认」的证据，别截到只剩一句
+        # 状态码翻译；HTML 错误页的原因已经由 _html_hint 抠出来了。
+        said = _clip(text, 220)
         # 「地址和凭据都通」这句不能省：看到 400 的人第一反应是地址填错了，
         # 而这恰恰是这个状态码唯一能排除的东西（地址错是连不上，凭据错是 401）。
         detail = (f"HTTP 400，{hint}" + (f"（{code}）" if code else "")
@@ -972,6 +1135,15 @@ def _read_chat_reply(status: int, payload: Any, url: str, started: float) -> dic
         return out
 
     if status == 200:
+        # 网关会用 200 + 业务错误码回「模型 id 已下线 / 额度桶空」之类。
+        # 直接认 200 会把一个根本没跑起来的号判成解封。
+        code = _error_code(payload)
+        has_error = isinstance(payload, dict) and bool(payload.get("error"))
+        if (code and code != "0") or has_error:
+            out.update(verdict=RECHECK_UNKNOWN,
+                       detail=(f"HTTP 200，但上游回了业务错误（{code or 'error'}）："
+                               f"{_clip(text, 160)}"))
+            return out
         out.update(verdict=RECHECK_REVIVED, detail="对话已通，风控解除")
         return out
 

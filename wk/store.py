@@ -859,7 +859,9 @@ def update_recheck(results: list[dict[str, Any]]) -> int:
             if row is None:
                 continue
             state = recheck_mod.next_track(row["s"] or "", verdict)
-            note = str(item.get("detail") or item.get("raw") or "")[:200] or None
+            # 400 的结论里带着上游原话和「试过哪几种组合」，200 字会把
+            # 定位信息截没；界面结论列本来就把全文挂在 title 上。
+            note = str(item.get("detail") or item.get("raw") or "")[:800] or None
             # 「验证发现是风控」要记来源：复检判定仍被封的号写 verify，
             # 导入时就标了 risk 的保留 import（那是更强的证据，不该被覆盖成
             # 一个更弱的来源）。解封后清空——它已经不在风控区了。

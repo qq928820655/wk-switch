@@ -492,7 +492,7 @@ class RunnerExitTests(unittest.TestCase):
         runner = recheck.Runner(self._cfg())
         seen = []
 
-        def fake(acc_, timeout=0, proxy="", model=""):
+        def fake(acc_, timeout=0, proxy="", model="", **kw):
             seen.append(proxy)
             return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
                     "status": 200, "endpoint": "", "latency_ms": 1}
@@ -508,7 +508,7 @@ class RunnerExitTests(unittest.TestCase):
         runner = recheck.Runner(self._cfg())
         seen = []
 
-        def fake(acc_, timeout=0, proxy="", model=""):
+        def fake(acc_, timeout=0, proxy="", model="", **kw):
             seen.append(proxy)
             return {"verdict": probe.RECHECK_BANNED, "detail": "", "raw": "",
                     "status": 403, "endpoint": "", "latency_ms": 1}
@@ -525,7 +525,7 @@ class RunnerExitTests(unittest.TestCase):
         runner = recheck.Runner(self._cfg())
         seen = []
 
-        def fake(acc_, timeout=0, proxy="", model=""):
+        def fake(acc_, timeout=0, proxy="", model="", **kw):
             seen.append(proxy)
             return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
                     "status": 200, "endpoint": "", "latency_ms": 1}
@@ -1502,7 +1502,7 @@ class ChatModelTests(unittest.TestCase):
                                    gap_seconds=1.0, chat_model="verify-x"))
         seen = []
 
-        def fake(acc_, timeout=0, proxy="", model=""):
+        def fake(acc_, timeout=0, proxy="", model="", **kw):
             seen.append(model)
             return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
                     "status": 200, "endpoint": "", "latency_ms": 1}
@@ -1512,8 +1512,8 @@ class ChatModelTests(unittest.TestCase):
             recheck.Runner(cfg).run([(1, acc())], force=True, ports={})
         self.assertEqual(seen, ["verify-x"])
 
-    def test_model_in_both_bodies(self):
-        """400 之后的降级请求必须送同一个模型，不能回退到旧默认值。"""
+    def test_400_tries_model_and_body_chain(self):
+        """400 后按顺序换模型/请求体，不再把同一个模型重发两遍就收工。"""
         bodies = []
 
         def fake(url, body, headers, timeout, proxy=""):
@@ -1522,8 +1522,158 @@ class ChatModelTests(unittest.TestCase):
 
         with mock.patch.object(probe, "_post_json", fake):
             res = probe.chat_probe(acc(), timeout=5, model="verify-x")
-        self.assertEqual([b["model"] for b in bodies], ["verify-x", "verify-x"])
+        self.assertEqual(len(bodies), probe.CHAT_MAX_ATTEMPTS)
+        self.assertEqual(bodies[0]["model"], "verify-x")
+        self.assertEqual({b["model"] for b in bodies}, {"verify-x", "hy3"})
         self.assertEqual(res["verdict"], probe.RECHECK_UNKNOWN)
+        self.assertIn("已试 8 种", res["detail"])
+        self.assertEqual(len(res["attempts"]), probe.CHAT_MAX_ATTEMPTS)
+
+
+class ChatChainTests(unittest.TestCase):
+    """400 自适应：intl 别名、候选链、逐次原文、200 业务错误码。"""
+
+    def test_intl_alias_is_second_attempt(self):
+        """裸名 400 → 第二次就用 -sg 打通，不再永远 400。"""
+        seen = []
+
+        def fake(url, body, headers, timeout, proxy=""):
+            seen.append(body["model"])
+            if body["model"] == "deepseek-v4.1-flash":
+                return 400, {"code": 11133, "msg": "model_param_invalid"}
+            if body["model"] == "deepseek-v4.1-flash-sg":
+                return 200, {"choices": [{"message": {"content": "pong"}}]}
+            return 400, {"msg": "bad model"}
+
+        with mock.patch.object(probe, "_post_json", fake):
+            res = probe.chat_probe(acc(), timeout=5)
+        self.assertEqual(seen[:2], ["deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"])
+        self.assertEqual(res["verdict"], probe.RECHECK_REVIVED)
+        self.assertEqual(res["model"], "deepseek-v4.1-flash-sg")
+        self.assertEqual([a["status"] for a in res["attempts"]], [400, 200])
+
+    def test_cn_keeps_bare_model(self):
+        self.assertEqual(probe.intl_model_alias("deepseek-v4.1-flash", "cn"),
+                         "deepseek-v4.1-flash")
+        self.assertEqual(probe.intl_model_alias("deepseek-v4.1-flash", "intl"),
+                         "deepseek-v4.1-flash-sg")
+        self.assertNotIn("deepseek-v4.1-flash-sg",
+                         probe.model_chain("deepseek-v4.1-flash", None, "cn"))
+
+    def test_custom_chain_and_paths(self):
+        self.assertEqual(probe.model_chain("", "m1, m2", "cn"), ["m1", "m2"])
+        self.assertEqual(probe.path_chain("/v1/chat/completions, chat/completions"),
+                         ("/v1/chat/completions", "/chat/completions"))
+
+    def test_v1_path_fallback(self):
+        def fake(url, body, headers, timeout, proxy=""):
+            if url.endswith("/v2/chat/completions"):
+                return 404, {}
+            if url.endswith("/v1/chat/completions"):
+                return 200, {"choices": []}
+            return 404, {}
+
+        with mock.patch.object(probe, "_post_json", fake):
+            res = probe.chat_probe(acc(), timeout=5)
+        self.assertEqual(res["verdict"], probe.RECHECK_REVIVED)
+        self.assertTrue(res["endpoint"].endswith("/v1/chat/completions"))
+        self.assertEqual([a["status"] for a in res["attempts"]], [404, 200])
+
+    def test_all_400_keeps_upstream_text(self):
+        def fake(url, body, headers, timeout, proxy=""):
+            return 400, {"code": 11133, "msg": "model id not found"}
+
+        with mock.patch.object(probe, "_post_json", fake):
+            res = probe.chat_probe(acc(), timeout=5)
+        self.assertEqual(res["verdict"], probe.RECHECK_UNKNOWN)
+        self.assertEqual(len(res["attempts"]), probe.CHAT_MAX_ATTEMPTS)
+        self.assertIn("model id not found", res["detail"])
+        self.assertIn("已试 8 种", res["detail"])
+        self.assertIn("11133", res["detail"])
+
+    def test_html_400_reason_is_extracted(self):
+        html = ('<!DOCTYPE html><html><head><meta name="mcai-preview-error" '
+                'code="400" content="model id not found: deepseek-v4.1-flash"/>'
+                '<title>400 Bad Request</title><style>.a{color:red}</style>'
+                '</head><body>参数错误</body></html>')
+        with mock.patch.object(probe, "_post_json",
+                               lambda *a, **k: (400, {"_raw": html})):
+            res = probe.chat_probe(acc(), timeout=5)
+        self.assertIn("model id not found: deepseek-v4.1-flash", res["detail"])
+        self.assertIn("参数错误", res["detail"])
+
+    def test_200_with_business_error_is_not_revived(self):
+        res = probe._read_chat_reply(
+            200, {"code": 6004, "msg": "usage exceeds frequency limit"},
+            "https://x/v2/chat/completions", 0.0)
+        self.assertEqual(res["verdict"], probe.RECHECK_UNKNOWN)
+        self.assertIn("6004", res["detail"])
+
+    def test_coerce_chat_chain_defaults(self):
+        cfg = recheck._coerce(dict(recheck.DEFAULTS))
+        self.assertEqual(cfg["chat_models"], "")
+        self.assertEqual(cfg["chat_paths"], "")
+        self.assertEqual(cfg["chat_max_attempts"], 8)
+        self.assertEqual(recheck._coerce(dict(
+            recheck.DEFAULTS, chat_max_attempts=99))["chat_max_attempts"], 16)
+
+    def test_runner_passes_configured_chain(self):
+        cfg = recheck._coerce(dict(recheck.DEFAULTS, enabled=True,
+                                   gap_seconds=1.0, chat_models="m1,m2",
+                                   chat_paths="/x/chat/completions",
+                                   chat_max_attempts=3))
+        seen = []
+
+        def fake(acc_, timeout=0, proxy="", model="", **kw):
+            seen.append(kw)
+            return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
+                    "status": 200, "endpoint": "", "latency_ms": 1}
+
+        with mock.patch.object(probe, "chat_probe", fake), \
+             mock.patch.object(recheck.Runner, "_prepare", lambda self, p: None):
+            recheck.Runner(cfg).run([(1, acc())], force=True, ports={})
+        self.assertEqual(seen[0]["models"], "m1,m2")
+        self.assertEqual(seen[0]["paths"], "/x/chat/completions")
+        self.assertEqual(seen[0]["max_attempts"], 3)
+
+
+class DiagnoseApiTests(unittest.TestCase):
+    """诊断接口：逐次尝试原样回传，不碰名单状态。"""
+
+    def test_diagnose_returns_attempts_without_writing(self):
+        import server
+
+        class Fake:
+            def __init__(self):
+                self.out = None
+
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        fake = Fake()
+        cfg = dict(recheck.DEFAULTS, chat_model="m-x", chat_models="m1",
+                   chat_paths="/p", chat_max_attempts=4)
+        result = {"verdict": probe.RECHECK_UNKNOWN, "detail": "HTTP 400",
+                  "raw": "", "status": 400, "endpoint": "u", "latency_ms": 1,
+                  "attempts": [{"status": 400, "model": "m-x"}]}
+        with mock.patch.object(server.store, "load_for_probe",
+                               return_value=[(7, acc())]), \
+             mock.patch.object(server.store, "exit_ports_of",
+                               return_value={7: 0}), \
+             mock.patch.object(server.recheck, "load_config",
+                               return_value=cfg), \
+             mock.patch.object(server.probe, "chat_probe",
+                               return_value=result) as called, \
+             mock.patch.object(server.recheck, "plan_port") as plan:
+            server.Handler._recheck_diagnose(fake, {"ids": [7]})
+        status, data = fake.out
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"]["attempts"], [{"status": 400, "model": "m-x"}])
+        self.assertEqual(data["config"]["chat_model"], "m-x")
+        self.assertEqual(data["config"]["exit_port"], 0)
+        self.assertEqual(called.call_args.kwargs["models"], "m1")
+        self.assertEqual(called.call_args.kwargs["max_attempts"], 4)
+        plan.assert_not_called()
 
 
 if __name__ == "__main__":
