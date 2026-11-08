@@ -1613,13 +1613,30 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 .rc-exit-pane .hint { margin: 8px 0 0; }
 .rc-exit-pane .hint { margin: 0; line-height: 1.6; }
 
+/* 桌面不额外开横向滚动层，维持 .table-wrap.tall 自己的 520px 内滚动；
+   窄屏才由 .rc-scroll-x 接管横向滑动 */
+.rc-scroll-x { min-width: 0; }
+
 @media (max-width: 720px) {
   /* 窄屏收掉次要列：名单要能一屏看完「谁被封、什么时候查的」 */
   /* 窄屏只留「名称 / 复检 / 出口 / 操作」四列：414px 放十列的结果是
      每一列都被挤到读不出来，还不如把次要列砍掉。
      用 fixed 布局 + th 上的宽度，否则 auto 布局会按内容重算，
      出口那个下拉会被压成一条缝。 */
-  #rc-table { table-layout: fixed; }
+  /* 手机上表格不再自己开一层纵向滚动：手指落在名单里会被内层容器吃掉，
+     滚到底也不带着页面走，看着就是「划不动」。改成整页滚动，名单完整展开。 */
+  .rc-table-wrap.tall { max-height: none; overflow: visible; }
+  /* 横向滑动交给内层。overflow-y 必须显式写 hidden：只写 visible 会被
+     CSS 规范按「另一轴是 auto」折算成 auto，内部纵向滚动又回来了。 */
+  .rc-scroll-x {
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+  }
+  /* 四列按最小可读宽度给死，名称列吃剩余空间；表格下限 320px，
+     比 360/375px 屏的容器宽一点，能左右拖动，又不会把「移出」推出首屏。 */
+  #rc-table { table-layout: fixed; min-width: 320px; }
   #rc-table .col-rc-count,
   #rc-table .col-rc-at,
   #rc-table .col-rc-realm,
@@ -1628,12 +1645,19 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   /* 桌面上每列左右各 12px 内边距，五列就是 120px 的纯留白——414px 宽的
      屏幕经不起这个。窄屏收到 6px，省出来的宽度全给名称列（那是扫表时的锚点）。 */
   #rc-table th, #rc-table td { padding: 7px 6px; }
-  #rc-table .row-actions { padding-right: 6px !important; width: 38px; }
-  #rc-table .col-check { width: 24px; }
-  #rc-table .col-rc-state { width: 62px; }
-  #rc-table .col-rc-exit { width: 70px; }
+  #rc-table .col-check { width: 30px; padding-left: 2px !important; padding-right: 2px !important; }
+  #rc-table th:nth-child(2), #rc-table td:nth-child(2) {
+    /* 不给固定宽度，让名称吃剩余空间；写死会把「移出」挤出 375px 首屏 */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #rc-table .col-rc-state { width: 64px; }
+  #rc-table .col-rc-exit { width: 76px; }
+  #rc-table .row-actions { width: 48px; padding-right: 4px !important; }
+  #rc-table .row-actions .link { padding: 2px 2px; font-size: 11px; }
   #rc-table .pill { padding: 1px 4px; font-size: 10.5px; }
-  .rc-exit-pick { max-width: 64px; font-size: 11px; padding: 3px 16px 3px 4px; }
+  .rc-exit-pick { max-width: 68px; font-size: 11px; padding: 3px 16px 3px 4px; }
   .rc-note { max-width: 120px; }
   .rc-switches { gap: 12px 0; }
   .rc-switch { max-width: none; }

@@ -2289,7 +2289,7 @@ function renderRecheckTable() {
     return `
     <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}">
       <td class="col-check"><input type="checkbox" class="rc-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
-      <td><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
+      <td title="${esc(r.name)}"><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
       <td class="col-rc-realm"><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
       <td class="col-rc-state"><span class="pill ${pill}">${esc(text)}</span></td>
       <td class="col-credit">${creditCell(r)}</td>
