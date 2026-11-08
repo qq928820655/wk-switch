@@ -1613,52 +1613,107 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 .rc-exit-pane .hint { margin: 8px 0 0; }
 .rc-exit-pane .hint { margin: 0; line-height: 1.6; }
 
-/* 桌面不额外开横向滚动层，维持 .table-wrap.tall 自己的 520px 内滚动；
-   窄屏才由 .rc-scroll-x 接管横向滑动 */
-.rc-scroll-x { min-width: 0; }
+/* 手机端不套横向滚动表格：十列压进 375px 必然裁字、露边框、把手指锁在
+   内层滚动里。每行直接重排成卡片，整页纵向滚；桌面 >720px 仍是原表格。 */
+.rc-mobile-all { display: none; }
 
 @media (max-width: 720px) {
-  /* 窄屏收掉次要列：名单要能一屏看完「谁被封、什么时候查的」 */
-  /* 窄屏只留「名称 / 复检 / 出口 / 操作」四列：414px 放十列的结果是
-     每一列都被挤到读不出来，还不如把次要列砍掉。
-     用 fixed 布局 + th 上的宽度，否则 auto 布局会按内容重算，
-     出口那个下拉会被压成一条缝。 */
-  /* 手机上表格不再自己开一层纵向滚动：手指落在名单里会被内层容器吃掉，
-     滚到底也不带着页面走，看着就是「划不动」。改成整页滚动，名单完整展开。 */
-  .rc-table-wrap.tall { max-height: none; overflow: visible; }
-  /* 横向滑动交给内层。overflow-y 必须显式写 hidden：只写 visible 会被
-     CSS 规范按「另一轴是 auto」折算成 auto，内部纵向滚动又回来了。 */
-  .rc-scroll-x {
-    overflow-x: auto;
-    overflow-y: hidden;
-    -webkit-overflow-scrolling: touch;
-    overscroll-behavior-x: contain;
+  .rc-table-wrap.tall {
+    max-height: none;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
   }
-  /* 四列按最小可读宽度给死，名称列吃剩余空间；表格下限 320px，
-     比 360/375px 屏的容器宽一点，能左右拖动，又不会把「移出」推出首屏。 */
-  #rc-table { table-layout: fixed; min-width: 320px; }
-  #rc-table .col-rc-count,
-  #rc-table .col-rc-at,
+  #rc-table, #rc-table tbody { display: block; width: 100%; }
+  #rc-table thead { display: none; }
+  #rc-table tbody { display: flex; flex-direction: column; gap: 9px; }
+  #rc-table tbody tr {
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) 42px;
+    grid-template-areas:
+      "ck    name  name  name act"
+      ".     state cred  cred act"
+      ".     exit  exit  exit act"
+      ".     note  note  note act";
+    gap: 9px 8px;
+    padding: 11px 11px 10px;
+    border: 1px solid var(--line-2);
+    border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
+  }
+  #rc-table tbody tr.sel { border-color: #c7c9f7; background: #fbfbff; }
+  #rc-table tbody tr:hover td { background: transparent; }
+  #rc-table tbody td {
+    display: block;
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 0 !important;
+    border: 0 !important;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  #rc-table .col-check { grid-area: ck; padding-top: 2px; }
+  #rc-table td:nth-child(2) {
+    grid-area: name;
+    min-width: 0;
+    font-size: 13px;
+    line-height: 1.35;
+    word-break: break-all;
+  }
+  #rc-table .col-rc-state { grid-area: state; }
+  #rc-table .col-rc-exit { grid-area: exit; }
+  #rc-table .col-credit { grid-area: cred; font-size: 11.5px; }
+  #rc-table .row-actions { grid-area: act; align-self: start; text-align: right; }
+  #rc-table .col-rc-note { grid-area: note; }
+  /* 版本 / 次数 / 上次复检塞进卡片会把第二行挤碎，桌面表格里仍完整保留 */
   #rc-table .col-rc-realm,
-  #rc-table .col-credit,
-  #rc-table .col-rc-note { display: none; }
-  /* 桌面上每列左右各 12px 内边距，五列就是 120px 的纯留白——414px 宽的
-     屏幕经不起这个。窄屏收到 6px，省出来的宽度全给名称列（那是扫表时的锚点）。 */
-  #rc-table th, #rc-table td { padding: 7px 6px; }
-  #rc-table .col-check { width: 30px; padding-left: 2px !important; padding-right: 2px !important; }
-  #rc-table th:nth-child(2), #rc-table td:nth-child(2) {
-    /* 不给固定宽度，让名称吃剩余空间；写死会把「移出」挤出 375px 首屏 */
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  #rc-table .col-rc-count,
+  #rc-table .col-rc-at { display: none; }
+  #rc-table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 10px;
+    line-height: 1.2;
+    color: var(--ink-3);
+    margin-bottom: 3px;
   }
-  #rc-table .col-rc-state { width: 64px; }
-  #rc-table .col-rc-exit { width: 76px; }
-  #rc-table .row-actions { width: 48px; padding-right: 4px !important; }
-  #rc-table .row-actions .link { padding: 2px 2px; font-size: 11px; }
-  #rc-table .pill { padding: 1px 4px; font-size: 10.5px; }
-  .rc-exit-pick { max-width: 68px; font-size: 11px; padding: 3px 16px 3px 4px; }
-  .rc-note { max-width: 120px; }
+  #rc-table .pill { padding: 2px 6px; font-size: 11px; }
+  #rc-table .row-actions .link { padding: 3px 5px; font-size: 12px; }
+  /* 原生 select 的 min-content 会把 1fr 列撑到 156px、盖住右边的「积分」。
+     这里让出口独占一整行并钉死像素宽度，不再跟 grid 的 fr 分配互相拉扯。 */
+  #rc-table .rc-exit-pick {
+    width: 160px;
+    max-width: 160px;
+    min-width: 0;
+    box-sizing: border-box;
+    font-size: 11.5px;
+    padding: 4px 18px 4px 6px;
+  }
+  #rc-table .rc-note { max-width: none; font-size: 11.5px; color: var(--ink-2); }
+  #rc-table tbody tr.rc-empty-row {
+    display: block;
+    padding: 0;
+    border: 1px solid var(--line-2);
+    border-radius: 10px;
+    background: #fff;
+  }
+  #rc-table tbody tr.rc-empty-row td { display: block; }
+  .rc-mobile-all {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 10px;
+    padding: 0 2px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+  .rc-mobile-all input { width: 15px; height: 15px; margin: 0; }
+  .rc-mobile-all .hint { margin-left: auto; }
   .rc-switches { gap: 12px 0; }
   .rc-switch { max-width: none; }
   /* 设置项走两列：一列排五行会把设置卡片拉成一屏半高，

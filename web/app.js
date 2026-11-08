@@ -2275,8 +2275,9 @@ function renderTrackCounts(stats) {
 function renderRecheckTable() {
   const body = $('#rc-table tbody');
   if (!recheckState.rows.length) {
-    body.innerHTML = '<tr><td colspan="10" class="empty-cell">这一档没有账号。导入带风控原因的账号会自动进名单。</td></tr>';
+    body.innerHTML = '<tr class="rc-empty-row"><td colspan="10" class="empty-cell">这一档没有账号。导入带风控原因的账号会自动进名单。</td></tr>';
     $('#rc-hint').textContent = '';
+    $('#rc-mobile-count').textContent = '0 条';
     syncRecheckSelection();
     return;
   }
@@ -2290,18 +2291,19 @@ function renderRecheckTable() {
     <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}">
       <td class="col-check"><input type="checkbox" class="rc-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
       <td title="${esc(r.name)}"><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
-      <td class="col-rc-realm"><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
-      <td class="col-rc-state"><span class="pill ${pill}">${esc(text)}</span></td>
-      <td class="col-credit">${creditCell(r)}</td>
-      <td class="col-rc-exit">${exitCell(r)}</td>
-      <td class="mono col-rc-count">${r.recheck_count || 0}</td>
-      <td class="mono col-rc-at">${esc(r.recheck) || '—'}</td>
-      <td class="rc-note col-rc-note" title="${esc(r.recheck_note || '')}">${esc(trimNote(r.recheck_note)) || '<span class="hint">—</span>'}</td>
+      <td class="col-rc-realm" data-label="版本"><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
+      <td class="col-rc-state" data-label="复检"><span class="pill ${pill}">${esc(text)}</span></td>
+      <td class="col-credit" data-label="积分">${creditCell(r)}</td>
+      <td class="col-rc-exit" data-label="出口">${exitCell(r)}</td>
+      <td class="mono col-rc-count" data-label="次数">${r.recheck_count || 0}</td>
+      <td class="mono col-rc-at" data-label="上次">${esc(r.recheck) || '—'}</td>
+      <td class="rc-note col-rc-note" data-label="结论" title="${esc(r.recheck_note || '')}">${esc(trimNote(r.recheck_note)) || '<span class="hint">—</span>'}</td>
       <td class="row-actions"><button class="link danger" data-act="untrack">移出</button></td>
     </tr>`;
   }).join('');
 
   $('#rc-hint').textContent = `共 ${recheckState.rows.length} 条`;
+  $('#rc-mobile-count').textContent = `共 ${recheckState.rows.length} 条`;
   syncExitSelects();
   syncRecheckSelection();
 }
@@ -2315,6 +2317,14 @@ function trimNote(text) {
 function syncRecheckSelection() {
   const n = recheckState.selected.size;
   $('#rc-sel-count').textContent = n ? `已选 ${n} 条` : '未选择';
+  // 两处全选框：桌面在表头，手机在卡片列表上方，状态必须一起走
+  const total = recheckState.rows.length;
+  ['#rc-check-all', '#rc-check-all-mobile'].forEach((k) => {
+    const el = $(k);
+    if (!el) return;
+    el.checked = total > 0 && n === total;
+    el.indeterminate = n > 0 && n < total;
+  });
   ['#btn-rc-sel-probe', '#btn-rc-diagnose', '#btn-rc-sel-exit',
    '#btn-rc-sel-remove', '#btn-rc-sel-clear'].forEach((k) => {
     $(k).disabled = n === 0;
@@ -2840,11 +2850,13 @@ function bind() {
   });
 
   // 表格里勾选与行内操作
-  $('#rc-check-all').addEventListener('change', (e) => {
-    const on = e.target.checked;
-    recheckState.selected.clear();
-    if (on) recheckState.rows.forEach((r) => recheckState.selected.add(r.id));
-    renderRecheckTable();
+  ['#rc-check-all', '#rc-check-all-mobile'].forEach((k) => {
+    $(k).addEventListener('change', (e) => {
+      const on = e.target.checked;
+      recheckState.selected.clear();
+      if (on) recheckState.rows.forEach((r) => recheckState.selected.add(r.id));
+      renderRecheckTable();
+    });
   });
   $('#rc-table').addEventListener('change', (e) => {
     const pick = e.target.closest('.rc-exit-pick');
