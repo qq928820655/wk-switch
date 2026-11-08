@@ -491,6 +491,60 @@ def batches(limit: int = 50) -> list[dict]:
     return [{"batch": r["b"], "count": r["n"], "at": r["at"] or ""} for r in rows]
 
 
+def row_by_id(row_id: int) -> dict[str, Any] | None:
+    """按行 id 取一条最小摘要。「已有账户重新登录」用它认目标行。"""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, uid, realm, name, nickname, email, "
+            "IFNULL(exit_port,0) AS exit_port FROM accounts WHERE id = ?",
+            (int(row_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"id": int(row["id"]), "uid": row["uid"] or "",
+            "realm": row["realm"] or "", "name": row["name"] or "",
+            "nickname": row["nickname"] or "", "email": row["email"] or "",
+            "exit_port": int(row["exit_port"] or 0)}
+
+
+def rebind(row_id: int, acc: Account, batch: str = "",
+           source: str = "") -> dict[str, Any]:
+    """按行 id 用新凭据覆盖这一行（「已有账户重新登录」）。
+
+    `upsert` 按 (uid, realm) 找人；重新登录后上游可能给出不同的 uid / 区域，
+    按唯一键会插出新行，用户原来设的出口端口、批次、勾选记录、风控结论全丢。
+    这里直接认行 id：身份和凭据字段随新 token 更新，其余元数据原样保留。
+
+    token 换了就作废旧积分快照（与 `upsert` 同口径）：旧余额属于上一个
+    token。风控状态不由这里改——重新登录不自动判定解封，仍由复检/校验决定。
+    """
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM accounts WHERE id = ?",
+                           (int(row_id),)).fetchone()
+        if row is None:
+            return {"updated": 0, "inserted": 0, "id": 0, "total": 0}
+        now = _now()
+        batch = batch or "oauth-" + clock.compact()
+        payload = json.dumps(acc.to_dict(), ensure_ascii=False)
+        state = tok.token_state(acc.access_token, acc.expires_at, acc.refresh_token)
+        conn.execute(
+            """UPDATE accounts SET
+                 uid=?, realm=?, name=?, nickname=?, email=?, phone=?,
+                 access_token=?, refresh_token=?, device_token=?, token_state=?,
+                 expires_at=?, domain=?, enterprise_id=?, enabled=?, source=?,
+                 payload=?, updated_at=?, batch=?, imported_at=?,
+                 credit_remain=NULL, credit_used=NULL, credit_size=NULL,
+                 credit_state=NULL, checked_at=0, checked_note=NULL
+               WHERE id=?""",
+            (identity_of(acc), _realm_of(acc), account_name(acc), acc.nickname,
+             acc.email, acc.phone, acc.access_token, acc.refresh_token,
+             acc.device_token, state, acc.expires_at, acc.domain,
+             acc.enterprise_id, int(acc.enabled), source or acc.source,
+             payload, now, batch, now, int(row_id)),
+        )
+        return {"updated": 1, "inserted": 0, "id": int(row_id), "total": 1}
+
+
 def list_accounts(realm: str = "", query: str = "", limit: int = 500,
                   track: str = "", batch: str = "") -> list[dict]:
     """按版本 / 批次筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。

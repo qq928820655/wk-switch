@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wk import (auth, clock, formats, pipeline, probe, recheck, store,
-                update as updater, version)
+                update as updater, version, weblogin)
 from wk.model import Account
 
 ROOT = Path(__file__).resolve().parent
@@ -196,6 +196,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/store/list":
             self._store_list()
             return
+        if path == "/api/store/login/poll":
+            self._store_login_poll()
+            return
+        if path == "/api/store/login/config":
+            self._store_login_config()
+            return
         if path == "/api/store/exits":
             self._store_exits()
             return
@@ -254,6 +260,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_export(payload)
             elif path == "/api/store/import":
                 self._store_import(payload)
+            elif path == "/api/store/login/start":
+                self._store_login_start(payload)
+            elif path == "/api/store/login/cancel":
+                self._store_login_cancel(payload)
             elif path == "/api/store/assign":
                 self._store_assign(payload)
             elif path == "/api/store/exit":
@@ -644,6 +654,84 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     # ---- 本地账户库 -----------------------------------------------
+    # ---- 从官方网址登录账户（协议见 wk/weblogin.py）------------------
+    def _store_login_config(self) -> None:
+        """弹窗要的默认值。单独一个轻量接口：不复用的那份设置里带着节点表，
+        打开弹窗就为读一个代理地址去问池面板不值当。
+
+        带 `target_id` 时是按某一行重新登录：默认代理取这一行的出口端口
+        （`verify_proxy` 配了仍是它优先），前端预填和后端兜底用的是同一份算法。
+        """
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlparse(self.path).query)
+        raw_id = (query.get("target_id") or [""])[0]
+        target = store.row_by_id(int(raw_id)) if raw_id.isdigit() else None
+        cfg = recheck.load_config()
+        proxy = recheck.plan_port(cfg, (target or {}).get("exit_port") or 0)["proxy"]
+        self._json(200, {
+            "ok": True,
+            "proxy": proxy,
+            "target": target,
+            "realms": [{"value": key, "label": cfg2["name"]}
+                       for key, cfg2 in weblogin.REALM_CONFIGS.items()],
+            "platform": weblogin.DEFAULT_PLATFORM,
+            "ttl": weblogin.LOGIN_TTL_SECONDS,
+        })
+
+    def _store_login_start(self, payload: dict) -> None:
+        """申请一个官方登录 state，返回给浏览器打开的 authUrl。
+
+        proxy 缺省沿用设置页的「固定验证代理」：默认直连会把这台机器上别的
+        账号一起关联到官方渠道，那正是用独立出口要隔开的东西。
+        """
+        raw_target = payload.get("target_id")
+        target = None
+        if raw_target not in (None, "", 0):
+            if not str(raw_target).isdigit():
+                raise ValueError("target_id 必须是账户行 id")
+            target = store.row_by_id(int(raw_target))
+            if target is None:
+                raise ValueError("目标账户行不存在，请刷新账户库")
+        realm = str(payload.get("realm") or (target or {}).get("realm")
+                    or "intl").strip().lower()
+        if realm not in weblogin.REALM_CONFIGS:
+            raise ValueError("版本只能是 intl 或 cn")
+        platform = str(payload.get("platform") or weblogin.DEFAULT_PLATFORM).strip()
+        if "proxy" in payload:
+            proxy = payload.get("proxy") or ""
+        else:
+            # 没显式给代理时按目标行的出口端口算；verify_proxy 在 plan_port
+            # 里优先级最高，所以两种情况都不会退回本机 IP。
+            cfg = recheck.load_config()
+            proxy = recheck.plan_port(cfg, (target or {}).get("exit_port") or 0)["proxy"]
+        try:
+            started = weblogin.LOGINS.start(
+                realm=realm, platform=platform, proxy=proxy, target=target,
+                fetch_credits=bool(payload.get("fetch_credits", True)))
+        except weblogin.WebLoginError as exc:
+            self._error(502, str(exc))
+            return
+        self._json(200, started)
+
+    def _store_login_poll(self) -> None:
+        """轮询一次。只有 status=ok 才写库；pending / error 都不动本地数据。"""
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlparse(self.path).query)
+        state = (query.get("state") or [""])[0]
+        if not state:
+            self._error(400, "缺少 state")
+            return
+        try:
+            self._json(200, weblogin.LOGINS.poll(state))
+        except Exception as exc:  # noqa: BLE001 — GET 没有外层兜底，别把连接打断
+            self._error(502, "%s: %s" % (type(exc).__name__, exc))
+
+    def _store_login_cancel(self, payload: dict) -> None:
+        self._json(200, {"ok": True,
+                         "cancelled": weblogin.LOGINS.cancel(payload.get("state"))})
+
     def _store_import(self, payload: dict) -> None:
         """把当前会话的转换结果写进本地库，按 (uid, 版本) 去重更新。
 

@@ -209,6 +209,7 @@
         <option value="">全部批次</option>
       </select>
 
+      <button class="btn small primary" id="btn-store-login" title="打开官方登录页授权，自动把账号和资料写进本地账户库">+ 官网登录</button>
       <button class="btn small" id="btn-probe-all" title="逐个向上游查询积分，只读，不刷新 token">校验全部</button>
       <button class="btn small" id="btn-store-assign" title="给正常账号随机分配出口；勾了几个就只分这几个。风控账号占用的端口会自动避开">一键分配出口</button>
       <button class="btn small" id="btn-store-direct" title="把正常账号的出口全部改回直连">全部直连</button>
@@ -221,6 +222,7 @@
         <button class="btn small" id="btn-sel-probe" disabled>校验选中</button>
         <button class="btn small" id="btn-sel-export" disabled>导出选中</button>
         <button class="btn small" id="btn-sel-risk" disabled title="把选中的号直接移进「封号中」名单，不用重新导入">标为风控</button>
+        <button class="btn small" id="btn-sel-relogin" disabled title="从官网重新登录这一个账号，按选中行覆盖 token 和资料">重登选中</button>
         <button class="btn small ghost" id="btn-sel-unrisk" disabled title="把选中的号移出复检名单，回到正常账号">移出风控</button>
         <button class="btn small danger" id="btn-sel-delete" disabled>删除选中</button>
         <button class="link" id="btn-sel-clear" disabled>取消</button>
@@ -653,6 +655,61 @@
   <input type="search" class="bind-search" id="bind-search" placeholder="搜节点名 / 地区 / 住宅" spellcheck="false">
   <p class="hint bind-note" id="bind-note"></p>
   <div class="bind-list" id="bind-list"></div>
+</div>
+
+<!-- 官网登录：官方 OAuth 设备流。用户去浏览器授权，本页轮询并把账号写进库。 -->
+<div class="modal" id="wl-modal" hidden>
+  <div class="modal-mask" id="wl-mask"></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="wl-title">
+    <div class="modal-head">
+      <h3 id="wl-title">从官网登录账户</h3>
+      <button class="link" id="wl-close">关闭</button>
+    </div>
+    <p class="hint wl-tip" id="wl-tip">
+      点「获取登录链接」→ 在浏览器里完成官方登录授权 → 本页自动检测并把账号和资料写进本地账户库。
+      同一个 uid 重新登录是更新，不会多出一行。
+    </p>
+
+    <div class="wl-target" id="wl-target" hidden>
+      <span id="wl-target-text"></span>
+      <button class="link" id="wl-target-new">改为新增（不覆盖这一行）</button>
+    </div>
+
+    <div class="wl-form">
+      <div class="wl-line">
+        <span class="realm-label">登录版本</span>
+        <div class="seg" id="wl-realm">
+          <label><input type="radio" name="wl-realm" value="intl" checked><span>国际版 workbuddy.ai</span></label>
+          <label><input type="radio" name="wl-realm" value="cn"><span>国内版 copilot.tencent.com</span></label>
+        </div>
+      </div>
+
+      <label class="field">
+        <span>登录出口代理</span>
+        <input type="text" id="wl-proxy" spellcheck="false" placeholder="http://127.0.0.1:7891">
+      </label>
+      <p class="hint wl-proxy-tip">
+        留空 = 直连。打开弹窗时预填设置页的「固定验证代理」，用独立出口隔开本机其它账号，
+        授权、取 token、拉资料、查积分都走这一条线。
+      </p>
+
+      <label class="wl-check"><input type="checkbox" id="wl-credits" checked><span>登录后自动查询积分与套餐</span></label>
+      <button class="btn primary" id="wl-start">获取登录链接</button>
+    </div>
+
+    <ol class="wl-steps">
+      <li class="wl-step" id="wl-step1"><b>1</b><span>向官方申请授权</span></li>
+      <li class="wl-step" id="wl-step2"><b>2</b><span>浏览器完成登录</span></li>
+      <li class="wl-step" id="wl-step3"><b>3</b><span>拉取资料并入库</span></li>
+    </ol>
+
+    <div class="wl-link-box" id="wl-link-box" hidden>
+      <a class="wl-link" id="wl-link" href="#" target="_blank" rel="noopener noreferrer"></a>
+      <button class="btn small" id="wl-copy">复制登录链接</button>
+    </div>
+    <p class="hint wl-status" id="wl-status"></p>
+    <div class="wl-profile" id="wl-profile" hidden></div>
+  </div>
 </div>
 
 <script src="/static/app.js"></script>

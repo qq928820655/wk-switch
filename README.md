@@ -9,6 +9,7 @@
 - **多格式识别**：导入时自动嗅探 JSON / ZIP / NDJSON / CSV / 文本行 / 加密信封，七个项目的导出包直接拖进来即可
 - **格式互转**：8 种输出格式，按目标项目的目录与字段约定命名
 - **本地账户库**：SQLite 留存，唯一键 `(uid, realm)`；同名不同号不会被合并
+- **从官网登录账户**：账户库工具栏「+ 官网登录」直接走官方 OAuth 设备流，浏览器完成授权后自动取回 token 与账户资料（昵称 / 邮箱 / 企业 / 套餐 / 积分）写进本地库，同一 uid 重复登录是更新；整条链路可指定独立出口代理
 - **导入批次可查**：每条记录带「批次号 + 导入时间（北京时间）」，工具栏能按批次筛，同一个包第几次导进来一眼对得上；`first_batch` 记着首次导入，重复导入不会把它冲掉
 - **国内版 / 国际版分离**：按 JWT issuer 与域名判定，导出可「全部 / 仅国内 / 仅国际 / 分版本各一份」
 - **备份还原**：整库打包 zip（`accounts.db` + `accounts.json`），支持合并与覆盖两种还原
@@ -70,6 +71,56 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
 
 分版本导出时文件名插版本段：`workbuddy-manager-cn-20261103-125433.zip`、`workbuddy-manager-intl-20261103-125433.zip`。
 本地库备份为 `wk-switch-backup-20261103-125433.zip`。
+
+## 从官网登录账户
+
+账户库工具栏的 **「+ 官网登录」** 用官方插件登录流程加号，不用再手工找导出文件。协议照 hub 最新 `wb_accounts.py` 的 `start_login` / `poll_login`（`wk/weblogin.py` 实现）：
+
+| 步骤 | 请求 | 返回 |
+|---|---|---|
+| 1 申请授权 | `POST {base}/v2/plugin/auth/state?platform=CLI`，body `{}` | `data.state` + `data.authUrl`（官方登录页） |
+| 2 浏览器授权 | 打开 `authUrl`，在官网上登录 | — |
+| 3 轮询取 token | `GET {base}/v2/plugin/auth/token?state=...` | `code=11217` 等待；`code=0` 给 `accessToken` / `refreshToken` / `expiresAt` / `domain` |
+| 4 拉账户资料 | `GET {base}/v2/plugin/login/account?state=...` + `Authorization: Bearer <AT>` | `data.nickname` / `email` / `enterpriseId` / `tier` 等 |
+
+两个版本的上游与渠道头：
+
+| 版本 | base | Origin | User-Agent | domain |
+|---|---|---|---|---|
+| 国际版 | `https://www.workbuddy.ai` | `https://www.workbuddy.ai` | `WorkBuddy/5.9.4` | `www.workbuddy.ai` |
+| 国内版 | `https://copilot.tencent.com` | `https://www.codebuddy.cn` | `WorkBuddy/5.8.3` | `copilot.tencent.com` |
+
+三条请求都带 `X-Requested-With: XMLHttpRequest`、`Content-Type: application/json`、`Accept: application/json, text/plain, */*`、`Referer`。UA 是官方客户端版本串——网关按渠道校验，写成 curl 的 UA 会被挡在门外。
+
+拿到资料后组装 `Account`：`uid` 取 JWT 里的 `uid`（解不出时用 token 指纹兜底，保证重复登录命中同一行），`expiresAt` 取上游值、没有就退回 JWT 的 `exp`，原始资料整包存进 `profile_raw` 随导出带走。写库走 `store.upsert`，`source=oauth`、批次 `oauth-<北京时间>`，所以同一个号重新扫码只更新 token 和资料，不会多出一行；token 变了会清掉上一次的积分快照。默认再跑一次只读积分查询，把余额和套餐也填上（弹窗里可取消勾选）。
+
+**出口代理**：授权、取 token、拉资料、查积分全走同一条线。弹窗打开时预填设置页的「固定验证代理」（`config/recheck.json` 的 `verify_proxy`，例如 `http://127.0.0.1:7891`），留空才是直连；`proxy` 参数不传时后端也按 `verify_proxy` 兜底，不会因为一次前端读取失败就退回本机 IP。代理只收 `http://` / `https://`，带认证的 `http://user:pass@host:port` 原样保留。没配代理时装空 `ProxyHandler`，**不吃 `HTTPS_PROXY` 环境变量**。
+
+会话只放内存，TTL 600 秒；`status=ok` 才写库，`pending` / `error` / `expired` / `unknown` 都不动本地数据。关弹窗或切换版本会 `cancel` 掉旧 state。
+
+API（都要先拿登录会话 cookie）：
+
+```bash
+# 申请
+curl -s -X POST http://127.0.0.1:8765/api/store/login/start \
+  -H 'Content-Type: application/json' \
+  -d '{"realm":"intl","platform":"CLI","proxy":"http://127.0.0.1:7891","fetch_credits":true}'
+# {"ok":true,"status":"pending","state":"0a38d772-...","authUrl":"https://www.workbuddy.ai/login?platform=CLI&state=0a38d772-...","proxy":"http://127.0.0.1:7891",...}
+
+# 轮询（界面每 2.5s 自动做一次）
+curl -s 'http://127.0.0.1:8765/api/store/login/poll?state=0a38d772-...'
+# 等待：{"ok":true,"status":"pending","message":"login ing..."}
+# 成功：{"ok":true,"status":"ok","account":{"uid":"...","name":"...","email":"...","realm":"intl",...},"store":{"inserted":1,...},"credits":{"state":"valid","remain":...},"proxy":"http://127.0.0.1:7891"}
+
+# 放弃
+curl -s -X POST http://127.0.0.1:8765/api/store/login/cancel \
+  -H 'Content-Type: application/json' -d '{"state":"0a38d772-..."}'
+
+# 弹窗默认值（轻量接口，不查节点表）
+curl -s http://127.0.0.1:8765/api/store/login/config
+```
+
+判断成功：弹窗第 3 步变绿、资料面板列出昵称 / uid / 邮箱 / 版本 / 积分，账户库表格立刻出现这一行，批次列是 `oauth-...`。上游返回 `code=0` 但没给 `accessToken` 时仍算 `pending`，不会写一条空 token 进去。
 
 ## 上游校验与积分
 
@@ -546,6 +597,7 @@ wk/
   token.py           JWT 载荷、realm 推断、凭据状态
   store.py           本地账户库（SQLite）、备份还原
   probe.py           只读探针：计费查询 + 对话探活
+  weblogin.py       官方 OAuth 设备流登录、拉资料、写账户库
   recheck.py         封号复检：名单流转、mihomo 节点发现
   clock.py           时间源：北京时间（UTC+8），全站唯一出口
   auth.py            访问口令与会话

@@ -572,6 +572,204 @@ function batchLabel(batch) {
   return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : String(batch || '');
 }
 
+/* ---------- 从官网登录账户（官方 OAuth 设备流） ---------- */
+
+const wlState = { state: '', timer: null, busy: false, proxyReady: false, target: null };
+
+function wlTargetView(target) {
+  // 目标行只留界面要显示的四个字段，别把整行（含脱敏 token）挂在全局状态里
+  return target ? {
+    id: Number(target.id), uid: target.uid || '', realm: target.realm || 'intl',
+    name: target.name || target.nickname || target.uid || '未命名',
+  } : null;
+}
+
+function wlModeText() { return wlState.target ? '重新登录' : '官网登录'; }
+
+function wlSetTarget(target) {
+  wlState.target = wlTargetView(target);
+  const box = $('#wl-target');
+  box.hidden = !wlState.target;
+  if (wlState.target) {
+    $('#wl-target-text').textContent =
+      `正在为「${wlState.target.name}」重新登录：token / 资料会覆盖这一行，出口和风控状态保留。`;
+    const radio = document.querySelector(`input[name="wl-realm"][value="${wlState.target.realm}"]`);
+    if (radio) radio.checked = true;
+    $('#wl-tip').textContent = '点「获取重登链接」→ 在浏览器里完成官方登录授权 → 本页自动检测并更新这一行。'
+      + '扫到的是别的账号时不会覆盖，会直接提示。';
+  } else {
+    $('#wl-tip').textContent = '点「获取登录链接」→ 在浏览器里完成官方登录授权 → 本页自动检测并把账号和资料写进本地账户库。'
+      + '同一个 uid 重新登录是更新，不会多出一行。';
+  }
+  $('#wl-title').textContent = wlState.target ? `重新登录：${wlState.target.name}` : '从官网登录账户';
+  $('#wl-start').textContent = wlState.target ? '获取重登链接' : '获取登录链接';
+}
+
+function wlStep(active, state) {
+  for (let i = 1; i <= 3; i += 1) {
+    const el = $(`#wl-step${i}`);
+    let cls = 'wl-step';
+    if (i < active) cls += ' done';
+    else if (i === active) cls += ` ${state || 'active'}`;
+    el.className = cls;
+  }
+}
+
+function wlStatus(text, kind) {
+  const el = $('#wl-status');
+  el.textContent = text || '';
+  el.className = 'hint wl-status' + (kind ? ` ${kind}` : '');
+}
+
+function wlStop(cancelServer) {
+  if (wlState.timer) { clearInterval(wlState.timer); wlState.timer = null; }
+  if (cancelServer && wlState.state) {
+    api('/api/store/login/cancel', { state: wlState.state }).catch(() => {});
+  }
+  wlState.state = '';
+  wlState.busy = false;
+  $('#wl-start').disabled = false;
+}
+
+async function openWebLogin(target) {
+  $('#wl-modal').hidden = false;
+  wlStatus('');
+  $('#wl-profile').hidden = true;
+  $('#wl-link-box').hidden = true;
+  wlStep(0, '');
+  wlSetTarget(target || null);
+  // 目标行变了就重算默认代理（该行的出口端口可能和上一次不同）
+  delete $('#wl-proxy').dataset.touched;
+  wlState.proxyReady = false;
+  const query = wlState.target ? `?target_id=${encodeURIComponent(wlState.target.id)}` : '';
+  // 预填固定验证代理 / 目标行出口：授权 / 取 token / 拉资料 / 查积分全走这一条线。
+  // 读不到默认值时保持 proxyReady=false，发起时不传 proxy，让后端自己按
+  // 目标行出口算——绝不能拿空串把「读失败」变成「显式直连」。
+  try {
+    const cfg = await apiGet('/api/store/login/config' + query);
+    const proxy = cfg.proxy || '';
+    if (!$('#wl-proxy').dataset.touched) $('#wl-proxy').value = proxy;
+    wlState.proxyReady = true;
+  } catch (err) {
+    wlState.proxyReady = false;
+    wlStatus('默认代理读取失败，发起时将按设置页的固定验证代理出站', '');
+  }
+}
+
+function closeWebLogin() {
+  wlStop(true);
+  wlSetTarget(null);
+  $('#wl-modal').hidden = true;
+}
+
+async function startWebLogin() {
+  if (wlState.busy) return;
+  wlStop(true);
+  wlState.busy = true;
+  const btn = $('#wl-start');
+  btn.disabled = true;
+  btn.textContent = wlState.target ? '正在申请重登…' : '正在申请…';
+  $('#wl-link-box').hidden = true;
+  $('#wl-profile').hidden = true;
+  wlStep(1, 'active');
+  wlStatus('正在向官方申请授权…');
+
+  try {
+    const realm = document.querySelector('input[name="wl-realm"]:checked').value;
+    const payload = {
+      realm,
+      platform: 'CLI',
+      fetch_credits: $('#wl-credits').checked,
+    };
+    if (wlState.target) payload.target_id = wlState.target.id;
+    if (wlState.proxyReady) payload.proxy = $('#wl-proxy').value.trim();
+    const data = await api('/api/store/login/start', payload);
+    wlState.state = data.state;
+    const link = $('#wl-link');
+    link.href = data.authUrl;
+    link.textContent = data.authUrl;
+    $('#wl-link-box').hidden = false;
+    wlStep(2, 'active');
+    wlStatus(`登录链接已生成，请在浏览器里完成官方登录授权。本次出口：${data.proxy || '直连'}`);
+    wlPoll();
+    wlState.timer = setInterval(wlPoll, 2500);
+    btn.textContent = wlState.target ? '重新获取重登链接' : '重新获取登录链接';
+  } catch (err) {
+    wlStatus(`发起失败：${err.message}`, 'bad');
+    wlStep(0, '');
+    btn.textContent = '重试';
+  } finally {
+    wlState.busy = false;
+    btn.disabled = false;
+  }
+}
+
+async function wlPoll() {
+  if (!wlState.state) return;
+  try {
+    const data = await apiGet('/api/store/login/poll?state=' + encodeURIComponent(wlState.state));
+    wlStatus(data.message || data.status, data.status === 'ok' ? 'ok' : '');
+    if (data.status === 'ok') {
+      clearInterval(wlState.timer);
+      wlState.timer = null;
+      wlState.state = '';
+      $('#wl-link-box').hidden = true;
+      wlStep(4, 'done');
+      renderWebLoginProfile(data);
+      await loadStore();
+      toast((data.target ? '已重新登录：' : '已登录并入库：')
+        + ((data.account && data.account.name) || '新账号'));
+    } else if (data.status === 'mismatch') {
+      clearInterval(wlState.timer);
+      wlState.timer = null;
+      wlState.state = '';
+      wlStatus(data.message || '扫到的是另一个账号，本地库没有改动', 'bad');
+    } else if (['error', 'expired', 'unknown'].includes(data.status)) {
+      clearInterval(wlState.timer);
+      wlState.timer = null;
+      wlState.state = '';
+      wlStatus(data.message || data.status, 'bad');
+    }
+  } catch (err) {
+    wlStatus(`轮询出错：${err.message}`, 'bad');
+  }
+}
+
+function renderWebLoginProfile(data) {
+  const a = data.account || {};
+  const c = data.credits || {};
+  const s = data.store || {};
+  const pairs = [
+    ['账号', a.name || '—'],
+    ['uid', a.uid || '—'],
+    ['邮箱', a.email || a.phone || '—'],
+    ['版本', a.realm_label || a.realm || '—'],
+    ['域名', a.domain || '—'],
+    ['套餐', c.tier || a.tier || '—'],
+    ['积分', c.remain == null ? '未查询' : String(c.remain)],
+    ['到期', a.expires || '—'],
+    ['入库', s.inserted ? '新增 1 条' : (s.updated ? '更新 1 条' : '—')],
+    ['模式', data.target ? `重登第 ${data.target.id} 行` : '新增账户'],
+    ['出口', data.proxy || '直连'],
+  ];
+  const el = $('#wl-profile');
+  el.innerHTML = '<h4>获取到的账户信息</h4><div class="wl-grid">'
+    + pairs.map(([k, v]) => `<div class="wl-kv"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')
+    + '</div>';
+  el.hidden = false;
+}
+
+async function copyWebLoginLink() {
+  const url = $('#wl-link').getAttribute('href') || '';
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('登录链接已复制');
+  } catch (err) {
+    toast('复制失败：' + err.message, true);
+  }
+}
+
 async function loadStore() {
   const params = new URLSearchParams();
   if (storeState.realm) params.set('realm', storeState.realm);
@@ -834,6 +1032,7 @@ function renderStoreTable(rows) {
       <td class="mono col-at" title="${esc(r.at)}">${esc(r.at)}</td>
       <td class="col-rt">${r.has_rt ? '<span class="pill ok">有</span>' : '<span class="hint">—</span>'}</td>
       <td class="row-actions">
+        <button class="link" data-act="relogin" title="从官网重新登录这个账号，按本行覆盖 token 和资料">重登</button>
         <button class="link" data-act="rename">改名</button>
         <button class="link danger" data-act="delete">删除</button>
       </td>
@@ -935,6 +1134,8 @@ function refreshSelBar() {
   $('#btn-sel-probe').disabled = picked === 0;
   $('#btn-sel-export').disabled = picked === 0;
   $('#btn-sel-risk').disabled = picked === 0;
+  // 一次只重登一个号：官方授权是单账号流程，多选没有明确的覆盖目标
+  $('#btn-sel-relogin').disabled = picked !== 1;
   $('#btn-sel-unrisk').disabled = picked === 0;
   $('#btn-sel-delete').disabled = picked === 0;
   $('#btn-sel-clear').disabled = picked === 0;
@@ -2707,6 +2908,7 @@ function bind() {
     const id = Number(tr.dataset.id);
     const row = storeState.rows.find((r) => r.id === id);
     if (!row) return;
+    if (btn.dataset.act === 'relogin') openWebLogin(row);
     if (btn.dataset.act === 'rename') storeRename(id, row.name);
     if (btn.dataset.act === 'delete') storeDelete(id, row.name);
   });
@@ -2728,6 +2930,27 @@ function bind() {
 
   $('#btn-sel-probe').addEventListener('click', probeSelected);
   $('#btn-probe-all').addEventListener('click', probeAll);
+  $('#btn-store-login').addEventListener('click', openWebLogin);
+  $('#wl-close').addEventListener('click', closeWebLogin);
+  $('#wl-mask').addEventListener('click', closeWebLogin);
+  $('#wl-start').addEventListener('click', startWebLogin);
+  $('#wl-copy').addEventListener('click', copyWebLoginLink);
+  $('#wl-target-new').addEventListener('click', () => {
+    // 清掉目标并按新增模式重算默认代理；已生成的旧 state 由 start 时作废
+    wlStop(true);
+    openWebLogin(null).then(() => wlStatus('已切换为新增模式，点「获取登录链接」即可', ''));
+  });
+  $('#wl-proxy').addEventListener('input', (e) => {
+    e.target.dataset.touched = '1';
+    wlState.proxyReady = true;
+  });
+  $('#wl-realm').addEventListener('change', () => {
+    // 换了版本旧 state 就作废，直接按新版本重新申请一个链接
+    if (!$('#wl-modal').hidden && wlState.state) startWebLogin();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('#wl-modal').hidden) closeWebLogin();
+  });
   $('#btn-store-assign').addEventListener('click', assignStoreExits);
   $('#btn-store-direct').addEventListener('click', clearStoreExits);
   // 横竖屏切换会改列数和下拉文案（窄屏只写端口号），重画一次表格
@@ -2748,6 +2971,12 @@ function bind() {
   });
   $('#btn-sel-export').addEventListener('click', exportSelected);
   $('#btn-sel-risk').addEventListener('click', () => setStoreRisk('banned'));
+  $('#btn-sel-relogin').addEventListener('click', () => {
+    const id = [...storeState.selected][0];
+    const row = storeState.rows.find((r) => r.id === id);
+    if (row) openWebLogin(row);
+    else toast('选中的行不在当前列表里，刷新后再试', true);
+  });
   $('#btn-sel-unrisk').addEventListener('click', () => setStoreRisk(''));
   $('#btn-sel-delete').addEventListener('click', deleteSelected);
   $('#btn-sel-clear').addEventListener('click', () => selectAll(false));
