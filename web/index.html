@@ -185,6 +185,7 @@
       <h2>本地账户库</h2>
       <div class="head-right">
         <span class="hint db-path" id="store-db"></span>
+        <button class="btn small primary" id="btn-store-login" title="打开官方登录页授权，自动把账号和资料写进本地账户库">+ 官网登录</button>
         <button class="btn small danger" id="btn-store-clear">清空账户库</button>
       </div>
     </div>
@@ -209,22 +210,23 @@
         <option value="">全部批次</option>
       </select>
 
-      <button class="btn small primary" id="btn-store-login" title="打开官方登录页授权，自动把账号和资料写进本地账户库">+ 官网登录</button>
-      <button class="btn small" id="btn-probe-all" title="逐个向上游查询积分，只读，不刷新 token">校验全部</button>
-      <button class="btn small" id="btn-store-assign" title="给正常账号随机分配出口；勾了几个就只分这几个。风控账号占用的端口会自动避开">一键分配出口</button>
-      <button class="btn small" id="btn-store-direct" title="把正常账号的出口全部改回直连">全部直连</button>
-      <button class="btn small ghost" id="btn-store-exits" title="重新读一次 mihomo 端口表">刷新节点</button>
+      <div class="store-actions">
+        <button class="btn small" id="btn-probe-all" title="逐个向上游查询积分，只读，不刷新 token">校验全部</button>
+        <button class="btn small" id="btn-store-assign" title="给正常账号随机分配出口；勾了几个就只分这几个。风控账号占用的端口会自动避开">一键分配出口</button>
+        <button class="btn small" id="btn-store-direct" title="把正常账号的出口全部改回直连">全部直连</button>
+        <button class="btn small ghost" id="btn-store-exits" title="重新读一次 mihomo 端口表">刷新节点</button>
+      </div>
     </div>
 
     <div class="sel-bar" id="sel-bar">
       <span class="sel-count" id="sel-count">未选择</span>
       <div class="sel-actions">
-        <button class="btn small" id="btn-sel-probe" disabled>校验选中</button>
-        <button class="btn small" id="btn-sel-export" disabled>导出选中</button>
+        <button class="btn small" id="btn-sel-probe" disabled>校验</button>
+        <button class="btn small" id="btn-sel-export" disabled>导出</button>
         <button class="btn small" id="btn-sel-risk" disabled title="把选中的号直接移进「封号中」名单，不用重新导入">标为风控</button>
-        <button class="btn small" id="btn-sel-relogin" disabled title="从官网重新登录这一个账号，按选中行覆盖 token 和资料">重登选中</button>
+        <button class="btn small" id="btn-sel-relogin" disabled title="从官网重新登录这一个账号，按选中行覆盖 token 和资料">重登</button>
         <button class="btn small ghost" id="btn-sel-unrisk" disabled title="把选中的号移出复检名单，回到正常账号">移出风控</button>
-        <button class="btn small danger" id="btn-sel-delete" disabled>删除选中</button>
+        <button class="btn small danger" id="btn-sel-delete" disabled>删除</button>
         <button class="link" id="btn-sel-clear" disabled>取消</button>
       </div>
     </div>
@@ -593,7 +595,7 @@
     <div class="sel-bar" id="rc-sel-bar">
       <span class="sel-count" id="rc-sel-count">未选择</span>
       <div class="sel-actions">
-        <button class="btn small" id="btn-rc-sel-probe" disabled>复检选中</button>
+        <button class="btn small" id="btn-rc-sel-probe" disabled>复检</button>
         <button class="btn small" id="btn-rc-diagnose" disabled title="对选中的第一个号发一次对话探测，列出每种模型/请求体/路径的状态码和上游原话，不写库">诊断 400</button>
         <button class="btn small" id="btn-rc-sel-exit" disabled>分配出口</button>
         <button class="btn small" id="btn-rc-sel-remove" disabled>移出名单</button>

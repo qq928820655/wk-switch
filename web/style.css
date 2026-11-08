@@ -745,6 +745,9 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 }
 .store-toolbar .seg { flex: none; }
 .store-toolbar .btn { flex: none; height: 34px; }
+/* 工具栏按钮独立成组：窄屏时整组可以单独切 2 列网格，不会和上面的
+   搜索框 / 版本筛选一起被 column 布局压成一行一个 */
+.store-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
 
 .search {
   padding: 7px 12px;
@@ -787,7 +790,7 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 .profiles.compact .profile { padding: 10px 12px; gap: 3px; }
 
 @media (max-width: 900px) {
-  .store-stats { grid-template-columns: 1fr; }
+  .store-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .topbar { flex-wrap: wrap; gap: 10px 16px; padding: 12px 18px; }
   .steps { order: 3; width: 100%; }
 }
@@ -864,9 +867,12 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   border: 1px solid var(--line-2);
   border-radius: 10px;
   background: #fbfbff;
+  min-width: 0;
 }
 .sel-count { font-size: 12px; color: var(--ink-2); white-space: nowrap; }
-.sel-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; flex: none; }
+/* flex:none 会让按钮组的 min-content 宽度把整条撑出卡片；改成可收缩，
+   宽度永远由父容器决定 */
+.sel-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; }
 .sel-actions .btn { padding: 4px 10px; font-size: 11.5px; }
 .sel-actions .link { padding: 4px 6px; font-size: 11.5px; }
 .check.inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); cursor: pointer; }
@@ -886,7 +892,7 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 
 /* ---------- 移动端 ---------- */
 @media (max-width: 900px) {
-  .store-stats { grid-template-columns: 1fr; }
+  .store-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .topbar { flex-wrap: wrap; gap: 10px 16px; padding: 12px 18px; padding-right: 84px; }
   .topbar-right { order: 3; width: 100%; justify-content: flex-start; margin-left: 0; }
   .tabs { order: 2; }
@@ -936,7 +942,24 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   .chip { padding: 4px 9px; font-size: 11.5px; }
 
   .sel-bar { gap: 6px; padding: 6px 8px 6px 10px; }
-  .sel-actions .btn { padding: 4px 8px; font-size: 11px; }
+  /* 窄屏按钮走 4 列网格：文字再长也只在格内，整条不会顶出表格右边 */
+  .sel-actions {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: 100%;
+    gap: 6px;
+  }
+  .sel-actions .btn, .sel-actions .link {
+    width: 100%;
+    min-width: 0;
+    padding: 5px 2px;
+    font-size: 11px;
+    text-align: center;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
   .head-right .db-path { display: none; }
 
   .profiles { grid-template-columns: 1fr; }
@@ -948,7 +971,13 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 
 @media (max-width: 480px) {
   .profiles.compact { grid-template-columns: 1fr; }
-  .stat-box { padding: 12px; }
+  .store-stats { gap: 8px; }
+  /* 两个统计卡各占半行，内容按半卡宽度收紧：标题、色块、数字都不换行 */
+  .stat-box { padding: 10px 11px; min-width: 0; }
+  .stat-box h3 { margin-bottom: 8px; font-size: 11.5px; }
+  .mini-row { gap: 2px 6px; }
+  .stat-mini { margin: 0 6px 4px 0; gap: 4px; font-size: 11px; white-space: nowrap; }
+  .stat-mini i { width: 7px; height: 7px; }
   .bar-row { grid-template-columns: 74px 1fr 40px; gap: 8px; }
   .store-toolbar { flex-direction: column; align-items: stretch; gap: 8px; }
   /* 列方向下 flex:1 1 200px 的 basis 会变成高度，这里必须显式压回 auto */
@@ -956,7 +985,18 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   .store-toolbar .seg { width: 100%; justify-content: space-between; }
   .store-toolbar .seg label { flex: 1 1 auto; }
   .store-toolbar .seg span { display: block; text-align: center; }
+  /* 四个按钮一行放不下就 2 行 2 列，不再一行一个 */
+  .store-toolbar .store-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
   .store-toolbar .btn { width: 100%; }
+  .store-actions .btn { padding: 5px 4px; font-size: 11.5px; text-align: center; white-space: nowrap; }
+  .card-head { gap: 8px; }
+  .head-right { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .head-right .btn { padding: 4px 8px; font-size: 11px; white-space: nowrap; }
   .row-actions { display: flex; gap: 2px; }
   #btn-logout { top: 10px; right: 12px; padding: 4px 9px; }
 }

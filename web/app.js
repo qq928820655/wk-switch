@@ -785,7 +785,7 @@ async function loadStore() {
   storeState.rows = data.rows || [];
   storeState.loaded = true;
 
-  // 库里已经删掉的 id 不能留在选择集里，否则「导出选中」会带上不存在的行
+  // 库里已经删掉的 id 不能留在选择集里，否则「导出」会带上不存在的行
   const alive = new Set(storeState.rows.map((r) => r.id));
   storeState.selected = new Set([...storeState.selected].filter((id) => alive.has(id)));
 
@@ -1192,7 +1192,7 @@ async function probeSelected() {
     toast('先勾选要校验的账号', true);
     return;
   }
-  await runProbe('/api/probe', { ids }, $('#btn-sel-probe'), '校验选中');
+  await runProbe('/api/probe', { ids }, $('#btn-sel-probe'), '校验');
 }
 
 /** 校验整库（按当前版本筛选）。账号多时要等一会儿。 */
@@ -1286,7 +1286,7 @@ async function exportSelected() {
     toast(err.message, true);
   } finally {
     btn.disabled = false;
-    btn.textContent = '导出选中';
+    btn.textContent = '导出';
   }
 }
 
@@ -1459,7 +1459,7 @@ async function loadStoreProfiles() {
 }
 
 /**
- * 从库导出。范围规则和「导出选中」是同一条：
+ * 从库导出。范围规则和「导出」是同一条：
  *
  *   勾了一部分  → 只导勾选的那些（版本筛选此时不生效，用户已经用手划了范围）
  *   全勾选/全不勾 → 全部（按上面的版本选项走，支持分版本各一份）
@@ -2894,7 +2894,7 @@ function bind() {
   if (batchSel) {
     batchSel.addEventListener('change', () => {
       storeState.batch = batchSel.value;
-      // 换批次等于换列表，勾选跟着清空——留着会让「导出选中」跨批次出错
+      // 换批次等于换列表，勾选跟着清空——留着会让「导出」跨批次出错
       storeState.selected.clear();
       loadStore().catch((err) => toast(err.message, true));
     });
