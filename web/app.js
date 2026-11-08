@@ -1714,6 +1714,7 @@ function fillRecheckForm(cfg, disc) {
   $('#rc-gap').value = Math.round(cfg.gap_seconds || 3);
   $('#rc-timeout').value = Math.round(cfg.timeout || 25);
   $('#rc-auto-hour').value = cfg.auto_hour ?? 3;
+  $('#rc-verify-proxy').value = cfg.verify_proxy || '';
   $('#rc-model').value = cfg.chat_model || 'deepseek-v4.1-flash';
   $('#rc-models').value = cfg.chat_models || '';
   $('#rc-paths').value = cfg.chat_paths || '';
@@ -2133,6 +2134,8 @@ async function saveRecheckCfg() {
     gap_seconds: Number($('#rc-gap').value) || 3,
     timeout: Number($('#rc-timeout').value) || 25,
     auto_hour: Number($('#rc-auto-hour').value) || 0,
+    // 固定验证代理：留空 = 按每行 exit_port 走，填了覆盖全部行
+    verify_proxy: $('#rc-verify-proxy').value.trim(),
     // 裸模型名。留空时后端回默认值，不在这里硬编码第二份
     chat_model: $('#rc-model').value.trim(),
     // 留空 = 后端用内置链（含国际版 -sg 别名），不在这里复制一份默认值
@@ -2256,15 +2259,23 @@ function renderDiagnose(data) {
 async function runRecheck(force, ids) {
   if (recheckState.running) return;
   const cfg = recheckState.cfg;
+  const out = $('#rc-result');
+  out.hidden = false;
+  out.classList.remove('bad');
+  // 以前「没开总开关 / 接口报错」只弹一个两秒的 toast，页面看起来像
+  // 完全没反应。所有结果都写进这块常驻区域，失败也留下原文。
   if (cfg && !cfg.enabled) {
+    out.classList.add('bad');
+    out.textContent = '复检没跑：总开关是关的。到上面的「复检设置」打开「启用封号复检」并保存，再点这里。';
     toast('封号复检没开启，先打开上面的总开关', true);
     return;
   }
   recheckState.running = true;
-  const out = $('#rc-result');
-  out.hidden = false;
-  out.classList.remove('bad');
   out.textContent = force ? '正在复检（无视间隔）…' : '正在复检…';
+  const buttons = ['#btn-rc-run', '#btn-rc-force', '#btn-rc-sel-probe'].map($);
+  const labels = buttons.map((b) => b.textContent);
+  buttons.forEach((b) => { b.disabled = true; });
+  buttons[1].textContent = '复检中…';
 
   const payload = { force: !!force };
   if (ids && ids.length) payload.ids = ids;
@@ -2287,11 +2298,22 @@ async function runRecheck(force, ids) {
       const head = ips.slice(0, 4).join(' / ');
       line += ` ｜ 出口 ${head}${ips.length > 4 ? ` 等 ${ips.length} 个` : ''}`;
     }
+    // 固定验证代理也印出来：核对「这一趟是不是真从 7891 出去的」不用翻日志
+    const prox = [...new Set((data.results || []).map((r) => r.proxy).filter(Boolean))];
+    if (prox.length) line += ` ｜ 代理 ${prox.slice(0, 2).join(' / ')}`;
     out.textContent = line;
     if (!s.revived && (s.banned || s.unknown)) out.classList.add('bad');
     await loadRecheckRows();
+  } catch (err) {
+    out.classList.add('bad');
+    out.textContent = '复检失败：' + (err.message || String(err));
+    toast(err.message || String(err), true);
   } finally {
     recheckState.running = false;
+    buttons.forEach((b, i) => { b.textContent = labels[i]; });
+    buttons[0].disabled = false;
+    buttons[1].disabled = false;
+    syncRecheckSelection();
   }
 }
 

@@ -47,6 +47,7 @@ import socket
 import ssl
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -201,11 +202,25 @@ def _post_json(url: str, body: dict, headers: dict, timeout: float,
     opener = _opener(proxy)
     try:
         with opener.open(req, timeout=timeout) as resp:
-            raw = resp.read()
+            # 对话打通时上游回的是 SSE 长流。整段 read() 会一直等到连接关闭，
+            # 而流式网关常常发完 [DONE] 还挂着；用 read1 分块收，见 [DONE]
+            # 立刻收工。上限 64 KiB，复杂度 O(字节数)，内存有界。
+            reader = getattr(resp, "read1", None) or resp.read
+            chunks: list[bytes] = []
+            total = 0
+            while total < 65536:
+                piece = reader(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+                total += len(piece)
+                if b"[DONE]" in piece:
+                    break
+            raw = b"".join(chunks)
             try:
                 return resp.status, json.loads(raw.decode("utf-8", "replace"))
             except (ValueError, UnicodeDecodeError):
-                return resp.status, {"_raw": raw[:2000].decode("utf-8", "replace")}
+                return resp.status, {"_raw": raw[:4000].decode("utf-8", "replace")}
     except urllib.error.HTTPError as exc:
         raw = b""
         try:
@@ -737,13 +752,38 @@ INTL_MODEL_ALIASES = {
     "deepseek-v4.1-flash": "deepseek-v4.1-flash-sg",
 }
 
-#: 兜底模型。本项目早期探针用的裸名，端点/路径实测过（假 token 回 401）。
-#: 候选链里放在用户指定值及其 intl 别名之后。
-CHAT_MODEL_CHAIN = ("hy3",)
+#: 兜底模型。glm-5.3-flash 是上游 2026-11 新开的轻量档，hy3 是本项目
+#: 早期探针用的裸名。候选链里放在用户指定值及其 intl 别名之后。
+CHAT_MODEL_CHAIN = ("glm-5.3-flash", "hy3")
 
-#: 400 时按「请求体形态 × 模型」逐个试。顺序上先换 body，再换模型，
-#: 保证 intl 别名在第二次请求就能被试到，不必等四五种 body 试完。
-CHAT_BODY_VARIANTS = ("standard", "plain", "minimal", "completion")
+#: 400 时按「请求体形态 × 模型」逐个试。official 是官方客户端的形态，
+#: 必须排第一：2026-11 的上游加了渠道校验，非流式请求直接 11101，
+#: messages[0] 不是 system 直接 11128，换多少模型都没用。
+CHAT_BODY_VARIANTS = ("official", "standard", "plain", "minimal", "completion")
+
+#: 官方对话网关要求的头。取自 WorkBuddy 桌面端 app.asar 的
+#: `applyGatewayHeaders` / `buildVlmGatewayHeaders`：少了 x-codebuddy-request
+#: 或 X-Conversation-*，上游回 11128「渠道校验没过」，而正文里的
+#: "request illegal" 会被误读成账号风控。
+CHAT_GATEWAY_HEADERS = {
+    "X-Private-Data": "true",
+    "X-Product": "SaaS",
+    "x-requested-with": "XMLHttpRequest",
+    "X-Agent-Intent": "craft",
+    "X-Agent-Purpose": "conversation",
+    "x-codebuddy-request": "1",
+    "Accept-Encoding": "identity",
+}
+
+#: 400 里属于「请求形态不对」的码，和账号状态无关。必须在 looks_restricted
+#: 之前拦掉：11128 的 msg 也写着 "request illegal"，走通用判据会判成仍封。
+CHANNEL_CODES = {
+    "11101": "上游只收流式请求（要 stream=true）",
+    "11128": "渠道校验没过（缺官方网关头，或首条消息不是 system）",
+    "11133": "模型名或参数不被接受",
+    "11134": "请求参数不合法",
+    "11135": "请求体缺字段",
+}
 
 #: 一次探测最多发几个请求。400 才继续前进，401/403/200/429 立刻返回。
 CHAT_MAX_ATTEMPTS = 8
@@ -780,6 +820,67 @@ RECHECK_BANNED = "banned"      # 仍被风控拦（11140 一类）
 RECHECK_AUTH = "auth"          # 凭据本身失效（401），与封号无关
 RECHECK_UNKNOWN = "unknown"    # 网络故障 / 限流 / 无法判定
 RECHECK_SKIPPED = "skipped"    # 本地就知道测不了（无 token / 加密信封 / 静态 Key）
+
+
+def _chat_headers(acc: Account) -> dict:
+    """对话请求的头：计费头 + 官方客户端的网关头。
+
+    实测（2026-11-08，www.workbuddy.ai）：只发计费头时，stream=true 也会
+    回 400 / 11128 "request illegal"；补齐桌面端那套 X-Conversation-*、
+    x-codebuddy-request、trace 后，同一个号立刻给出 403 / 11140 的真实
+    风控结论。每次请求都换一组 uuid，避免上游按固定会话号把这些敲门
+    关联成一条设备的连续行为。
+    """
+    head = _headers(acc)
+    head.update(CHAT_GATEWAY_HEADERS)
+    trace = uuid.uuid4().hex
+    span = uuid.uuid4().hex[:16]
+    parent = uuid.uuid4().hex[:16]
+    head.update({
+        "X-Conversation-ID": str(uuid.uuid4()),
+        "X-Conversation-Request-ID": str(uuid.uuid4()),
+        "acp-connection-id": str(uuid.uuid4()),
+        "X-Conversation-Message-ID": str(uuid.uuid4()),
+        "X-Request-ID": str(uuid.uuid4()),
+        "traceparent": f"00-{trace}-{span}-01",
+        "b3": f"{trace}-{span}-1-{parent}",
+        "X-B3-TraceId": trace,
+        "X-B3-ParentSpanId": parent,
+        "X-B3-SpanId": span,
+        "X-B3-Sampled": "1",
+        "X-Trace-ID": trace,
+    })
+    return head
+
+
+def _sse_text(raw: str) -> str:
+    """从 SSE 事件里挑出业务错误码/提示。
+
+    对话真的打通时上游回 `data: {...}` 一串事件，JSON 整体解析失败会落到
+    `_raw`。只看状态码会把 200 + 11140 判成「已解封」，所以把每个事件的
+    code / msg / error 拼出来，交给通用判据再走一遍。
+    """
+    parts: list[str] = []
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            item = json.loads(chunk)
+        except ValueError:
+            parts.append(chunk[:120])
+            continue
+        if isinstance(item, dict):
+            for key in ("code", "msg", "message", "error"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                parts.append(json.dumps(value, ensure_ascii=False)
+                             if isinstance(value, (dict, list)) else str(value))
+    return " ".join(p for p in parts if p)[:400]
 
 
 def _chat_bases(acc: Account) -> tuple[str, ...]:
@@ -844,7 +945,16 @@ def _chat_body(model: str, variant: str) -> dict:
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
     }
-    if variant == "standard":
+    if variant == "official":
+        # 上游渠道校验要求首条是 system，且只收流式。这两条缺一就 400/11128
+        # 或 400/11101，跟账号封没封完全无关。system 内容不参与校验。
+        body["messages"] = [
+            {"role": "system", "content": "You are WorkBuddy, a helpful AI assistant."},
+            {"role": "user", "content": "ping"},
+        ]
+        body["max_tokens"] = 5
+        body["stream"] = True
+    elif variant == "standard":
         body["max_tokens"] = 5
         body["stream"] = False
     elif variant == "plain":
@@ -916,6 +1026,8 @@ def _body_text(body: Any) -> str:
     raw = body.get("_raw")
     if isinstance(raw, str):
         parts.append(_html_hint(raw))
+        if "data:" in raw:
+            parts.append(_sse_text(raw))
     return " ".join(parts)
 
 
@@ -995,7 +1107,7 @@ def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "",
         out.update(verdict=RECHECK_SKIPPED, detail="静态 API Key 不适用封号复检")
         return out
 
-    headers = _headers(acc)
+    headers = _chat_headers(acc)
     headers["Accept"] = "application/json"
     chat_model = str(model or CHAT_MODEL).strip() or CHAT_MODEL
     realm = str(acc.realm or "").lower()
@@ -1003,13 +1115,14 @@ def chat_probe(acc: Account, timeout: float = 25.0, proxy: str = "",
     candidates = path_chain(paths)
     budget = max(1, min(int(max_attempts or CHAT_MAX_ATTEMPTS), 16))
 
-    # 组合顺序：外层是请求体形态，内层是模型。这样第二次请求就是同一个
-    # body 换 intl 别名，不必先把四种 body 全试一遍才轮到模型。
+    # 组合顺序：外层是请求体形态，内层是模型。第一发必须是 official——
+    # 只有它能过渠道校验；后面那些是上游改版时的降级形态，不用于判定
+    # 账号状态，只在 official 也被 400 时才继续试。
     combos: list[tuple[str, str]] = []
     for variant in CHAT_BODY_VARIANTS:
         for name in chain:
             combos.append((name, variant))
-    first = (chain[0], "standard")
+    first = (chain[0], "official")
     combos = [first] + [c for c in combos if c != first]
 
     proxy = proxy or acc.proxy
@@ -1091,6 +1204,17 @@ def _read_chat_reply(status: int, payload: Any, url: str, started: float) -> dic
         "raw": text[:200],
         "latency_ms": int((time.time() - started) * 1000),
     }
+
+    # 渠道类 400 必须排在风控判据前面：11128 的 msg 同样是
+    # "request illegal"，走 looks_restricted 会把「请求形态不对」判成
+    # 「这个号还封着」，用户看到的就永远是 400 而不是真正的原因。
+    code = _error_code(payload)
+    if status == 400 and code in CHANNEL_CODES:
+        out.update(verdict=RECHECK_UNKNOWN,
+                   detail=(f"HTTP 400，{CHANNEL_CODES[code]}（{code}）；"
+                           "地址和凭据都通，是请求形态没过校验，不是账号状态；上游："
+                           + _clip(text, 180)))
+        return out
 
     if looks_restricted(text):
         out.update(verdict=RECHECK_BANNED,

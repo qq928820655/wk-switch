@@ -1329,10 +1329,13 @@ class Handler(BaseHTTPRequestHandler):
         rid, acc = pairs[0]
         cfg = recheck.load_config()
         port = int(store.exit_ports_of([rid]).get(rid) or 0)
-        if port:
-            acc.proxy = recheck.plan_port(cfg, port)["proxy"]
+        # plan_port 会把固定验证代理一起算进来：诊断和真复检必须走同一条线，
+        # 否则「诊断通了、复检 400」这种对不上的结果会反复出现。
+        proxy = recheck.plan_port(cfg, port)["proxy"]
+        if proxy:
+            acc.proxy = proxy
         res = probe.chat_probe(
-            acc, timeout=cfg["timeout"],
+            acc, timeout=cfg["timeout"], proxy=proxy,
             model=cfg.get("chat_model", ""),
             models=cfg.get("chat_models") or None,
             paths=cfg.get("chat_paths") or None,
@@ -1464,8 +1467,14 @@ def attach_exit_proxies(pairs: list) -> None:
     if not pairs:
         return
     cfg = recheck.load_config()
+    fixed = str(cfg.get("verify_proxy") or "").strip()
     port_map = store.exit_ports_of([row_id for row_id, _ in pairs])
     for row_id, acc in pairs:
+        if fixed:
+            # 固定验证代理覆盖所有行，包括没分配出口的：不让任何一次校验
+            # 从本机直连 IP 出去。
+            acc.proxy = fixed
+            continue
         port = int(port_map.get(row_id, 0) or 0)
         if port:
             acc.proxy = recheck.plan_port(cfg, port)["proxy"]

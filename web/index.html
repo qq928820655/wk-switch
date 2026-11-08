@@ -456,6 +456,12 @@
         <input type="number" id="rc-auto-hour" min="0" max="23" step="1">
       </label>
       <label class="field">
+        <span>固定验证代理</span>
+        <input type="text" id="rc-verify-proxy" spellcheck="false"
+               placeholder="http://127.0.0.1:7891"
+               title="填了以后复检、单号诊断、账户库积分校验全从这个代理出站，覆盖每行的出口端口；留空按各行出口走">
+      </label>
+      <label class="field">
         <span>账户验证模型</span>
         <input type="text" id="rc-model" spellcheck="false"
                placeholder="deepseek-v4.1-flash"

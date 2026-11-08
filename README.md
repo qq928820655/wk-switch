@@ -165,23 +165,32 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
 
 判定顺序是「先看风控特征，再看 401/403，最后才认 200」。上游偶尔在账号被限制时也回 200 带一段业务错误体，先认 200 会把封着的号判成解封。
 
-**「HTTP 400」为什么一直修不好**
+**「HTTP 400」的真实原因（2026-11-08 实测）**
 
-400 是上游收到了请求、但不认它的内容。地址和 token 都是通的（地址错会连不上，凭据错是 401），问题出在模型 id 或请求体。
+用导出的 `changzhangp` 那个号，从 `127.0.0.1:7891` 打 `https://www.workbuddy.ai/v2/chat/completions`，逐层加条件：
 
-最常见的那一条查到了出处：hub `wb_proxy.py` 的 `INTL_MODEL_ALIASES` 把 `deepseek-v4.1-flash` 映射成 `deepseek-v4.1-flash-sg`，注释写明 2026-11 起国际版出口只认 `-sg`，旧裸名会被拒（`11133 model_param_invalid` / `6004`）。以前 400 之后只换请求体、`model` 从头到尾没变，所以怎么试都是 400。
+| 请求形态 | 上游回执 |
+|---|---|
+| `stream:false` + 计费头 | `400 / 11101 Non-stream chat request is currently not supported` |
+| `stream:true`，仍只有计费头 | `400 / 11128 "request illegal"`（渠道校验没过） |
+| 补官方网关头，messages 首条仍是 user | `400 / 11128 "first message is not system prompt"` |
+| 补官方网关头 + `messages[0]` 是 system | `403 / 11140 账号存在异常行为，已被限制使用` |
 
-现在 400 会按「请求体形态 × 候选模型 × 候选路径」自动往前试，最多 8 次；只有 400 / 404 才继续，401 / 403 / 429 / 200 立刻停：
+所以「换了模型、换了请求体还是 400」不是模型名的问题：这套请求从来没被当成官方客户端发出来的。桌面端 `app.asar` 的 `applyGatewayHeaders` 给出了完整头清单——`x-codebuddy-request: 1`、`X-Agent-Intent: craft`、`X-Agent-Purpose: conversation`、`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID` / `X-Request-ID`（每次新 uuid）、`acp-connection-id`、`x-requested-with`、`X-Private-Data`、`X-Product: SaaS`、`traceparent` / `b3` / `X-B3-*`。加上 `stream:true` 和 system 首条，就是探针现在的第一发形态 `official`；后面那些降级形态只在它也回 400 时才试。
+
+`11101` / `11128` / `11133` 这类 400 单独归类为「请求形态没过校验」，判 `unknown`。它们的 msg 也写着 `request illegal`，走通用风控判据会被误判成「仍封」；真正的账号级限制是 `403 / 11140`。
+
+400 仍按「请求体形态 × 候选模型 × 候选路径」往前试，最多 8 次；只有 400 / 404 继续，401 / 403 / 429 / 200 立刻停：
 
 | 维度 | 候选 |
 |---|---|
-| 模型 | 配置的 `chat_model` → 国际版自动插 `-sg` 别名 → 内置兜底 `hy3`；也能用 `chat_models` 自定义一串 |
-| 请求体 | `standard`（max_tokens=5, stream=false）→ `plain`（max_tokens=16）→ `minimal`（只有 model+messages）→ `completion`（max_completion_tokens） |
+| 请求体 | `official`（system 首条 + stream=true + 官方头）→ `standard` → `plain` → `minimal` → `completion` |
+| 模型 | 配置的 `chat_model` → 国际版自动插 `-sg` 别名 → `glm-5.3-flash` → `hy3`；也能用 `chat_models` 自定义 |
 | 路径 | `/v2/chat/completions` → `/v1/chat/completions` → `/chat/completions` |
 
-打通的那个模型和请求体形态写进结论。全 400 时把第一次的上游原话、错误码和「已试 N 种组合」一起写进结论列（完整原文挂在 title 上；HTML 错误页会抠出 `<title>` 与 `meta[error]` 的 content，不再只截到一段 CSS）。`200 + code=6004` 这类业务失败也不再当成解封。结论仍判 `unknown` 而不是 `banned`——400 说明不了账号状态。
+全 400 时把第一次的上游原话、错误码和「已试 N 种组合」写进结论列（完整原文挂在 title 上；HTML 错误页抠出 `<title>` 与 `meta[error]` 的 content）。对话打通时上游回 SSE 流，探针按 `data:` 事件分块收、见 `[DONE]` 就停，流里夹的 `11140` 之类业务错误不会被 200 状态码盖过去判成解封。
 
-名单里勾一个号点「诊断 400」，会把每次尝试的模型、请求体、地址、状态码、上游原话列成表；这个动作不写库，名单状态和次数都不变。
+名单里勾一个号点「诊断 400」，会把每次尝试的模型、请求体、地址、状态码、上游原话列成表；这个动作不写库。总开关关着或接口报错时，结果区会常驻写明原因，不再只弹一个两秒的 toast。
 
 **账户验证模型**
 
@@ -190,13 +199,26 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
 ```json
 {
   "chat_model": "deepseek-v4.1-flash",
-  "chat_models": "deepseek-v4.1-flash, deepseek-v4.1-flash-sg, hy3",
+  "chat_models": "deepseek-v4.1-flash, deepseek-v4.1-flash-sg, glm-5.3-flash, hy3",
   "chat_paths": "/v2/chat/completions, /v1/chat/completions, /chat/completions",
   "chat_max_attempts": 8
 }
 ```
 
-写**裸模型名**，别带 `cn:` / `global:` 前缀——那是面板自己分池用的，转发到上游会被判成 `11133 model_param_invalid`。`chat_models` / `chat_paths` 留空就是内置链（会自动插 `-sg` 别名），逗号分隔可自定义顺序；`chat_max_attempts` 钳在 1~16。设置页的「候选模型」「候选对话路径」写的就是这两个字段。
+写**裸模型名**，别带 `cn:` / `global:` 前缀——那是面板自己分池用的，转发到上游会被判成 `11133 model_param_invalid`。`chat_models` / `chat_paths` 留空就是内置链（自动插 `-sg` 别名和 `glm-5.3-flash`），逗号分隔可自定义顺序；`chat_max_attempts` 钳在 1~16。设置页的「候选模型」「候选对话路径」写的就是这两个字段。
+
+**固定验证代理（避免本机 IP 连坐）**
+
+`config/recheck.json`：
+
+```json
+{
+  "enabled": true,
+  "verify_proxy": "http://127.0.0.1:7891"
+}
+```
+
+填了以后，复检、单号诊断、账户库积分校验**全部**从这个代理出站，覆盖每行的 `exit_port`（包括 `0` = 直连的行）。本机 IP 上还挂着别的账号时，直连去敲风控号会把那些号一起关联上；用单独出口把变量隔开。留空恢复按行出口。设置页「固定验证代理」写这个字段，复检结果区会把实际用上的代理地址印出来，方便核对这一趟有没有走对线。
 
 **端口换节点**
 

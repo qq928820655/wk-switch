@@ -1524,7 +1524,8 @@ class ChatModelTests(unittest.TestCase):
             res = probe.chat_probe(acc(), timeout=5, model="verify-x")
         self.assertEqual(len(bodies), probe.CHAT_MAX_ATTEMPTS)
         self.assertEqual(bodies[0]["model"], "verify-x")
-        self.assertEqual({b["model"] for b in bodies}, {"verify-x", "hy3"})
+        self.assertEqual({b["model"] for b in bodies},
+                         {"verify-x", "glm-5.3-flash", "hy3"})
         self.assertEqual(res["verdict"], probe.RECHECK_UNKNOWN)
         self.assertIn("已试 8 种", res["detail"])
         self.assertEqual(len(res["attempts"]), probe.CHAT_MAX_ATTEMPTS)
@@ -1664,7 +1665,8 @@ class DiagnoseApiTests(unittest.TestCase):
                                return_value=cfg), \
              mock.patch.object(server.probe, "chat_probe",
                                return_value=result) as called, \
-             mock.patch.object(server.recheck, "plan_port") as plan:
+             mock.patch.object(server.recheck, "plan_port",
+                               return_value={"proxy": ""}) as plan:
             server.Handler._recheck_diagnose(fake, {"ids": [7]})
         status, data = fake.out
         self.assertEqual(status, 200)
@@ -1673,7 +1675,134 @@ class DiagnoseApiTests(unittest.TestCase):
         self.assertEqual(data["config"]["exit_port"], 0)
         self.assertEqual(called.call_args.kwargs["models"], "m1")
         self.assertEqual(called.call_args.kwargs["max_attempts"], 4)
-        plan.assert_not_called()
+        # 出口由 plan_port 统一算（固定代理也在里面），诊断与真复检同线
+        plan.assert_called_once()
+        self.assertEqual(called.call_args.kwargs["proxy"], "")
+
+
+class OfficialChatShapeTests(unittest.TestCase):
+    """2026-11 上游渠道校验：流式 + system 首条 + 官方网关头。
+
+    实测（www.workbuddy.ai，走 127.0.0.1:7891）：非流式请求回 400/11101；
+    补 stream 但缺网关头回 400/11128 "first message is not system prompt"；
+    补齐网关头 + system 首条后，同一个号回 403/11140 真实风控结论。
+    """
+
+    def test_official_body_is_first_and_valid(self):
+        self.assertEqual(probe.CHAT_BODY_VARIANTS[0], "official")
+        body = probe._chat_body("m-x", "official")
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["model"], "m-x")
+
+    def test_chat_headers_are_official_and_fresh(self):
+        h1 = probe._chat_headers(acc())
+        h2 = probe._chat_headers(acc())
+        for key in ("x-codebuddy-request", "X-Agent-Intent", "X-Conversation-ID",
+                    "X-Request-ID", "traceparent", "X-Private-Data", "X-B3-TraceId"):
+            self.assertIn(key, h1)
+        self.assertEqual(h1["x-codebuddy-request"], "1")
+        self.assertEqual(h1["X-Product"], "SaaS")
+        self.assertNotEqual(h1["X-Request-ID"], h2["X-Request-ID"])
+
+    def test_channel_400_is_not_banned(self):
+        # 11128 的 msg 也写 "request illegal"，走通用判据会误判成仍封
+        for code, word in (("11101", "流式"), ("11128", "渠道"), ("11133", "模型名")):
+            res = probe._read_chat_reply(
+                400, {"code": int(code), "msg": "request illegal"},
+                "https://x/v2/chat/completions", 0.0)
+            self.assertEqual(res["verdict"], probe.RECHECK_UNKNOWN)
+            self.assertIn(word, res["detail"])
+            self.assertIn("地址和凭据都通", res["detail"])
+
+    def test_11140_is_banned(self):
+        payload = {"code": 11140, "msg": "request illegal",
+                   "displayMsg": {"zh": "账号存在异常行为，已被限制使用"}}
+        res = probe._read_chat_reply(
+            403, payload, "https://x/v2/chat/completions", 0.0)
+        self.assertEqual(res["verdict"], probe.RECHECK_BANNED)
+
+    def test_sse_business_error_not_revived(self):
+        raw = ('data: {"code":11140,"msg":"request illegal"}\n\n'
+               'data: [DONE]\n\n')
+        self.assertIn("11140", probe._sse_text(raw))
+        res = probe._read_chat_reply(
+            200, {"_raw": raw}, "https://x/v2/chat/completions", 0.0)
+        self.assertEqual(res["verdict"], probe.RECHECK_BANNED)
+
+    def test_post_json_stops_on_sse_done(self):
+        class Resp:
+            status = 200
+            headers = {}
+
+            def __init__(self):
+                self.chunks = [b'data: {"choices":[{"delta":{"content":"po"}}]}\n\n',
+                               b'data: [DONE]\n\n', b'NEVER READ']
+
+            def read1(self, n):
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def read(self, n=-1):
+                return self.read1(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class Opener:
+            def open(self, req, timeout=0):
+                return Resp()
+
+        with mock.patch.object(probe, "_opener", return_value=Opener()):
+            status, payload = probe._post_json("http://x", {}, {}, 5)
+        self.assertEqual(status, 200)
+        self.assertIn("[DONE]", payload["_raw"])
+        self.assertNotIn("NEVER READ", payload["_raw"])
+
+    def test_model_chain_has_glm(self):
+        chain = probe.model_chain("deepseek-v4.1-flash", None, "intl")
+        self.assertIn("deepseek-v4.1-flash-sg", chain)
+        self.assertIn("glm-5.3-flash", chain)
+
+    def test_verify_proxy_overrides_every_row(self):
+        import server
+
+        cfg = dict(recheck.DEFAULTS)
+        cfg["verify_proxy"] = "http://127.0.0.1:7891"
+        for port in (0, 17901):
+            self.assertEqual(recheck.plan_port(cfg, port)["proxy"],
+                             "http://127.0.0.1:7891")
+        pairs = [(1, acc()), (2, acc())]
+        with mock.patch.object(server.recheck, "load_config", return_value=cfg), \
+             mock.patch.object(server.store, "exit_ports_of", return_value={}):
+            server.attach_exit_proxies(pairs)
+        self.assertEqual({a.proxy for _, a in pairs},
+                         {"http://127.0.0.1:7891"})
+
+    def test_diagnose_uses_verify_proxy(self):
+        import server
+
+        class Fake:
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        fake = Fake()
+        cfg = dict(recheck.DEFAULTS)
+        cfg["verify_proxy"] = "http://127.0.0.1:7891"
+        result = {"verdict": probe.RECHECK_BANNED, "detail": "仍被风控拦截",
+                  "raw": "", "status": 403, "endpoint": "u", "latency_ms": 1,
+                  "attempts": []}
+        with mock.patch.object(server.store, "load_for_probe",
+                               return_value=[(7, acc())]), \
+             mock.patch.object(server.store, "exit_ports_of", return_value={7: 0}), \
+             mock.patch.object(server.recheck, "load_config", return_value=cfg), \
+             mock.patch.object(server.probe, "chat_probe",
+                               return_value=result) as called:
+            server.Handler._recheck_diagnose(fake, {"ids": [7]})
+        self.assertEqual(called.call_args.kwargs["proxy"],
+                         "http://127.0.0.1:7891")
 
 
 if __name__ == "__main__":

@@ -102,6 +102,7 @@ EXIT_MODES = (EXIT_SAME, EXIT_RANDOM)
 #: 结果里说明「这一趟从哪出去的」。
 EXIT_PORT = "port"
 EXIT_DIRECT = "direct"
+EXIT_PROXY = "proxy"      # 全局固定验证代理，覆盖所有行的 exit_port
 
 EXIT_LABELS = {
     EXIT_SAME: "同一出口",
@@ -109,6 +110,7 @@ EXIT_LABELS = {
     EXIT_CUSTOM: "自定义出口",
     EXIT_PORT: "指定端口",
     EXIT_DIRECT: "直连",
+    EXIT_PROXY: "固定代理",
 }
 
 DEFAULTS: dict[str, Any] = {
@@ -131,6 +133,11 @@ DEFAULTS: dict[str, Any] = {
     "chat_paths": "",
     #: 一次探测最多发几个请求。只有 400/404 才继续，防止把上游敲出限流。
     "chat_max_attempts": 8,
+    #: 固定验证代理。填了以后，复检、单号诊断、账户库积分校验全部从这个
+    #: 地址出站，覆盖每行自己的 exit_port。用途是「只让被测号走干净 IP」：
+    #: 本机直连 IP 上还挂着别的账号，拿它去敲风控号会把那些号一起关联上。
+    #: 例：http://127.0.0.1:7891。留空按原来的按行出口逻辑。
+    "verify_proxy": "",
     #: 出口策略：random / same / custom。见模块顶部那张表。
     "exit_mode": "random",
     #: same 模式固定走这个出口。空 = 不下发代理（账号自带优先，其次直连）。
@@ -212,6 +219,9 @@ def _coerce(cfg: dict) -> dict:
     # rotate_proxy 是派生字段，写回时跟 exit_mode 保持一致
     cfg["rotate_proxy"] = mode == EXIT_RANDOM
     cfg["exit_pin"] = normalize_url(cfg.get("exit_pin"))
+    # 固定代理只认 http/https 且必须是单个地址：填一串或 socks5 会在运行时
+    # 抛 unknown url type，配置阶段就剔干净，坏值等价于「没配」。
+    cfg["verify_proxy"] = normalize_url(cfg.get("verify_proxy"))
     # 勾选的端口：去重、丢非法值、保序（用户点选的顺序在界面上有意义）。
     # 上限 64：端口池本身通常 32 个，留一倍余量就够，再多只是把配置写胖。
     picked: list[int] = []
@@ -1314,6 +1324,12 @@ def plan_port(cfg: dict, port: int, names: dict | None = None,
     每行一个整数。现在复检走这条，`plan_exit` 留给还在读老配置的调用方
     与测试，两边都返回同样的五个键，调用方不用分情况。
     """
+    fixed = str(cfg.get("verify_proxy") or "").strip()
+    if fixed:
+        # 固定验证代理优先级最高：连 exit_port=0 的号也要走它，否则「没分
+        # 配出口」的号会从本机 IP 直连出去，把本机其它账号一起拖进关联。
+        return {"mode": EXIT_PROXY, "mode_label": EXIT_LABELS[EXIT_PROXY],
+                "proxy": fixed, "exit_ip": "", "label": fixed}
     port = int(port or 0)
     if not port:
         return {"mode": EXIT_DIRECT, "mode_label": EXIT_LABELS[EXIT_DIRECT],
