@@ -415,6 +415,31 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   line-height: 1.7;
 }
 
+/* 每日活跃开关：跟状态胶囊同一套视觉，做成按钮是为了能直接点。
+   窄屏整列会被藏掉，名称后面的小红点接着承担状态提示。 */
+.da-toggle {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  cursor: pointer;
+  min-width: 26px;
+}
+.da-toggle.ok { background: var(--ok-soft); color: var(--ok); border-color: #cdebd8; }
+.da-toggle.off { background: #f1f2f6; color: var(--ink-3); border-color: var(--line-2); }
+.da-toggle:hover { filter: brightness(.96); }
+.da-toggle:disabled { opacity: .6; cursor: default; }
+.dot-da-off {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 5px 0 1px;
+  border-radius: 50%;
+  background: var(--bad);
+  vertical-align: 2px;
+}
+
 .pill.ok { background: var(--ok-soft); color: var(--ok); }
 .pill.warn { background: var(--warn-soft); color: var(--warn); }
 .pill.bad { background: var(--bad-soft); color: var(--bad); }
@@ -1288,6 +1313,7 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   #store-table .col-upd,
   #store-table .col-exp,
   #store-table .col-batch,
+  #store-table .col-daily,
   #store-table .status-cred,
   #store-table th:last-child,
   #store-table td.row-actions { display: none; }

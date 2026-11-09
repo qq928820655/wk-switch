@@ -1004,7 +1004,7 @@ function syncStoreCols() {
   const narrow = window.matchMedia('(max-width: 720px)').matches;
   const widths = narrow
     ? [24, 88, 48, 58, 52, 76]              // 勾选/名称/版本/状态/积分/出口
-    : [36, 132, 64, 88, 62, 92, 148, 112, 86, 92, 44, 92];
+    : [36, 132, 64, 88, 62, 92, 148, 76, 112, 86, 92, 44, 92];
   cg.innerHTML = widths.map((w) => `<col style="width:${w}px">`).join('');
 }
 
@@ -1012,7 +1012,7 @@ function renderStoreTable(rows) {
   syncStoreCols();
   const body = $('#store-table tbody');
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="12" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
+    body.innerHTML = '<tr><td colspan="13" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
     $('#store-hint').textContent = '';
     return;
   }
@@ -1021,12 +1021,13 @@ function renderStoreTable(rows) {
   body.innerHTML = rows.map((r) => `
     <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}${r.recheck_state ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="row-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
-      <td title="最近更新 ${esc(r.updated_at)}"><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
+      <td title="最近更新 ${esc(r.updated_at)}">${r.realm === 'intl' && r.daily_active === false ? '<i class="dot-da-off" title="每日活跃已关闭"></i>' : ''}<b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
       <td><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
       <td class="mono col-uid" title="${esc(r.uid)}">${esc(shortUid(r.uid))}</td>
       <td class="col-state">${statusCell(r)}</td>
       <td class="col-credit">${creditCell(r)}</td>
       <td class="col-store-exit">${storeExitCell(r)}</td>
+      <td class="col-daily">${dailyActiveCell(r)}</td>
       <td class="col-batch">${batchCell(r)}</td>
       <td class="mono col-exp">${esc(r.expires) || '—'}</td>
       <td class="mono col-at" title="${esc(r.at)}">${esc(r.at)}</td>
@@ -1039,6 +1040,44 @@ function renderStoreTable(rows) {
     </tr>`).join('');
 
   $('#store-hint').textContent = `共 ${rows.length} 条`;
+}
+
+/**
+ * 每日活跃开关：对应 hub 账户文件里的 `tasksEnabled`，默认开。
+ * 窄屏这一列会被藏掉，所以名称后面另挂一个小红点，手机上也能看出关没关。
+ */
+function dailyActiveCell(r) {
+  if (r.realm !== 'intl') return '<span class="hint" title="国内版没有每日活跃">—</span>';
+  const on = r.daily_active !== false;
+  const next = on ? 'false' : 'true';
+  return `<button class="link da-toggle ${on ? 'ok' : 'off'}" data-act="daily" data-on="${on ? 1 : 0}" title="点一下${on ? '关闭' : '开启'}每日活跃；导出的 hub 账户文件带 tasksEnabled=${next}">${on ? '开' : '关'}</button>`;
+}
+
+/** 勾选集里只有国际版能改每日活跃，国内版在前端就剔掉，省一次无效请求。 */
+function intlSelectedIds() {
+  return [...storeState.selected].filter((id) => {
+    const row = storeState.rows.find((r) => r.id === id);
+    return row && row.realm === 'intl';
+  });
+}
+
+async function setDailyActive(ids, enabled, sourceBtn) {
+  if (!ids.length) return;
+  const btn = sourceBtn || (enabled ? $('#btn-sel-daily-on') : $('#btn-sel-daily-off'));
+  const label = btn ? btn.textContent : (enabled ? '开活跃' : '关活跃');
+  if (btn) { btn.disabled = true; btn.textContent = '处理中'; }
+  try {
+    const data = await api('/api/store/daily-active', { ids, enabled });
+    if (!data.ok) throw new Error(data.error || '设置失败');
+    const skipped = data.skipped ? `，跳过 ${data.skipped} 个国内版` : '';
+    toast(`已${enabled ? '开启' : '关闭'} ${data.changed} 个国际版账号的每日活跃${skipped}`);
+    // 重画表格：行内开关、小红点、导出用的快照都要跟着变
+    await loadStore();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    if (btn && btn.isConnected) { btn.textContent = label; btn.disabled = false; }
+  }
 }
 
 /**
@@ -1133,6 +1172,10 @@ function refreshSelBar() {
   $('#sel-count').textContent = picked ? `已选 ${picked} 条` : '未选择';
   $('#btn-sel-probe').disabled = picked === 0;
   $('#btn-sel-export').disabled = picked === 0;
+  // 每日活跃只管国际版：全是国内版时两个按钮直接灰掉，不给后端送空请求
+  const intl = intlSelectedIds().length;
+  $('#btn-sel-daily-on').disabled = intl === 0;
+  $('#btn-sel-daily-off').disabled = intl === 0;
   $('#btn-sel-risk').disabled = picked === 0;
   // 一次只重登一个号：官方授权是单账号流程，多选没有明确的覆盖目标
   $('#btn-sel-relogin').disabled = picked !== 1;
@@ -2923,6 +2966,9 @@ function bind() {
     if (btn.dataset.act === 'relogin') openWebLogin(row);
     if (btn.dataset.act === 'rename') storeRename(id, row.name);
     if (btn.dataset.act === 'delete') storeDelete(id, row.name);
+    if (btn.dataset.act === 'daily' && row.realm === 'intl') {
+      setDailyActive([id], btn.dataset.on !== '1', btn);
+    }
   });
 
   // 勾选 + 逐行出口下拉：都走 change 委托，表格重绘不会丢事件
@@ -2982,6 +3028,8 @@ function bind() {
     });
   });
   $('#btn-sel-export').addEventListener('click', exportSelected);
+  $('#btn-sel-daily-on').addEventListener('click', () => setDailyActive(intlSelectedIds(), true));
+  $('#btn-sel-daily-off').addEventListener('click', () => setDailyActive(intlSelectedIds(), false));
   $('#btn-sel-risk').addEventListener('click', () => setStoreRisk('banned'));
   $('#btn-sel-relogin').addEventListener('click', () => {
     const id = [...storeState.selected][0];

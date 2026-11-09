@@ -545,6 +545,27 @@ def rebind(row_id: int, acc: Account, batch: str = "",
         return {"updated": 1, "inserted": 0, "id": int(row_id), "total": 1}
 
 
+def _payload_bool(payload: str, key: str, default: bool = True) -> bool:
+    """从账户快照里读一个布尔开关。
+
+    payload 是完整 Account.to_dict() 的 JSON，字段名是 snake_case。旧库、
+    手工导入、别的写入方都可能缺这个键或写成字符串，一律按缺省值兜住，
+    不让一条脏数据把整个列表接口搞挂。
+    """
+    try:
+        data = json.loads(payload or "{}")
+    except (ValueError, TypeError):
+        return default
+    value = data.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def list_accounts(realm: str = "", query: str = "", limit: int = 500,
                   track: str = "", batch: str = "") -> list[dict]:
     """按版本 / 批次筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。
@@ -587,6 +608,10 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
         # 探针列可能是 NULL（没查过）——sqlite3.Row 缺列时也不会报，这里用
         # keys() 兜一下，兼容升级前的旧库刚打开、ALTER 还没跑到的瞬间。
         keys = row.keys()
+        # hub 的账户级开关叫 tasksEnabled，本项目存成 Account.tasks_enabled。
+        # 只有国际版用它决定「每日活跃」；国内版也给个值，界面自己判断不显示。
+        daily = _payload_bool(row["payload"] if "payload" in keys else "",
+                              "tasks_enabled", True)
         credit_state = (row["credit_state"] if "credit_state" in keys else "") or ""
         checked_at = int((row["checked_at"] if "checked_at" in keys else 0) or 0)
         recheck_state = (row["recheck_state"] if "recheck_state" in keys else "") or ""
@@ -641,6 +666,8 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
             # 出口端口：0 = 直连。节点名由前端拿端口去 nodes 表里查，
             # store 不认识 mihomo，别在这里硬塞一份名单。
             "exit_port": int((row["exit_port"] if "exit_port" in keys else 0) or 0),
+            # 每日活跃（hub: tasksEnabled）。默认开，与 hub 的账户缺省一致。
+            "daily_active": daily,
         })
     return out
 
@@ -1036,6 +1063,46 @@ def set_exit_port(ids: list[int], port: int) -> int:
             [port] + [int(i) for i in ids],
         )
         return cur.rowcount or 0
+
+
+def set_daily_active(ids: list[int], enabled: bool) -> dict[str, int]:
+    """设置国际版账户的每日活跃开关（hub 里的 `tasksEnabled`）。
+
+    值存在 payload 的 Account 快照里，而不是新开一列：导出 hub 账户文件时
+    `to_hub_flat()` 把它渲染成 `tasksEnabled`，导入时 `from_row()` 又读回来，
+    来回只有一份状态，不会和别的列漂移。国内版没有每日活跃，直接排除。
+
+    复杂度 O(n)，n = 选中行数；每行一次 JSON 解析 + 一次 UPDATE，批量只在
+    界面勾选时触发，不是热路径。
+    """
+    wanted = [int(i) for i in (ids or [])]
+    if not wanted:
+        return {"changed": 0, "skipped": 0}
+    placeholders = ",".join("?" * len(wanted))
+    now = _now()
+    with connect() as conn:
+        found = conn.execute(
+            f"SELECT id, realm, payload FROM accounts WHERE id IN ({placeholders})",
+            wanted,
+        ).fetchall()
+        updates = []
+        for row in found:
+            if row["realm"] != "intl":
+                continue
+            try:
+                data = json.loads(row["payload"] or "{}")
+            except (ValueError, TypeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data["tasks_enabled"] = bool(enabled)
+            updates.append((json.dumps(data, ensure_ascii=False), now, int(row["id"])))
+        if updates:
+            conn.executemany(
+                "UPDATE accounts SET payload = ?, updated_at = ? WHERE id = ?",
+                updates,
+            )
+    return {"changed": len(updates), "skipped": len(found) - len(updates)}
 
 
 def exit_ports_of(ids: Iterable[int]) -> dict[int, int]:

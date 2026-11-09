@@ -13,7 +13,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from wk import store  # noqa: E402
+from wk import formats, model, store  # noqa: E402
 from wk.model import Account  # noqa: E402
 
 
@@ -782,6 +782,100 @@ class RecheckApiTests(StoreTestBase):
         })
         self.assertEqual(data["track"], "banned")
         self.assertEqual([r["id"] for r in data["rows"]], [ids["u-a3"]])
+class DailyActiveTests(StoreTestBase):
+    """国际版「每日活跃」= hub 账户文件里的 tasksEnabled，默认开。
+
+    开关存在 payload 的账户快照里：设置 → 列表 → hub 导出 → hub 导入
+    四个环节用的是同一份值，哪一步被冲掉都算回归。
+    """
+
+    def _two_realms(self):
+        store.upsert([self.acc("u-intl", "国际", realm="intl"),
+                     self.acc("u-cn", "国内", realm="cn")])
+        return {r["uid"]: r for r in store.list_accounts()}
+
+    def _hub_row(self, uid="u-hub", enabled=False):
+        return {"uid": uid, "nickname": uid, "realm": "intl",
+                "accessToken": "at-" + uid, "tasksEnabled": enabled}
+
+    def test_default_on_everywhere(self):
+        self._two_realms()
+        self.assertTrue(all(r["daily_active"] for r in store.list_accounts()))
+        self.assertTrue(all(a.tasks_enabled for a in store.load_for_export()))
+        for flat in (formats.to_hub_flat(a) for a in store.load_for_export()):
+            self.assertTrue(flat["tasksEnabled"])
+
+    def test_turn_off_only_intl_and_export_carries_flag(self):
+        rows = self._two_realms()
+        result = store.set_daily_active([rows["u-intl"]["id"], rows["u-cn"]["id"]], False)
+        self.assertEqual(result, {"changed": 1, "skipped": 1})
+        after = {r["uid"]: r for r in store.list_accounts()}
+        self.assertFalse(after["u-intl"]["daily_active"])
+        self.assertTrue(after["u-cn"]["daily_active"])
+        flat = formats.to_hub_flat(store.load_for_export(realm="intl")[0])
+        self.assertFalse(flat["tasksEnabled"])
+
+    def test_turn_back_on(self):
+        rows = self._two_realms()
+        store.set_daily_active([rows["u-intl"]["id"]], False)
+        result = store.set_daily_active([rows["u-intl"]["id"]], True)
+        self.assertEqual(result, {"changed": 1, "skipped": 0})
+        after = {r["uid"]: r for r in store.list_accounts()}
+        self.assertTrue(after["u-intl"]["daily_active"])
+        self.assertTrue(formats.to_hub_flat(
+            store.load_for_export(realm="intl")[0])["tasksEnabled"])
+
+    def test_hub_import_roundtrip(self):
+        acc = model.from_row(self._hub_row(enabled=False))
+        self.assertFalse(acc.tasks_enabled)
+        store.upsert([acc])
+        self.assertFalse(store.list_accounts()[0]["daily_active"])
+        self.assertFalse(formats.to_hub_flat(
+            store.load_for_export()[0])["tasksEnabled"])
+
+        # 从 hub 再导回来关成 True，导入也要认
+        acc2 = model.from_row(self._hub_row(enabled=True))
+        store.upsert([acc2])
+        self.assertTrue(store.list_accounts()[0]["daily_active"])
+
+    def test_bad_payload_does_not_break_list_and_is_repairable(self):
+        rows = self._two_realms()
+        with store.connect() as conn:
+            conn.execute("UPDATE accounts SET payload = '{not json' WHERE realm = 'intl'")
+        listed = store.list_accounts()
+        self.assertEqual(len(listed), 2)
+        self.assertTrue(next(r["daily_active"] for r in listed
+                             if r["uid"] == "u-intl"))
+        result = store.set_daily_active([rows["u-intl"]["id"]], False)
+        self.assertEqual(result["changed"], 1)
+        self.assertFalse(next(r["daily_active"] for r in store.list_accounts()
+                              if r["uid"] == "u-intl"))
+
+    def test_empty_ids_is_noop(self):
+        self.assertEqual(store.set_daily_active([], True),
+                         {"changed": 0, "skipped": 0})
+
+    def test_handler_validates_payload(self):
+        import server
+
+        class Fake:
+            def __init__(self):
+                self.out = None
+
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        fake = Fake()
+        with self.assertRaises(ValueError):
+            server.Handler._store_daily_active(fake, {"ids": [], "enabled": False})
+        with self.assertRaises(ValueError):
+            server.Handler._store_daily_active(fake, {"ids": [1], "enabled": "false"})
+        rows = self._two_realms()
+        server.Handler._store_daily_active(
+            fake, {"ids": [rows["u-intl"]["id"]], "enabled": False})
+        self.assertEqual(fake.out[0], 200)
+        self.assertEqual(fake.out[1]["changed"], 1)
+        self.assertFalse(fake.out[1]["enabled"])
 
 
 if __name__ == "__main__":

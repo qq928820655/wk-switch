@@ -268,6 +268,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._store_assign(payload)
             elif path == "/api/store/exit":
                 self._store_exit(payload)
+            elif path == "/api/store/daily-active":
+                self._store_daily_active(payload)
             elif path == "/api/store/rename":
                 self._store_rename(payload)
             elif path == "/api/store/delete":
@@ -890,6 +892,25 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"端口超出范围：{port}")
         changed = store.set_exit_port(ids, port)
         self._json(200, {"ok": True, "changed": changed, "port": port})
+
+    def _store_daily_active(self, payload: dict) -> None:
+        """逐行 / 批量设置国际版账户的「每日活跃」。
+
+        写的是账户快照里的 `tasks_enabled`：导出 hub 账户文件时渲染成
+        `tasksEnabled`，hub 的调度器据此决定这个号跑不跑每日活跃对话。
+        国内版没有这项任务，store 层会跳过并用 skipped 报回来。
+        """
+        ids = [int(i) for i in (payload.get("ids") or [])
+               if str(i).strip().isdigit()]
+        if not ids:
+            raise ValueError("没有选中账号")
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是 true / false")
+        result = store.set_daily_active(ids, enabled)
+        if not result["changed"]:
+            raise ValueError("选中的账号里没有国际版账户")
+        self._json(200, {"ok": True, "enabled": enabled, **result})
 
     def _store_rename(self, payload: dict) -> None:
         row_id = int(payload.get("id") or 0)
