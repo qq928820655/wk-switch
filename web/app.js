@@ -541,7 +541,46 @@ const storeState = {
   // 出口下拉的选项来自 mihomo 节点表；busyRisk 是风控区已经占住的端口，
   // 一键分配要避开它们，下拉里则照样列出（那是用户手动自定义的范围）。
   nodes: [], available: [], busyRisk: [], exitsLoaded: false,
+  exitProxyLoaded: false,
 };
+
+/** 导出时把「按账户出口写 proxy」的界面设置收成后端要的对象。
+ *  配置还没读回来时返回 null：别拿 HTML 里的空值去覆盖已保存的自定义主机。 */
+function exitProxyPayload() {
+  if (!storeState.exitProxyLoaded) return null;
+  return {
+    enabled: $('#store-exit-proxy').checked,
+    host: $('#store-exit-host').value.trim(),
+    mode: $('#store-exit-mode').value,
+    scope: $('#store-exit-scope').value,
+  };
+}
+
+/** host 留空时显示实际回落到哪台机器，别让人对着空输入框猜。 */
+async function loadExitProxyConfig() {
+  try {
+    const d = await apiGet('/api/store/exit-proxy/config');
+    const c = d.config || {};
+    $('#store-exit-proxy').checked = c.enabled !== false;
+    $('#store-exit-host').value = c.host || '';
+    $('#store-exit-host').placeholder = (d.node_host || '留空沿用节点配置') + '（留空沿用）';
+    $('#store-exit-mode').value = c.mode === 'fill' ? 'fill' : 'override';
+    $('#store-exit-scope').value = c.scope === 'intl' ? 'intl' : 'all';
+    storeState.exitProxyLoaded = true;
+  } catch (err) {
+    /* 读不到就留 HTML 里的默认值，不挡导出 */
+  }
+}
+
+/** 导出回报里带上「这次写了几个 proxy」，避免开关勾了却看不出有没有生效。 */
+function exitProxyToast(data, prefix) {
+  const ep = (data.report && data.report.opts && data.report.opts.exit_proxy) || {};
+  if (!ep.enabled) return `${prefix}（未改 proxy）`;
+  if (!ep.host) return `${prefix}（出口主机没配，proxy 未写）`;
+  return `${prefix}，按出口写 ${ep.applied || 0} 个 proxy` +
+    (ep.cleared ? `、${ep.cleared} 个直连` : '') +
+    (ep.skipped ? `、跳过 ${ep.skipped} 个` : '');
+}
 
 const REALM_PILL = { cn: 'warn', intl: 'brand' };
 const REALM_TEXT = { cn: '国内版', intl: '国际版' };
@@ -1315,7 +1354,10 @@ async function exportSelected() {
   btn.disabled = true;
   btn.textContent = '生成中…';
   try {
-    const data = await api('/api/store/export', { profile: storeState.profile, ids });
+    const ep = exitProxyPayload();
+    const data = await api('/api/store/export', {
+      profile: storeState.profile, ids, ...(ep ? { exit_proxy: ep } : {}),
+    });
     $('#store-downloads').innerHTML = data.files.map((f) => `
       <div class="dl">
         <div>
@@ -1324,7 +1366,7 @@ async function exportSelected() {
         </div>
         <a href="${esc(f.download)}" download="${esc(f.name)}">下载</a>
       </div>`).join('');
-    toast(`已导出 ${ids.length} 条`);
+    toast(exitProxyToast(data, `已导出 ${ids.length} 条`));
   } catch (err) {
     toast(err.message, true);
   } finally {
@@ -1530,6 +1572,9 @@ async function storeExport() {
       // 范围由这里明确说清：服务端不再靠「有没有 ids」猜
       scope: partial ? 'selected' : 'all',
     };
+    const ep = exitProxyPayload();
+    // 按每个账户自己的出口端口写 proxy，导出即存为默认配置
+    if (ep) payload.exit_proxy = ep;
     if (ids.length) payload.ids = ids;
     const data = await api('/api/store/export', payload);
     const scope = partial ? `已选 ${ids.length} 条` : `全部 ${total} 条`;
@@ -1541,7 +1586,7 @@ async function storeExport() {
         </div>
         <a href="${esc(f.download)}" download="${esc(f.name)}">下载</a>
       </div>`).join('');
-    toast(`已生成 ${data.files.length} 个文件（${scope}）`);
+    toast(exitProxyToast(data, `已生成 ${data.files.length} 个文件（${scope}）`));
   } catch (err) {
     toast(err.message, true);
   } finally {
@@ -3081,6 +3126,7 @@ function bind() {
 }
 
 bind();
+loadExitProxyConfig();
 loadProfiles()
   .then(() => loadStoreProfiles())
   .catch(() => toast('格式列表加载失败', true));

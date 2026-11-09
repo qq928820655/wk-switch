@@ -760,13 +760,19 @@ def recheck_stats() -> dict[str, Any]:
     return {**counts, "tracked": sum(counts.values())}
 
 
-def load_for_export(realm: str = "", ids: list[int] | None = None) -> list[Account]:
+def load_for_export(realm: str = "", ids: list[int] | None = None,
+                    with_ids: bool = False):
     """把库里的记录还原成 Account，供导出渲染。
 
     payload 里存的是完整 Account 快照，直接反序列化即可——比逐列重建可靠，
     也不会漏掉后续版本新增的字段。
+
+    ``with_ids=True`` 额外返回 ``(row_id, Account, exit_port)`` 三元组：
+    exit_port 是 DB 独立列、不进 payload，但导出时要按它给每个账户写各自的
+    proxy（见 wk/exitproxy.py），所以这里一次 SQL 带出来，别让调用方再查
+    一遍库靠 uid 对齐——uid 可能重复，row_id 才是唯一身份。
     """
-    sql = "SELECT payload FROM accounts WHERE 1=1"
+    sql = "SELECT id, payload, IFNULL(exit_port,0) AS exit_port FROM accounts WHERE 1=1"
     args: list[Any] = []
     if realm in ("cn", "intl"):
         sql += " AND realm = ?"
@@ -777,14 +783,18 @@ def load_for_export(realm: str = "", ids: list[int] | None = None) -> list[Accou
         args.extend(ids)
     sql += " ORDER BY id"
 
-    out: list[Account] = []
+    out: list[Any] = []
     with connect() as conn:
         for row in conn.execute(sql, args).fetchall():
             try:
                 data = json.loads(row["payload"] or "{}")
             except ValueError:
                 continue
-            out.append(_account_from_payload(data))
+            acc = _account_from_payload(data)
+            if with_ids:
+                out.append((int(row["id"]), acc, int(row["exit_port"] or 0)))
+            else:
+                out.append(acc)
     return out
 
 

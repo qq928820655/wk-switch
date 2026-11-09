@@ -18,8 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from wk import (auth, clock, formats, pipeline, probe, recheck, store,
-                update as updater, version, weblogin)
+from wk import (auth, clock, exitproxy, formats, pipeline, probe, recheck,
+                store, update as updater, version, weblogin)
 from wk.model import Account
 
 ROOT = Path(__file__).resolve().parent
@@ -202,6 +202,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/store/login/config":
             self._store_login_config()
             return
+        if path == "/api/store/exit-proxy/config":
+            self._store_exit_proxy_config()
+            return
         if path == "/api/store/exits":
             self._store_exits()
             return
@@ -270,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._store_exit(payload)
             elif path == "/api/store/daily-active":
                 self._store_daily_active(payload)
+            elif path == "/api/store/exit-proxy/config":
+                self._store_exit_proxy_save(payload)
             elif path == "/api/store/rename":
                 self._store_rename(payload)
             elif path == "/api/store/delete":
@@ -912,6 +917,24 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("选中的账号里没有国际版账户")
         self._json(200, {"ok": True, "enabled": enabled, **result})
 
+    def _store_exit_proxy_config(self) -> None:
+        """导出卡片的「按账户出口写 proxy」默认值。单独一个轻量 GET。"""
+        cfg = exitproxy.load_config()
+        self._json(200, {
+            "ok": True,
+            "config": cfg,
+            # 界面上 host 输入框留空时显示这个回落值，让人知道实际用哪台机器
+            "resolved_host": exitproxy.resolve_host(cfg),
+            "node_host": exitproxy.resolve_host({**cfg, "host": ""}),
+        })
+
+    def _store_exit_proxy_save(self, payload: dict) -> None:
+        """只保存配置、不导出。导出接口带 exit_proxy 时也会走同一份落盘逻辑。"""
+        patch = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+        cfg = exitproxy.save_config(patch)
+        self._json(200, {"ok": True, "config": cfg,
+                         "resolved_host": exitproxy.resolve_host(cfg)})
+
     def _store_rename(self, payload: dict) -> None:
         row_id = int(payload.get("id") or 0)
         name = str(payload.get("name") or "")
@@ -947,22 +970,37 @@ class Handler(BaseHTTPRequestHandler):
         if asked == "all":
             ids = None
 
+        # 每次导出都按 DB 的 exit_port 给每个账户写自己的 proxy。
+        # payload.exit_proxy 是界面上的本次设置（导出即存为默认）；不传就用
+        # config/exitproxy.json；显式传 false 表示这次不改账户文件、也不落盘。
+        asked_proxy = payload.get("exit_proxy", None)
+        if isinstance(asked_proxy, dict):
+            proxy_cfg = exitproxy.save_config(asked_proxy)
+        elif isinstance(asked_proxy, bool) and not asked_proxy:
+            proxy_cfg = {**exitproxy.load_config(), "enabled": False}
+        else:
+            proxy_cfg = exitproxy.load_config()
+
         if ids:
             ids = [int(i) for i in ids]
-            accounts = store.load_for_export(ids=ids)
+            rows = store.load_for_export(ids=ids, with_ids=True)
             scope = "selected"
             # 分版本导出对「已选中的这批」照样有效：拆包只看 realm，不看范围。
             realm_mode = "split" if realm_mode == "split" else "all"
         elif realm_mode in ("cn", "intl"):
-            accounts = store.load_for_export(realm=realm_mode)
+            rows = store.load_for_export(realm=realm_mode, with_ids=True)
         else:
-            accounts = store.load_for_export()
+            rows = store.load_for_export(with_ids=True)
 
-        if not accounts:
+        if not rows:
             raise ValueError("本地库里没有可导出的账号")
 
+        proxy_stat = exitproxy.apply(rows, proxy_cfg)
+        accounts = [acc for _row_id, acc, _port in rows]
+
         outputs = self._build_exports(accounts, profile_id, realm_mode)
-        self._respond_files(outputs, profile_id, {"scope": scope},
+        self._respond_files(outputs, profile_id,
+                            {"scope": scope, "exit_proxy": proxy_stat},
                             realm_mode, len(accounts))
 
     # ---- 在线升级 -------------------------------------------------

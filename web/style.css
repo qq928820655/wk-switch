@@ -672,6 +672,52 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 .realm-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
 .realm-label { font-size: 12px; color: var(--ink-3); margin-right: 2px; }
 
+/* 导出时按账户出口写 proxy 的一行设置：开关 + 主机 + 策略 + 范围。
+   放在 realm-row 下面，宽度超了就自动换行，不撑破卡片。 */
+.exit-proxy-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: #fbfbff;
+}
+.ep-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ep-toggle input { width: 15px; height: 15px; accent-color: var(--brand); }
+.ep-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.ep-field input[type="text"], .ep-field select {
+  height: 30px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 12px;
+  font-family: inherit;
+}
+.ep-field input[type="text"] { width: 180px; }
+.ep-field select { min-width: 78px; }
+#store-exit-proxy-hint { margin: 8px 0 0; line-height: 1.6; }
+
 .chip {
   display: inline-flex;
   align-items: center;
@@ -996,6 +1042,12 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 
 @media (max-width: 480px) {
   .profiles.compact { grid-template-columns: 1fr; }
+  /* 出口设置：开关独占一行，主机独占一行，策略/范围各半行 */
+  .exit-proxy-row { gap: 7px 8px; padding: 9px 10px; }
+  .ep-toggle { flex: 1 1 100%; }
+  .ep-field { flex: 1 1 calc(50% - 4px); min-width: 0; }
+  .ep-field.ep-host { flex: 1 1 100%; }
+  .ep-field input[type="text"], .ep-field select { width: 100%; min-width: 0; }
   .store-stats { gap: 8px; }
   /* 两个统计卡各占半行，内容按半卡宽度收紧：标题、色块、数字都不换行 */
   .stat-box { padding: 10px 11px; min-width: 0; }

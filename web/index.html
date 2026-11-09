@@ -317,6 +317,31 @@
       </div>
     </div>
 
+    <div class="exit-proxy-row" id="store-exit-proxy-row">
+      <label class="ep-toggle">
+        <input type="checkbox" id="store-exit-proxy" checked>
+        <span>按账户出口写 proxy</span>
+      </label>
+      <label class="ep-field ep-host">主机
+        <input type="text" id="store-exit-host" placeholder="留空沿用节点配置" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="ep-field">策略
+        <select id="store-exit-mode">
+          <option value="override">覆盖</option>
+          <option value="fill">仅补空</option>
+        </select>
+      </label>
+      <label class="ep-field">范围
+        <select id="store-exit-scope">
+          <option value="all">全部账户</option>
+          <option value="intl">仅国际版</option>
+        </select>
+      </label>
+    </div>
+    <p class="hint" id="store-exit-proxy-hint">
+      每个账户按自己配的出口端口写成 <span class="mono">http://主机:端口</span>，并清掉 <span class="mono">proxySlot</span>；hub 的每日活跃、对话就按号走各自的节点。端口 0 写成直连，主机留空沿用节点配置，设置随每次导出保存为默认。
+    </p>
+
     <div class="export-bar">
       <button class="btn primary" id="btn-store-export" disabled>从库导出</button>
       <span class="hint" id="store-export-hint">先选择一种目标格式</span>
