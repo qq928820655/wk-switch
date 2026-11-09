@@ -994,11 +994,11 @@ div[id^="view-"].hidden { display: none !important; }
   main { padding: 16px 14px 56px; gap: 14px; }
   .card { padding: 16px 15px 18px; border-radius: 12px; }
   .card-head { flex-wrap: wrap; gap: 4px 10px; }
-  /* 五个 tab 在 360px 下比一行宽 40 多像素：不收缩的话整个 body 被撑到 418，
-     浏览器再把页面缩回去，所有基于 375 的布局判断都失真。让它自己横向滚。 */
-  .tabs { max-width: 100%; min-width: 0; overflow-x: auto; scrollbar-width: none; }
-  .tabs::-webkit-scrollbar { display: none; }
-  .tab { padding: 6px 10px; font-size: 12px; }
+  /* 五个 tab 在 360px 下比一行宽 40 多像素。以前让它横向滚，可滚动条是隐掉的，
+     等于把「封号复检」「升级」藏起来——用户根本不知道右边还有。改成折行：
+     第一行三个、第二行两个，全部可见，不依赖「发现这里能滑」。 */
+  .tabs { width: 100%; max-width: 100%; min-width: 0; flex-wrap: wrap; overflow: visible; }
+  .tab { flex: 1 1 auto; padding: 6px 10px; font-size: 12px; text-align: center; }
   .brand p { display: none; }
   .steps { width: 100%; justify-content: space-between; }
   .step { padding: 4px 8px; font-size: 12px; }
@@ -2041,6 +2041,9 @@ div[id^="view-"].hidden { display: none !important; }
 }
 
 /* ---------- 每日活跃 ---------- */
+/* 记录表的「结果」胶囊在窄屏内联到账号格（少一列就少一份 padding）。
+   默认值必须放在这里而不是文件末尾——媒体查询里的 display 会被同优先级但
+   后出现的规则盖掉（踩过）。 */
 .da-pill-inline { display: none; }
 
 .da-actions {
@@ -2105,27 +2108,56 @@ div[id^="view-"].hidden { display: none !important; }
 }
 
 @media (max-width: 720px) {
-  /* 账号表：窄屏砍掉「上次活跃」，名称列吃剩余宽度。colgroup 的固定像素宽
-     在窄屏就是溢出的元凶——fixed 布局按 col 宽度算，藏掉列也不会让出空间。 */
-  /* 7 列：勾选 / 名称 / 活跃 / 出口 / 今日 / 上次活跃 / 操作。
-     窄屏藏「出口」和「上次活跃」——能改活跃、能看今天成没成，这两个才是这
-     一页的用途；出口配置在账户库里改。 */
-  #da-accounts th:nth-child(4),
-  #da-accounts td:nth-child(4),
-  #da-accounts th:nth-child(6),
-  #da-accounts td:nth-child(6) { display: none; }
+  /* 账号表在手机上改成卡片式：每个账号两行 —— 第一行名字独占整行，第二行是
+     开关 / 今日 / 跑一次。继续用表格 + fixed 布局是「名称显示不全」的根因：
+     360px 下名称列只剩 111px，agnete-brain-alpha-01 这类长号必然被截成八个
+     字符。调列宽治不好（四个格子加起来已经占满 302px），只能换结构。
+     表格本身留着，只把 tr 变 grid、thead 收起来，DOM 不分叉。 */
+  #da-accounts thead { display: none; }
+  #da-accounts, #da-accounts tbody { display: block; width: 100%; }
   #da-accounts colgroup { display: none; }
-  #da-accounts { table-layout: fixed; width: 100%; }
-  #da-accounts td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #da-accounts th, #da-accounts td,
+  #da-accounts tbody tr {
+    display: grid;
+    grid-template-columns: 20px 1fr auto auto;
+    grid-template-areas:
+      "chk name name  name"
+      ".   act  today run";
+    align-items: center;
+    gap: 7px 8px;
+    padding: 9px 8px;
+    border-bottom: 1px solid var(--line-2);
+  }
+  #da-accounts tbody tr:last-child { border-bottom: 0; }
+  #da-accounts tbody td {
+    display: block;
+    padding: 0;
+    border: 0;
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    box-sizing: border-box;
+  }
+  #da-accounts td:nth-child(1) { grid-area: chk; }
+  #da-accounts td:nth-child(2) {
+    grid-area: name;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    word-break: normal;
+  }
+  #da-accounts td:nth-child(3) { grid-area: act; }
+  #da-accounts td:nth-child(5) { grid-area: today; }
+  #da-accounts td:nth-child(7) { grid-area: run; text-align: right; }
+  /* 出口和上次活跃在手机上没用：出口在账户库里改，上次时间点进去看记录表 */
+  #da-accounts td:nth-child(4), #da-accounts td:nth-child(6) { display: none; }
+  /* 空表提示只有一格 td，grid-area 没定义，让它横跨整行 */
+  #da-accounts td.empty-cell { grid-column: 1 / -1; text-align: center; padding: 18px 0; }
+  /* 记录表仍是表格，四列的 padding 收一点才装得下 */
   #da-log th, #da-log td { padding: 7px 6px; }
-  #da-accounts th:nth-child(1), #da-accounts td:nth-child(1) { width: 26px; }
-  #da-accounts th:nth-child(3), #da-accounts td:nth-child(3) { width: 60px; }
-  #da-accounts th:nth-child(5), #da-accounts td:nth-child(5) { width: 58px; }
-  #da-accounts th:nth-child(7), #da-accounts td:nth-child(7) { width: 50px; }
   .da-reason-full { display: none; }
   .da-reason-short { display: inline; }
-  #da-accounts td:nth-child(2) { word-break: break-all; }
   .da-actions .btn { font-size: 12px; padding: 0 8px; }
 }
 

@@ -3228,14 +3228,17 @@ function renderDaAccounts() {
       ? '<span class="pill ok">已完成</span>'
       : (r.last_at && !r.last_ok ? '<span class="pill bad">失败</span>'
         : '<span class="pill mute">未跑</span>');
+    // 窄屏靠 CSS 把 tr 变成两行网格（名称独占第一行），不在这里做结构分叉。
     return `<tr data-id="${r.id}" class="${on ? 'sel' : ''}${r.risk ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="da-check" ${on ? 'checked' : ''}></td>
       <td title="${esc(r.uid)}"><b>${esc(r.name)}</b></td>
       <td class="da-active">${daActiveCell(r)}</td>
       <td class="mono">${esc(daExitText(r.exit_port))}</td>
-      <td>${today}</td>
+      <td class="da-today">${today}</td>
       <td class="mono" title="${esc(r.last_detail || '')}">${esc(r.last_at_text || '—')}</td>
-      <td class="row-actions"><button class="link" data-act="run-one">跑一次</button></td>
+      <td class="row-actions">${r.risk
+    ? '<button class="link" disabled title="风控号不参与每日活跃，移出风控后才能跑">跑一次</button>'
+    : '<button class="link" data-act="run-one" title="立刻跑这个号，不受「跳过今日已完成」影响">跑一次</button>'}</td>
     </tr>`;
   }).join('');
   const sel = daState.selected.size;
@@ -3335,11 +3338,18 @@ function daStartPoll() {
   tick();
 }
 
-async function daRun(scope, ids) {
+/** 触发一批。`opts.skipDone` 能强制覆盖「跳过今日已完成」——
+ *  行内「跑一次」必须传 false：那个按钮的语义是「现在就跑这一个」，
+ *  被默认的 skip_done 吞掉会变成「点了没反应」，让人以为要先勾选。 */
+async function daRun(scope, ids, opts) {
+  const force = opts && typeof opts.skipDone === 'boolean' ? opts.skipDone : null;
   const btns = ['#btn-da-run-pending', '#btn-da-run-all'];
   btns.forEach((k) => { $(k).disabled = true; });
   try {
-    const payload = { scope, skip_done: $('#da-skip-done').checked };
+    const payload = {
+      scope,
+      skip_done: force === null ? $('#da-skip-done').checked : force,
+    };
     if (ids && ids.length) payload.ids = ids;
     const data = await api('/api/activity/run', payload);
     if (!data.started) {
@@ -3417,8 +3427,16 @@ function bindActivity() {
       daSetActive([id], toggle.dataset.on !== '1', toggle);
       return;
     }
-    if (e.target.dataset.act === 'run-one') {
-      daRun('selected', [id]);
+    // 行内「跑一次」：只跑这一行，强制忽略「跳过今日已完成」。
+    // 用 closest 而不是 e.target.dataset —— 以后按钮里塞图标/文字节点就取不到。
+    const runOne = e.target.closest('button[data-act="run-one"]');
+    if (runOne) {
+      const row = daState.rows.find((r) => r.id === id);
+      if (row && row.risk) {
+        toast('风控号不参与每日活跃，移出风控后再跑', true);
+        return;
+      }
+      daRun('selected', [id], { skipDone: false });
     }
   });
 }
