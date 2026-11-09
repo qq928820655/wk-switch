@@ -2663,11 +2663,15 @@ function switchView(view) {
   });
   $('#view-convert').classList.toggle('hidden', view !== 'convert');
   $('#view-store').classList.toggle('hidden', view !== 'store');
+  $('#view-activity').classList.toggle('hidden', view !== 'activity');
   $('#view-recheck').classList.toggle('hidden', view !== 'recheck');
   $('#view-update').classList.toggle('hidden', view !== 'update');
   if (view === 'store') {
     loadStore().catch((err) => toast(err.message, true));
     loadStoreProfiles();
+  }
+  if (view === 'activity') {
+    loadActivity().catch((err) => toast(err.message, true));
   }
   if (view === 'recheck') {
     loadRecheck().catch((err) => toast(err.message, true));
@@ -3116,17 +3120,288 @@ function bind() {
   const sample = params.get('sample');
   if (sample) loadSample(sample === '1' ? '' : sample);
 
-  // ?view=store|update 直接打开对应视图（书签/深链用）
+  // ?view=store|activity|update 直接打开对应视图（书签/深链用）
   const view = params.get('view');
-  if (view === 'store' || view === 'update') switchView(view);
+  if (view === 'store' || view === 'activity' || view === 'update') switchView(view);
 
   // 整页拖入也接住，避免浏览器直接打开文件
   window.addEventListener('dragover', (e) => e.preventDefault());
   window.addEventListener('drop', (e) => e.preventDefault());
 }
 
+/* ---------- 每日活跃 ---------- */
+
+const daState = {
+  cfg: null,
+  rows: [],
+  selected: new Set(),
+  pollTimer: null,
+  loaded: false,
+};
+
+/** 配置 → 表单。缺字段按默认值填，不让输入框空着。 */
+function daFillForm(cfg) {
+  daState.cfg = cfg;
+  $('#da-enabled').checked = cfg.enabled !== false;
+  $('#da-web').checked = cfg.web !== false;
+  $('#da-desktop').checked = cfg.desktop !== false;
+  $('#da-use-exit').checked = cfg.use_exit !== false;
+  $('#da-skip-done').checked = cfg.skip_done !== false;
+  $('#da-model').value = cfg.chat_model || 'deepseek-v4.1-flash';
+  $('#da-models').value = cfg.models || '';
+  $('#da-timeout').value = cfg.timeout || 120;
+  $('#da-rounds').value = cfg.rounds || 2;
+  $('#da-concurrency').value = cfg.concurrency || 2;
+  $('#da-daily-at').value = cfg.daily_at || '08:30';
+  $('#da-interval').value = cfg.interval_minutes || 30;
+  $('#da-proxy').value = cfg.proxy || '';
+  $('#da-fallback').value = cfg.fallback_proxy || '';
+  $('#da-prompt').value = cfg.prompt || 'Hi';
+}
+
+function daFormRead() {
+  return {
+    enabled: $('#da-enabled').checked,
+    web: $('#da-web').checked,
+    desktop: $('#da-desktop').checked,
+    use_exit: $('#da-use-exit').checked,
+    skip_done: $('#da-skip-done').checked,
+    chat_model: $('#da-model').value.trim() || 'deepseek-v4.1-flash',
+    models: $('#da-models').value.trim(),
+    timeout: Number($('#da-timeout').value) || 120,
+    rounds: Number($('#da-rounds').value) || 2,
+    concurrency: Number($('#da-concurrency').value) || 2,
+    daily_at: $('#da-daily-at').value || '08:30',
+    interval_minutes: Number($('#da-interval').value) || 30,
+    proxy: $('#da-proxy').value.trim(),
+    fallback_proxy: $('#da-fallback').value.trim(),
+    prompt: $('#da-prompt').value.trim() || 'Hi',
+  };
+}
+
+async function loadActivity() {
+  const data = await apiGet('/api/activity/config');
+  daFillForm(data.config);
+  renderDaStats(data.summary);
+  daState.loaded = true;
+  await Promise.all([loadDaAccounts(), loadDaLog()]);
+  if (data.state && data.state.running) daStartPoll();
+}
+
+async function loadDaAccounts() {
+  const data = await apiGet('/api/activity/accounts');
+  daState.rows = data.rows || [];
+  renderDaAccounts();
+  renderDaStats(data.summary);
+  daRenderState(data.state);
+}
+
+async function loadDaLog() {
+  const range = $('#da-range').value || '7d';
+  const result = $('#da-result').value || '';
+  const data = await apiGet(
+    `/api/activity/list?range=${encodeURIComponent(range)}&result=${encodeURIComponent(result)}&limit=200`);
+  renderDaLog(data.rows || []);
+  renderDaStats(data.summary);
+}
+
+function renderDaStats(summary) {
+  if (!summary) return;
+  $('#da-stats').innerHTML = `
+    <div class="stat-box">
+      <h3>今日成功 <b>${summary.today_ok || 0}</b></h3>
+      <div class="mini-row">
+        <span class="stat-mini"><i style="background:#16a34a"></i>失败 ${summary.today_failed || 0}</span>
+        <span class="stat-mini"><i style="background:#94a3b8"></i>跳过 ${summary.today_skipped || 0}</span>
+      </div>
+    </div>
+    <div class="stat-box">
+      <h3>近 7 天成功 <b>${summary.week_ok || 0}</b></h3>
+      <div class="mini-row">
+        <span class="stat-mini"><i style="background:#dc2626"></i>失败 ${summary.week_failed || 0}</span>
+      </div>
+    </div>`;
+}
+
+function daRenderState(st) {
+  if (!st) return;
+  if (st.running) {
+    $('#da-state').textContent =
+      `运行中 ${st.done}/${st.total}（成功 ${st.ok} · 失败 ${st.failed}）`;
+    return;
+  }
+  if (st.finished_at) {
+    $('#da-state').textContent =
+      `上批 ${st.total} 个：成功 ${st.ok} · 失败 ${st.failed} · 跳过 ${st.skipped}`;
+    return;
+  }
+  $('#da-state').textContent = '未运行';
+}
+
+function daExitText(port) {
+  return port ? String(port) : '直连';
+}
+
+function renderDaAccounts() {
+  const body = $('#da-accounts tbody');
+  if (!daState.rows.length) {
+    body.innerHTML = '<tr><td colspan="6" class="empty-cell">账户库里还没有国际版账号。先在「导入转换」或「官网登录」里加号。</td></tr>';
+    $('#da-accounts-hint').textContent = '';
+    return;
+  }
+  body.innerHTML = daState.rows.map((r) => {
+    const on = daState.selected.has(r.id);
+    const today = r.today_ok
+      ? '<span class="pill ok">已完成</span>'
+      : (r.last_at && !r.last_ok ? '<span class="pill bad">失败</span>'
+        : '<span class="pill mute">未跑</span>');
+    const off = r.daily_active ? '' : ' <span class="pill mute" title="账户库里关掉了每日活跃">已关</span>';
+    return `<tr data-id="${r.id}" class="${on ? 'sel' : ''}">
+      <td class="col-check"><input type="checkbox" class="da-check" ${on ? 'checked' : ''}></td>
+      <td title="${esc(r.uid)}"><b>${esc(r.name)}</b>${off}</td>
+      <td class="mono">${esc(daExitText(r.exit_port))}</td>
+      <td>${today}</td>
+      <td class="mono" title="${esc(r.last_detail || '')}">${esc(r.last_at_text || '—')}</td>
+      <td class="row-actions"><button class="link" data-act="run-one">跑一次</button></td>
+    </tr>`;
+  }).join('');
+  const sel = daState.selected.size;
+  $('#da-accounts-hint').textContent =
+    `共 ${daState.rows.length} 个国际版账号${sel ? ` · 已选 ${sel} 个` : ''}`;
+}
+
+function renderDaLog(rows) {
+  const body = $('#da-log tbody');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="8" class="empty-cell">这个区间里还没有活跃记录。</td></tr>';
+    $('#da-log-hint').textContent = '';
+    return;
+  }
+  body.innerHTML = rows.map((r) => {
+    const pill = r.skipped ? '<span class="pill mute">跳过</span>'
+      : (r.ok ? '<span class="pill ok">成功</span>' : '<span class="pill bad">失败</span>');
+    const mode = r.mode === 'web+desktop' ? '网页+桌面'
+      : (r.mode === 'web' ? '网页' : (r.mode === 'desktop' ? '桌面' : (r.phase || '—')));
+    const at = String(r.at_text || '');
+    return `<tr>
+      <td class="mono da-at"><span class="at-full">${esc(at)}</span><span class="at-short">${esc(at.slice(5, 16))}</span></td>
+      <td title="${esc(r.uid)}"><b>${esc(r.name)}</b><span class="da-pill-inline">${pill}</span></td>
+      <td class="da-result">${pill}</td>
+      <td>${esc(mode)}</td>
+      <td class="mono">${esc(r.model || '—')}</td>
+      <td class="mono" title="${esc(r.proxy || '')}">${esc((r.proxy || '').replace(/^https?:\/\//, '') || '直连')}</td>
+      <td class="mono">${r.elapsed_ms ? (r.elapsed_ms / 1000).toFixed(1) + 's' : '—'}</td>
+      <td class="da-detail" title="${esc(r.detail || '')}">${esc(r.detail || '—')}</td>
+    </tr>`;
+  }).join('');
+  $('#da-log-hint').textContent = `共 ${rows.length} 条（最新在前）`;
+}
+
+function daStartPoll() {
+  if (daState.pollTimer) return;
+  $('#da-dot').hidden = false;
+  const tick = async () => {
+    try {
+      const data = await apiGet('/api/activity/state');
+      daRenderState(data.state);
+      if (!data.state.running) {
+        clearInterval(daState.pollTimer);
+        daState.pollTimer = null;
+        $('#da-dot').hidden = true;
+        await Promise.all([loadDaAccounts(), loadDaLog()]);
+        toast('本批活跃跑完了');
+        return;
+      }
+      await loadDaAccounts();
+    } catch (err) {
+      clearInterval(daState.pollTimer);
+      daState.pollTimer = null;
+      $('#da-dot').hidden = true;
+    }
+  };
+  daState.pollTimer = setInterval(tick, 1800);
+  tick();
+}
+
+async function daRun(scope, ids) {
+  const btns = ['#btn-da-run-pending', '#btn-da-run-all'];
+  btns.forEach((k) => { $(k).disabled = true; });
+  try {
+    const payload = { scope, skip_done: $('#da-skip-done').checked };
+    if (ids && ids.length) payload.ids = ids;
+    const data = await api('/api/activity/run', payload);
+    if (!data.started) {
+      toast(data.msg || '没有要跑的账号');
+      return;
+    }
+    toast(`已开始跑 ${data.started} 个号`);
+    daStartPoll();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btns.forEach((k) => { $(k).disabled = false; });
+  }
+}
+
+async function daSave() {
+  const btn = $('#btn-da-save');
+  btn.disabled = true;
+  try {
+    const data = await api('/api/activity/config', daFormRead());
+    daFillForm(data.config);
+    toast('每日活跃设置已保存');
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function bindActivity() {
+  $('#btn-da-save').addEventListener('click', daSave);
+  // 勾了号就只跑勾的，没勾就跑今天还没成功的那些
+  $('#btn-da-run-pending').addEventListener('click', () => {
+    if (daState.selected.size) daRun('selected', [...daState.selected]);
+    else daRun('pending');
+  });
+  $('#btn-da-run-all').addEventListener('click', () => daRun('all'));
+  $('#btn-da-refresh').addEventListener('click', () => {
+    loadActivity().catch((err) => toast(err.message, true));
+  });
+  $('#btn-da-log-refresh').addEventListener('click', () => {
+    loadDaLog().catch((err) => toast(err.message, true));
+  });
+  $('#da-range').addEventListener('change', () => {
+    loadDaLog().catch((err) => toast(err.message, true));
+  });
+  $('#da-result').addEventListener('change', () => {
+    loadDaLog().catch((err) => toast(err.message, true));
+  });
+
+  // 账号勾选：只用来「跑选中的」，与账户库那套勾选集不共享
+  $('#da-check-all').addEventListener('change', (e) => {
+    daState.selected.clear();
+    if (e.target.checked) daState.rows.forEach((r) => daState.selected.add(r.id));
+    renderDaAccounts();
+  });
+
+  $('#da-accounts tbody').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr');
+    if (!tr) return;
+    const id = Number(tr.dataset.id);
+    if (e.target.classList.contains('da-check')) {
+      if (e.target.checked) daState.selected.add(id); else daState.selected.delete(id);
+      renderDaAccounts();
+      return;
+    }
+    if (e.target.dataset.act === 'run-one') {
+      daRun('selected', [id]);
+    }
+  });
+}
+
 bind();
-loadExitProxyConfig();
+bindActivity();
 loadProfiles()
   .then(() => loadStoreProfiles())
   .catch(() => toast('格式列表加载失败', true));

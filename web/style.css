@@ -977,6 +977,11 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   main { padding: 16px 14px 56px; gap: 14px; }
   .card { padding: 16px 15px 18px; border-radius: 12px; }
   .card-head { flex-wrap: wrap; gap: 4px 10px; }
+  /* 五个 tab 在 360px 下比一行宽 40 多像素：不收缩的话整个 body 被撑到 418，
+     浏览器再把页面缩回去，所有基于 375 的布局判断都失真。让它自己横向滚。 */
+  .tabs { max-width: 100%; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { padding: 6px 10px; font-size: 12px; }
   .brand p { display: none; }
   .steps { width: 100%; justify-content: space-between; }
   .step { padding: 4px 8px; font-size: 12px; }
@@ -2017,4 +2022,82 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   .wl-grid { grid-template-columns: 1fr; }
   .wl-line { align-items: stretch; flex-direction: column; gap: 6px; }
   .wl-form > .btn { width: 100%; }
+}
+
+/* ---------- 每日活跃 ---------- */
+.da-pill-inline { display: none; }
+
+.da-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 16px 0 10px;
+}
+.da-actions .btn { flex: none; height: 34px; }
+#da-stats { margin-bottom: 14px; }
+
+/* 说明可能很长：单行省略，全文走 title。多行会把表格撑成一片高墙。 */
+#da-log .da-detail {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#da-log tbody td,
+#da-accounts tbody td { vertical-align: middle; }
+#da-accounts tbody tr.sel { background: #f7f7ff; }
+
+@media (max-width: 900px) {
+  .da-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .da-actions .btn { width: 100%; }
+}
+
+/* 记录表 8 列：1000px 以下放不下（colgroup 固定宽度合计 752 + 说明列），
+   先砍「阶段 / 模型 / 出口」——这三项排查时才看，手机上更用不上。 */
+@media (max-width: 1000px) {
+  #da-log th:nth-child(4), #da-log td:nth-child(4),
+  #da-log th:nth-child(5), #da-log td:nth-child(5),
+  #da-log th:nth-child(6), #da-log td:nth-child(6) { display: none; }
+  #da-log colgroup { display: none; }
+  /* auto 布局下「说明」的最小内容宽度会把表撑到 550px 以上；fixed 才锁得住。 */
+  #da-log { table-layout: fixed; width: 100%; }
+  #da-log th, #da-log td { box-sizing: border-box; }
+  #da-log td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #da-log th:nth-child(1), #da-log td:nth-child(1) { width: 96px; }
+  #da-log th:nth-child(2), #da-log td:nth-child(2) { width: 30%; }
+  #da-log th:nth-child(3), #da-log td:nth-child(3) { width: 50px; }
+  #da-log th:nth-child(7), #da-log td:nth-child(7) { width: 50px; }
+  /* 窄屏把「结果」并进账号格：少一列就少一份 padding，表格才真的装得下。
+     结果列本身藏掉，pill 挪到名称后面。 */
+  #da-log th:nth-child(3), #da-log td:nth-child(3) { display: none; }
+  #da-log th:nth-child(2), #da-log td:nth-child(2) { width: 34%; }
+  .da-pill-inline { display: inline-block; margin-left: 5px; }
+  #da-log .da-detail { max-width: none; }
+}
+
+@media (max-width: 720px) {
+  /* 账号表：窄屏砍掉「上次活跃」，名称列吃剩余宽度。colgroup 的固定像素宽
+     在窄屏就是溢出的元凶——fixed 布局按 col 宽度算，藏掉列也不会让出空间。 */
+  #da-accounts th:nth-child(5),
+  #da-accounts td:nth-child(5) { display: none; }
+  #da-accounts colgroup { display: none; }
+  #da-accounts { table-layout: fixed; width: 100%; }
+  #da-accounts td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #da-accounts th, #da-accounts td,
+  #da-log th, #da-log td { padding: 7px 6px; }
+  #da-accounts th:nth-child(1), #da-accounts td:nth-child(1) { width: 26px; }
+  #da-accounts th:nth-child(3), #da-accounts td:nth-child(3) { width: 52px; }
+  #da-accounts th:nth-child(4), #da-accounts td:nth-child(4) { width: 58px; }
+  #da-accounts th:nth-child(6), #da-accounts td:nth-child(6) { width: 58px; }
+  #da-accounts td:nth-child(2) { word-break: break-all; }
+  .da-actions .btn { font-size: 12px; padding: 0 8px; }
+}
+
+/* 时间列：桌面放完整「2026-11-09 19:56:09」，窄屏只留「11-09 19:56」。
+   108px 塞 19 个等宽字符必然截断，换短格式比加宽列更划算。 */
+.da-at .at-short { display: none; }
+
+@media (max-width: 720px) {
+  .da-at .at-full { display: none; }
+  .da-at .at-short { display: inline; }
 }

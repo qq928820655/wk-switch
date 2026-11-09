@@ -18,8 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from wk import (auth, clock, exitproxy, formats, pipeline, probe, recheck,
-                store, update as updater, version, weblogin)
+from wk import (activity, auth, clock, exitproxy, formats, pipeline, probe,
+                recheck, store, update as updater, version, weblogin)
 from wk.model import Account
 
 ROOT = Path(__file__).resolve().parent
@@ -226,6 +226,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/recheck/picker":
             self._recheck_picker()
             return
+        if path == "/api/activity/config":
+            self._activity_config_get()
+            return
+        if path == "/api/activity/list":
+            self._activity_list()
+            return
+        if path == "/api/activity/state":
+            self._json(200, {"ok": True, "state": activity.state()})
+            return
+        if path == "/api/activity/accounts":
+            self._activity_accounts()
+            return
         if path.startswith("/api/download/"):
             self._download(path[len("/api/download/"):])
             return
@@ -299,6 +311,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._recheck_bind(payload)
             elif path == "/api/recheck/track":
                 self._recheck_track(payload)
+            elif path == "/api/activity/config":
+                self._activity_config_set(payload)
+            elif path == "/api/activity/run":
+                self._activity_run(payload)
             elif path == "/api/recheck/diagnose":
                 self._recheck_diagnose(payload)
             elif path == "/api/recheck/assign":
@@ -916,6 +932,82 @@ class Handler(BaseHTTPRequestHandler):
         if not result["changed"]:
             raise ValueError("选中的账号里没有国际版账户")
         self._json(200, {"ok": True, "enabled": enabled, **result})
+
+    # ---------------------------------------------------------- 每日活跃
+    def _activity_config_get(self) -> None:
+        self._json(200, {"ok": True, "config": activity.load_config(),
+                         "summary": store.activity_summary(),
+                         "state": activity.state()})
+
+    def _activity_config_set(self, payload: dict) -> None:
+        cfg = activity.save_config(payload or {})
+        self._json(200, {"ok": True, "config": cfg})
+
+    def _activity_list(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        pick = lambda k, d="": (query.get(k) or [d])[0]  # noqa: E731
+        rows = store.activity_rows(
+            range_key=pick("range", "7d"),
+            result=pick("result", ""),
+            uid=pick("uid", ""),
+            row_id=int(pick("row_id", "0") or 0) if pick("row_id", "0").isdigit() else 0,
+            limit=int(pick("limit", "200") or 200) if pick("limit", "200").isdigit() else 200,
+        )
+        self._json(200, {"ok": True, "rows": rows,
+                         "summary": store.activity_summary()})
+
+    def _activity_accounts(self) -> None:
+        """国际版账号 + 今日状态。账号列表页要一次拿全，别在循环里查库。"""
+        last = store.activity_last()
+        today = clock.day_start()
+        rows = []
+        for row in store.list_accounts(realm="intl", limit=2000):
+            row_id = int(row["id"])
+            seen = last.get(row_id) or {}
+            at = int(seen.get("at") or 0)
+            today_ok = bool(seen.get("ok")) and at >= today
+            rows.append({
+                "id": row_id,
+                "name": row["name"],
+                "realm": row["realm"],
+                "uid": row["uid"],
+                "exit_port": int(row.get("exit_port") or 0),
+                "daily_active": row.get("daily_active") is not False,
+                "today_ok": today_ok,
+                "last_ok": bool(seen.get("ok")),
+                "last_at": at,
+                "last_at_text": seen.get("at_text") or "",
+                "last_detail": str(seen.get("detail") or "")[:200],
+            })
+        self._json(200, {"ok": True, "rows": rows,
+                         "summary": store.activity_summary(),
+                         "state": activity.state()})
+
+    def _activity_run(self, payload: dict) -> None:
+        """手动触发。`scope=pending|all|selected`，`ids` 只在 selected 时生效。"""
+        if activity.busy():
+            raise ValueError("上一批还在跑，等它结束")
+        cfg = activity.load_config()
+        scope = str(payload.get("scope") or "pending")
+        if scope == "selected":
+            ids = [int(i) for i in (payload.get("ids") or [])
+                   if str(i).strip().isdigit()]
+            if not ids:
+                raise ValueError("没有选中账号")
+            # with_ids 一次给出 (行 id, Account, exit_port)，uid 可能重复，
+            # 行 id 才是唯一身份。
+            pairs = store.load_for_export(ids=ids, with_ids=True)
+        elif scope == "all":
+            pairs = activity.all_pairs("intl")
+        else:
+            pairs = activity.pending_pairs("intl")
+        if not pairs:
+            self._json(200, {"ok": True, "started": 0, "msg": "没有要跑的账号"})
+            return
+        skip_done = bool(payload.get("skip_done", cfg.get("skip_done", True)))
+        started = activity.run_batch(pairs, cfg, trigger="manual",
+                                     skip_done=skip_done, background=True)
+        self._json(200, {"ok": True, **started})
 
     def _store_exit_proxy_config(self) -> None:
         """导出卡片的「按账户出口写 proxy」默认值。单独一个轻量 GET。"""
@@ -1729,6 +1821,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
     start_auto_recheck()
+    activity.start_scheduler()
     return httpd
 
 

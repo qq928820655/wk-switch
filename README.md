@@ -23,6 +23,7 @@
 - **状态列区分风控**：账户库的「状态」列以前只画凭据状态，封着的号也显示绿色「有效」。现在进了风控区先显示红色「封号中」，整行淡红底 + 左侧红条，凭据状态降成小字
 - **风控区可直接挪号**：账户库勾选若干行，点「标为风控 / 移出风控」按行 id 直接落库，不用重新导入一遍；复检页「把账号加进名单」支持搜索全库（不受账户库默认 500 行限制），下拉会列出正常账号和**其它档位**的账号并标明档位，加入的是当前选中的那一档，点完表格立刻切过去显示，号不会凭空消失
 - **封号复检**：被上游风控拦掉的账号单独进「封号复检」标签页，定时发一次最小对话探活；出口按**每个账号一个 mihomo 端口**分配（单一出口单选、随机出口多选，名单里每行还能单独改，改完就是自定义），支持端口自动检测（显示节点名 / 类型 / 延迟，不只是一串 IP），每个端口还能单独换成别的节点
+- **国际版每日活跃真跑**：不只是开关。每日到点自动跑，网页端 agent 会话（建会话 → 接沙箱 → ACP `session/prompt` → 轮询到 `completed` → `stop`）加一条桌面对话兜底，逐账号走自己的 `exit_port`，一次尝试一行落 `activity` 表。「每日活跃」页能看今日汇总、每个号的今日状态、历史记录（按今天 / 1 天 / 7 天 / 30 天 / 全部筛），也能手动跑「今天还没成功的 / 全部国际版号 / 勾选的几个」。会话有 10 条硬上限，撞上了自动 `prune` 旧会话再重试，不会跑到第十天开始集体失败。详见下文
 - **国际版每日活跃开关**：账户库里每个国际版账号的「活跃」列直接点「开 / 关」，勾选后选择条还能批量「开活跃 / 关活跃」。这个值就是 hub 账户文件里的 `tasksEnabled`（默认开，`wb_accounts.py:2264 task_active()` / `wb_scheduler.py:561` 据此决定要不要跑每日活跃对话）：导出 hub 文档或账户目录时随文件走，从 hub 导入时读回来，来回只有一份状态。国内版没有这项任务，显示「—」且不允许设置；窄屏这列收起，关闭的账号名称前挂一个红点
 - **导出按每个账户自己的出口走**：账户库「从账户库导出」卡片里的「按账户出口写 proxy」默认开着，导出时把 DB 里每行 `exit_port` 翻成该账户的 `proxy`（`http://<主机>:<端口>`），同时**清掉 `proxySlot`** —— hub 的 `wb_accounts.py:4614 apply_proxy_slots()` 会拿槽 id 去 `settings.json` 的 `proxy_slots` 查 URL 覆盖静态 `proxy`，槽不清的话本工具配的端口会被无声丢掉。清掉后 `wb_accounts.py:2889` 的每日活跃桌面腿和 `:2619` 的网页腿都用 `self.proxy`，于是每个号跑各自的节点，不是全批一个出口。`exit_port=0` 写成直连。策略「覆盖」一律改写，「仅补空」保留账户原有的 hub 槽绑定；范围可限「仅国际版」；主机留空沿用 `config/recheck.json` 的 `mihomo.host`（默认 `cli-proxy-mihomo`，是 docker 网络服务名，hub 不在同一网络时填宿主机 IP 或可达域名）。设置随每次导出写进 `config/exitproxy.json`，接口 `GET/POST /api/store/exit-proxy/config`。改完要重新导出并导进 hub 才生效，`hub_document` / `hub_dir_zip` 两个格式都带
 - **验证模型可配、400 自动绕开**：复检与账户验证默认送 `deepseek-v4.1-flash`；国际版上游只认 `deepseek-v4.1-flash-sg`，裸名被拒时自动按候选模型 / 请求体 / 路径往下试（最多 8 次），勾选一个号点「诊断 400」能看到每次尝试的状态码和上游原话，且不写库
@@ -403,6 +404,116 @@ curl -s "http://127.0.0.1:8006/api/v1/nodes" -H "X-Token: $(grep MPOOL_TOKEN .en
 
 默认每天 3 点跑一轮（`auto_hour`），服务在跑就会执行，不用挂 crontab。总开关 `enabled` 默认关闭：复检会真的往上游发请求、真扣一点额度，不该在你还没看过说明的时候自己开跑。
 
+## 国际版每日活跃
+
+账户库那个「活跃」列只是开关（导出成 hub 的 `tasksEnabled`），本程序自己也能**真的把每日活跃跑掉**：每日到点自动跑、结果落库、界面上逐账号看今天成没成。口径跟官方一致——官方要的是**一次跑完的网页端 agent 会话**，不是发一条 chat completion 了事。
+
+### 只建会话不算
+
+`POST /console/as/conversations/` 只是排队：会话建出来停在 `CREATING`，agent 要等客户端接上沙箱、把这一轮请求进去才会真正跑。只建不接，会话永远不完成，官方那边不计入活跃。所以网页腿的步骤是固定的，少一步都是白跑：
+
+```
+POST /console/as/conversations/          # body 带 prompt / model / conversationOrigin
+  → GET  .../conversations/{id}/session  # 取沙箱 link / token / sessionId / cwd
+  → SSE  连上 link（Accept: text/event-stream），响应头给 Acp-Connection-Id
+  → JSON-RPC initialize
+  → JSON-RPC session/load
+  → JSON-RPC session/set_model
+  → JSON-RPC session/prompt
+  → 轮询 GET .../conversations/{id} 直到 status=completed
+  → POST .../conversations/{id}/stop      # 失败轮次改 delete，别留垃圾会话
+```
+
+**活跃会话有硬上限**：上游对 `working / creating / pending` 状态的会话封顶 10 条，攒满了再建直接 `429`（业务码 `10105`）。不 stop 的实现在第十天左右开始集体哑掉，看起来像「突然全失败了」。本程序每轮结束必 stop，建会话撞上限时先 `prune` 掉最旧的几条（保留 8 条）再重试一次，`detail` 里会写明「已自动结束 N 条旧会话」。
+
+**桌面腿**是 `POST /v2/chat/completions`，一条最短的 `Hi`。它是老做法，网页腿不通时至少能证明对话链路活着。2026-11 起渠道侧要求首条是 `system` 且 `stream: true`，被 `400` 顶回来会自动换一版请求体重发。
+
+### 结果怎么算成功
+
+两条腿的结果分开记，**不合并不美化**：
+
+| 网页腿 | 桌面腿 | 记为 |
+|---|---|---|
+| 通过 | 任意 | **成功**（`mode=web` 或 `web+desktop`） |
+| 失败 | 通过 | **失败**，`detail` 写「桌面腿通过，网页腿失败：…」 |
+| 失败 | 失败 | 失败 |
+| 关闭 | 通过 | 成功（`mode=desktop`，只跑桌面腿时） |
+
+桌面腿成功不算活跃，因为官方不认它。把它算成成功只会让人以为今天跑完了，实际第二天看活跃还是断的。
+
+### 出口
+
+逐账号走自己的 `exit_port`，跟账户库、导出写 `proxy` 用的是同一个坐标。优先级：
+
+```
+固定 proxy（config 里填了就用它，调试用）
+  → 账户 exit_port（http://<mihomo.host>:<端口>）
+    → fallback_proxy
+      → 直连
+```
+
+一台机器上跑几十个号，直连等于把它们的请求特征全绑在一个 IP 上，所以直连排在最后，且 `detail`/记录里的「出口」列会把实际用的地址写出来，配错了能直接看见。
+
+### 落库
+
+`activity` 表，一次尝试一行，不覆盖：
+
+| 列 | 含义 |
+|---|---|
+| `at` | 时间戳（北京时间展示） |
+| `row_id` / `uid` / `name` / `realm` | 哪一行账户。`row_id` 是唯一身份，`uid` 可能重复 |
+| `ok` / `skipped` | 成功 / 跳过（国内版、无 token、加密信封、静态 API Key 都算跳过，不算失败） |
+| `mode` | `web` / `desktop` / `web+desktop` |
+| `phase` | 卡在哪一步：`create` / `session` / `desktop` / `turn` |
+| `status` | 上游 HTTP 状态码 |
+| `model` / `proxy` | 这一轮用的模型和出口 |
+| `elapsed_ms` | 耗时 |
+| `conversation` | 会话 id，便于去上游对账 |
+| `detail` | 一句人话，超长截断 |
+| `trigger` | `manual` / `auto` |
+
+不写 token。上游返回 HTML 错误页时会把整段 HTML 塞进 `detail` 把表格撑长，所以错误文本统一归一：`401` → 「凭据失效（401），需要重新登录」，`WinError 10053/10054` → 「连接被本机中断」。
+
+### 配置
+
+`config/activity.json`，界面上的设置卡直接改这个文件：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 自动跑的总开关。关掉只是不自动跑，手动按钮照常可用 |
+| `web` / `desktop` | `true` | 两条腿各自开关 |
+| `prompt` | `Hi` | 送进去的那句话 |
+| `chat_model` | `deepseek-v4.1-flash` | 主模型。国际版只认 `-sg` 后缀，裸名被拒自动换候选 |
+| `models` | 空 | 追加候选模型，逗号分隔 |
+| `proxy` | 空 | 固定代理，压过 `exit_port` |
+| `use_exit` | `true` | 按账户自己的 `exit_port` 出站 |
+| `fallback_proxy` | 空 | 没配出口时的兜底 |
+| `timeout` | `120` | 网页腿单轮等待上限（秒） |
+| `rounds` | `2` | 网页腿最多试几轮 |
+| `concurrency` | `2` | 同时跑几个号 |
+| `daily_at` | `08:30` | 自动运行的起始时刻（北京时间） |
+| `interval_minutes` | `30` | 过了起始时刻后，隔多久补一次没成功的号 |
+| `skip_done` | `true` | 当日已成功的直接跳过 |
+
+三个条件同时成立才会自动跑一轮：`enabled` 开着、当前时间过了 `daily_at`、距上次扫描超过 `interval_minutes`。这样早上八点半没跑成的号，白天每半小时补一次，跑成了就不再碰——不是每天只赌一次。
+
+### 接口
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/api/activity/config` | 配置 + 今日/本周汇总 + 运行态 |
+| `POST` | `/api/activity/config` | 改配置（只认上表里的键） |
+| `GET` | `/api/activity/accounts` | 国际版账号 + 今日状态（`today_ok` / `last_detail`） |
+| `GET` | `/api/activity/list?range=7d&result=&uid=&row_id=` | 历史记录，`range` 取 `today/1d/7d/30d/all` |
+| `GET` | `/api/activity/state` | 只查运行态，用于轮询 |
+| `POST` | `/api/activity/run` | 手动触发，`scope=pending\|all\|selected`，`selected` 时用 `ids` |
+
+`scope=pending` 是「今天还没成功的」；`all` 是全部国际版号，不管今天跑没跑过。同一时刻只允许一批在跑，重复触发返回「上一批还在跑，等它结束」。
+
+### 本机网络限制
+
+网页腿要连沙箱域名 `*.sandbox.cloudstudio.club`。本机（Windows，代理 7890/7891/7892 与直连都试过）对该域名的 TCP 能通但 TLS 握手被本地网络栈中止（`WinError 10053/10054`），同一代理访问 `workbuddy.ai` / GitHub 正常。也就是说：**建会话、取 session 这两步在本机是通的（`code 0`，`link/token/sessionId/cwd` 全部拿到），ACP 那一段在本机跑不完**。ACP 层按 hub 的协议逐字节移植，要在放行该域名的机器上验证最后一跳。
+
 ## 部署
 
 ### Linux
@@ -601,6 +712,7 @@ wk/
   token.py           JWT 载荷、realm 推断、凭据状态
   store.py           本地账户库（SQLite）、备份还原
   probe.py           只读探针：计费查询 + 对话探活
+  activity.py        每日活跃：网页端 ACP 会话 + 桌面对话、落库、调度
   weblogin.py       官方 OAuth 设备流登录、拉资料、写账户库
   recheck.py         封号复检：名单流转、mihomo 节点发现
   clock.py           时间源：北京时间（UTC+8），全站唯一出口

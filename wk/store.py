@@ -36,7 +36,8 @@ DB_PATH = os.path.join(DATA_DIR, "accounts.db")
 #: 3 = 加探针列（积分三元组 / 校验状态 / 校验时间），见 wk/probe.py
 #: 4 = 加封号复检列（名单状态 / 次数 / 时间 / 结论），见 wk/recheck.py
 #: 5 = 加导入批次列（最近批次 / 首次批次 / 导入时间）+ 风控来源标记
-SCHEMA_VERSION = 6
+#: 7 = 加每日活跃历史表 activity，见 wk/activity.py
+SCHEMA_VERSION = 7
 
 #: 探针状态的中文名。与 wk/probe.py 的 STATE_* 常量一一对应，
 #: 界面上不再自己拼字符串。
@@ -151,6 +152,31 @@ CREATE TABLE IF NOT EXISTS import_log (
     detail     TEXT,
     created_at TEXT
 );
+
+-- 每日活跃的尝试历史（见 wk/activity.py）。一次尝试一行，不覆盖：
+-- 「今天跑没跑成」要能回看过去几天，单列 last_daily 只会留下最后一次，
+-- 失败原因第二天就没了。
+CREATE TABLE IF NOT EXISTS activity (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_id       INTEGER DEFAULT 0,
+    uid          TEXT,
+    name         TEXT,
+    realm        TEXT,
+    at           INTEGER DEFAULT 0,
+    ok           INTEGER DEFAULT 0,
+    skipped      INTEGER DEFAULT 0,
+    mode         TEXT,
+    phase        TEXT,
+    status       INTEGER DEFAULT 0,
+    model        TEXT,
+    proxy        TEXT,
+    elapsed_ms   INTEGER DEFAULT 0,
+    conversation TEXT,
+    detail       TEXT,
+    trigger      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_activity_at ON activity(at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_row ON activity(row_id, at DESC);
 """
 
 
@@ -1113,6 +1139,128 @@ def set_daily_active(ids: list[int], enabled: bool) -> dict[str, int]:
                 updates,
             )
     return {"changed": len(updates), "skipped": len(found) - len(updates)}
+
+
+# ------------------------------------------------------------------ 每日活跃历史
+
+#: 历史行的查询白名单。前端传 `range=today|1d|7d|30d|all`，其余一律按 7d。
+ACTIVITY_RANGES = {"today": 0, "1d": 1, "7d": 7, "30d": 30, "all": None}
+
+
+def activity_add(rec: dict[str, Any]) -> dict[str, Any]:
+    """写一行活跃尝试，返回落库后的行（含 id 与可读时间）。"""
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO activity
+               (row_id, uid, name, realm, at, ok, skipped, mode, phase, status,
+                model, proxy, elapsed_ms, conversation, detail, trigger)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (int(rec.get("row_id") or 0), str(rec.get("uid") or ""),
+             str(rec.get("name") or ""), str(rec.get("realm") or ""),
+             int(rec.get("at") or time.time()), int(rec.get("ok") or 0),
+             int(rec.get("skipped") or 0), str(rec.get("mode") or ""),
+             str(rec.get("phase") or ""), int(rec.get("status") or 0),
+             str(rec.get("model") or ""), str(rec.get("proxy") or ""),
+             int(rec.get("elapsed_ms") or 0), str(rec.get("conversation") or ""),
+             str(rec.get("detail") or ""), str(rec.get("trigger") or "manual")))
+        row_id = cur.lastrowid
+    return {"id": row_id, **rec}
+
+
+def activity_done_today(row_id: int) -> bool:
+    """这一行今天有没有成功过。按北京时间零点算，不是滚动 24 小时。"""
+    start = clock.day_start()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM activity WHERE row_id = ? AND ok = 1 AND at >= ? LIMIT 1",
+            (int(row_id), int(start))).fetchone()
+    return row is not None
+
+
+def activity_rows(range_key: str = "7d", result: str = "", uid: str = "",
+                  row_id: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    """读历史，最新在前。筛选在 SQL 里做完，前端只渲染。"""
+    key = str(range_key or "7d").strip().lower()
+    if key not in ACTIVITY_RANGES:
+        key = "7d"
+    sql = "SELECT * FROM activity WHERE 1=1"
+    args: list[Any] = []
+    days = ACTIVITY_RANGES[key]
+    if key == "today":
+        sql += " AND at >= ?"
+        args.append(int(clock.day_start()))
+    elif days is not None:
+        sql += " AND at >= ?"
+        args.append(int(time.time()) - days * 86400)
+    if result == "ok":
+        sql += " AND ok = 1"
+    elif result == "failed":
+        sql += " AND ok = 0 AND skipped = 0"
+    elif result == "skipped":
+        sql += " AND skipped = 1"
+    if uid:
+        sql += " AND uid = ?"
+        args.append(str(uid))
+    if row_id:
+        sql += " AND row_id = ?"
+        args.append(int(row_id))
+    sql += " ORDER BY at DESC, id DESC LIMIT ?"
+    args.append(max(1, min(int(limit or 200), 1000)))
+    with connect() as conn:
+        rows = conn.execute(sql, args).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["at_text"] = clock.stamp(item.get("at") or 0)
+        item["ok"] = bool(item.get("ok"))
+        item["skipped"] = bool(item.get("skipped"))
+        out.append(item)
+    return out
+
+
+def activity_summary() -> dict[str, int]:
+    """今日 + 近 7 天的计数，给界面顶部那排数字用。"""
+    day = int(clock.day_start())
+    week = int(time.time()) - 7 * 86400
+    with connect() as conn:
+        def count(since: int, where: str) -> int:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM activity WHERE at >= ? AND {where}",
+                (since,)).fetchone()
+            return int(row["n"] or 0)
+        return {
+            "today_ok": count(day, "ok = 1"),
+            "today_failed": count(day, "ok = 0 AND skipped = 0"),
+            "today_skipped": count(day, "skipped = 1"),
+            "week_ok": count(week, "ok = 1"),
+            "week_failed": count(week, "ok = 0 AND skipped = 0"),
+        }
+
+
+def activity_last() -> dict[int, dict[str, Any]]:
+    """每一行最近一次尝试：{row_id: {ok, at, detail, at_text}}。
+
+    账号列表上要显示「今天跑过没、结果如何」，一次 GROUP BY 取完，
+    不在循环里逐行查。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT a.row_id, a.ok, a.skipped, a.at, a.detail, a.trigger
+               FROM activity a
+               JOIN (SELECT row_id, MAX(at) AS last_at FROM activity
+                     GROUP BY row_id) m
+                 ON a.row_id = m.row_id AND a.at = m.last_at""").fetchall()
+    out: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        out[int(row["row_id"])] = {
+            "ok": bool(row["ok"]),
+            "skipped": bool(row["skipped"]),
+            "at": int(row["at"] or 0),
+            "at_text": clock.stamp(row["at"] or 0),
+            "detail": row["detail"] or "",
+            "trigger": row["trigger"] or "",
+        }
+    return out
 
 
 def exit_ports_of(ids: Iterable[int]) -> dict[int, int]:

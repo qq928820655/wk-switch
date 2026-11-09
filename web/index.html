@@ -25,6 +25,7 @@
   <nav class="tabs" id="tabs">
     <button class="tab active" data-view="convert">导入转换</button>
     <button class="tab" data-view="store">账户库 <span class="tab-count" id="store-count">0</span></button>
+    <button class="tab" data-view="activity">每日活跃 <span class="tab-dot" id="da-dot" hidden></span></button>
     <button class="tab" data-view="recheck">封号复检 <span class="tab-dot" id="recheck-dot" hidden></span></button>
     <button class="tab" data-view="update">升级 <span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
@@ -446,6 +447,163 @@
 </div><!-- /view-update -->
 
 <!-- ============ 封号复检 ============ -->
+<div id="view-activity" class="hidden">
+
+  <section class="card">
+    <div class="card-head">
+      <h2>每日活跃</h2>
+      <span class="hint">国际版：建一条网页会话并跑完，计入官方每日活跃；桌面对话兜底</span>
+    </div>
+
+    <div class="rc-switches">
+      <label class="rc-switch">
+        <input type="checkbox" id="da-enabled">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>自动运行</b><small>服务跑着就到点自己跑，按补跑间隔重试当天没成功的号</small></span>
+      </label>
+      <label class="rc-switch">
+        <input type="checkbox" id="da-web">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>网页端会话</b><small>真正计入官方活跃的那条腿；关掉只剩桌面对话，不计活跃</small></span>
+      </label>
+      <label class="rc-switch">
+        <input type="checkbox" id="da-desktop">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>桌面对话</b><small>先发一条最小对话，证明对话链路还通</small></span>
+      </label>
+      <label class="rc-switch">
+        <input type="checkbox" id="da-use-exit">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>按账户出口</b><small>每个号从自己那行的 mihomo 端口出去；关掉走下面的兜底代理</small></span>
+      </label>
+      <label class="rc-switch">
+        <input type="checkbox" id="da-skip-done">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>跳过当日已成功</b><small>同一天只成功一次，补跑不会重复消耗额度</small></span>
+      </label>
+    </div>
+
+    <div class="rc-grid">
+      <label class="field">
+        <span>活跃模型</span>
+        <input type="text" id="da-model" placeholder="deepseek-v4.1-flash">
+      </label>
+      <label class="field">
+        <span>候选模型（逗号分隔）</span>
+        <input type="text" id="da-models" placeholder="留空 = 只用上面那个 + 内置兜底">
+      </label>
+      <label class="field">
+        <span>单轮等待（秒）</span>
+        <input type="number" id="da-timeout" min="20" max="1800" step="10">
+      </label>
+      <label class="field">
+        <span>最多轮次</span>
+        <input type="number" id="da-rounds" min="1" max="6" step="1">
+      </label>
+      <label class="field">
+        <span>并发（个）</span>
+        <input type="number" id="da-concurrency" min="1" max="8" step="1">
+      </label>
+      <label class="field">
+        <span>每日起始时刻</span>
+        <input type="time" id="da-daily-at">
+      </label>
+      <label class="field">
+        <span>补跑间隔（分钟）</span>
+        <input type="number" id="da-interval" min="5" max="1440" step="5">
+      </label>
+      <label class="field">
+        <span>固定代理（压过出口）</span>
+        <input type="text" id="da-proxy" placeholder="留空 = 按每行出口">
+      </label>
+      <label class="field">
+        <span>兜底代理</span>
+        <input type="text" id="da-fallback" placeholder="留空 = 直连；如 http://127.0.0.1:7891">
+      </label>
+      <label class="field">
+        <span>提示词</span>
+        <input type="text" id="da-prompt" placeholder="Hi">
+      </label>
+    </div>
+
+    <div class="store-actions da-actions">
+      <button class="btn primary" id="btn-da-save">保存设置</button>
+      <button class="btn" id="btn-da-run-pending">跑今日未完成</button>
+      <button class="btn ghost" id="btn-da-run-all">全部重跑</button>
+      <button class="btn ghost" id="btn-da-refresh">刷新</button>
+    </div>
+    <p class="hint" id="da-hint"></p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>账号状态</h2>
+      <span class="hint" id="da-state">未运行</span>
+    </div>
+    <div class="store-stats" id="da-stats"></div>
+    <div class="table-wrap tall">
+      <table class="grid" id="da-accounts">
+        <colgroup>
+          <col style="width:32px">
+          <col style="width:200px">
+          <col style="width:78px">
+          <col style="width:78px">
+          <col style="width:120px">
+          <col style="width:96px">
+        </colgroup>
+        <thead>
+          <tr><th class="col-check"><input type="checkbox" id="da-check-all" title="全选国际版账号"></th>
+            <th>名称</th><th>出口</th><th>今日</th><th>上次活跃</th><th class="row-actions"></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="hint" id="da-accounts-hint"></p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>活跃记录</h2>
+      <div class="head-right">
+        <select class="select-batch" id="da-range">
+          <option value="today">今日</option>
+          <option value="1d">近 1 天</option>
+          <option value="7d" selected>近 7 天</option>
+          <option value="30d">近 30 天</option>
+          <option value="all">全部</option>
+        </select>
+        <select class="select-batch" id="da-result">
+          <option value="">全部结果</option>
+          <option value="ok">成功</option>
+          <option value="failed">失败</option>
+          <option value="skipped">跳过</option>
+        </select>
+        <button class="btn small ghost" id="btn-da-log-refresh">刷新</button>
+      </div>
+    </div>
+    <div class="table-wrap tall">
+      <table class="grid" id="da-log">
+        <colgroup>
+          <col style="width:120px">
+          <col style="width:150px">
+          <col style="width:64px">
+          <col style="width:64px">
+          <col style="width:140px">
+          <col style="width:150px">
+          <col style="width:64px">
+          <col>
+        </colgroup>
+        <thead>
+          <tr><th>时间</th><th>账号</th><th>结果</th><th>阶段</th>
+            <th>模型</th><th>出口</th><th>耗时</th><th>说明</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="hint" id="da-log-hint"></p>
+  </section>
+</div>
+
 <div id="view-recheck" class="hidden">
 
   <section class="card">
