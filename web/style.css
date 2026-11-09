@@ -646,10 +646,12 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 
 /* ---------- 视图切换 ---------- */
 /* 三个视图各是一条规则：漏一个就会让上个视图的内容留在下面 */
-/* 每个视图都要单独列：作者样式里的 display 会盖掉 UA 的 [hidden]，
-   漏一个就会出现「切走了还露在下面」——升级页踩过这个坑 */
-#view-convert.hidden, #view-store.hidden, #view-recheck.hidden,
-#view-update.hidden { display: none; }
+/* 作者样式里的 display 会盖掉 UA 的 [hidden]，漏一个就会出现「切走了还露在
+   下面」——升级页踩过一次（逐个列 id），每日活跃页又踩了一次（新视图没加进
+   那个列表，切到任何 tab 都能看见它的设置卡）。改成按 id 前缀匹配：以后加
+   视图不用再回来补这一行。!important 是为了压过可能出现的 #view-xxx 规则
+   （id 选择器权重高于类），带 hidden 时才生效，不影响正常显示。 */
+div[id^="view-"].hidden { display: none !important; }
 
 .tabs { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: var(--line-2); }
 
