@@ -415,30 +415,45 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   line-height: 1.7;
 }
 
-/* 每日活跃开关：跟状态胶囊同一套视觉，做成按钮是为了能直接点。
-   窄屏整列会被藏掉，名称后面的小红点接着承担状态提示。 */
-.da-toggle {
-  border: 1px solid transparent;
+/* 每日活跃开关（账户级）：一枚小胶囊，点一下直接落库。
+   放在「每日活跃」页的账号卡里，账户库那张表不再重复这一列 —— 同一个开关
+   出现在两个标签页，改完还要回头确认哪边是准的，没有意义。 */
+.rc-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line-2);
+  background: #f1f2f6;
+  color: var(--ink-3);
+  border-radius: 999px;
+  padding: 1px 8px 1px 3px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  cursor: pointer;
+  min-width: 42px;
+}
+.rc-mini .rc-mini-box {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #c8cbd6;
+  flex: none;
+}
+.rc-mini.on { background: var(--ok-soft); color: var(--ok); border-color: #cdebd8; }
+.rc-mini.on .rc-mini-box { background: var(--ok); }
+.rc-mini:hover { filter: brightness(.96); }
+.rc-mini:disabled { opacity: .55; cursor: default; }
+/* 风控号不给开关，只给一句话：让人知道不是自己关的，解封后会自动回来 */
+.da-off-reason {
+  display: inline-block;
+  font-size: 11.5px;
+  color: var(--bad);
+  background: var(--bad-soft);
   border-radius: 999px;
   padding: 1px 7px;
-  font-size: 11.5px;
-  line-height: 1.5;
-  cursor: pointer;
-  min-width: 26px;
+  white-space: nowrap;
 }
-.da-toggle.ok { background: var(--ok-soft); color: var(--ok); border-color: #cdebd8; }
-.da-toggle.off { background: #f1f2f6; color: var(--ink-3); border-color: var(--line-2); }
-.da-toggle:hover { filter: brightness(.96); }
-.da-toggle:disabled { opacity: .6; cursor: default; }
-.dot-da-off {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  margin: 0 5px 0 1px;
-  border-radius: 50%;
-  background: var(--bad);
-  vertical-align: 2px;
-}
+.da-reason-short { display: none; }
 
 .pill.ok { background: var(--ok-soft); color: var(--ok); }
 .pill.warn { background: var(--warn-soft); color: var(--warn); }
@@ -1370,7 +1385,6 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
   #store-table .col-upd,
   #store-table .col-exp,
   #store-table .col-batch,
-  #store-table .col-daily,
   #store-table .status-cred,
   #store-table th:last-child,
   #store-table td.row-actions { display: none; }
@@ -2036,6 +2050,19 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 .da-actions .btn { flex: none; height: 34px; }
 #da-stats { margin-bottom: 14px; }
 
+/* 账号卡的批量条：两个按钮 + 一句统计。hint 不换行挤爆，按钮始终在左。 */
+.da-bulk {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 2px;
+}
+.da-bulk .btn { flex: none; height: 30px; }
+.da-bulk .hint { margin: 0; }
+.da-active { white-space: nowrap; }
+#da-accounts tbody tr.risk-row { background: #fffafa; }
+
 /* 说明可能很长：单行省略，全文走 title。多行会把表格撑成一片高墙。 */
 #da-log .da-detail {
   max-width: 420px;
@@ -2078,17 +2105,24 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 @media (max-width: 720px) {
   /* 账号表：窄屏砍掉「上次活跃」，名称列吃剩余宽度。colgroup 的固定像素宽
      在窄屏就是溢出的元凶——fixed 布局按 col 宽度算，藏掉列也不会让出空间。 */
-  #da-accounts th:nth-child(5),
-  #da-accounts td:nth-child(5) { display: none; }
+  /* 7 列：勾选 / 名称 / 活跃 / 出口 / 今日 / 上次活跃 / 操作。
+     窄屏藏「出口」和「上次活跃」——能改活跃、能看今天成没成，这两个才是这
+     一页的用途；出口配置在账户库里改。 */
+  #da-accounts th:nth-child(4),
+  #da-accounts td:nth-child(4),
+  #da-accounts th:nth-child(6),
+  #da-accounts td:nth-child(6) { display: none; }
   #da-accounts colgroup { display: none; }
   #da-accounts { table-layout: fixed; width: 100%; }
   #da-accounts td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #da-accounts th, #da-accounts td,
   #da-log th, #da-log td { padding: 7px 6px; }
   #da-accounts th:nth-child(1), #da-accounts td:nth-child(1) { width: 26px; }
-  #da-accounts th:nth-child(3), #da-accounts td:nth-child(3) { width: 52px; }
-  #da-accounts th:nth-child(4), #da-accounts td:nth-child(4) { width: 58px; }
-  #da-accounts th:nth-child(6), #da-accounts td:nth-child(6) { width: 58px; }
+  #da-accounts th:nth-child(3), #da-accounts td:nth-child(3) { width: 60px; }
+  #da-accounts th:nth-child(5), #da-accounts td:nth-child(5) { width: 58px; }
+  #da-accounts th:nth-child(7), #da-accounts td:nth-child(7) { width: 50px; }
+  .da-reason-full { display: none; }
+  .da-reason-short { display: inline; }
   #da-accounts td:nth-child(2) { word-break: break-all; }
   .da-actions .btn { font-size: 12px; padding: 0 8px; }
 }

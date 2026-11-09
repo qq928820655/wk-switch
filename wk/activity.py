@@ -154,6 +154,17 @@ def save_config(patch: dict[str, Any]) -> dict[str, Any]:
 
 # ------------------------------------------------------------------ 出口选择
 
+def is_risk(row: dict[str, Any]) -> bool:
+    """这一行是不是风控账号。
+
+    判据只用 `recheck_state == 'banned'`（封号中）：导入时标过风控的号也写这个值
+    （`store.upsert` 里 `mark = "banned" if row_risk else ""`），所以一个字段覆盖
+    两种来源。`risk_src` 只是来源标记，解封后仍留着历史，不能拿它当判据 ——
+    拿它判会把已解封的号永久排除在活跃之外。
+    """
+    return str(row.get("recheck_state") or "") == "banned"
+
+
 def proxy_for(acc: Account, cfg: dict[str, Any], exit_port: int = 0) -> str:
     """这一号从哪出去。
 
@@ -861,6 +872,11 @@ def run_batch(pairs: Iterable[tuple[int, Account]], cfg: dict[str, Any] | None =
     cfg = cfg or load_config()
     if skip_done is None:
         skip_done = bool(cfg.get("skip_done", True))
+    # 风控账号在这里再挡一次：pending / all 由 _pairs 过滤，但「勾选跑」是前端
+    # 直接把行 id 传进来的（selected 走 load_for_export），绕过了 _pairs。
+    # 放在 run_batch 里过滤，三个入口就都守住了，不用每个入口各写一遍。
+    risk_ids = {int(r["id"]) for r in store.list_accounts(realm="intl", limit=2000)
+                if is_risk(r)}
     todo: list[tuple[int, Account, int]] = []
     for item in pairs:
         if len(item) == 3:
@@ -868,6 +884,8 @@ def run_batch(pairs: Iterable[tuple[int, Account]], cfg: dict[str, Any] | None =
         else:
             row_id, acc = item        # type: ignore[misc]
             port = 0
+        if int(row_id) in risk_ids:
+            continue
         if skip_done and store.activity_done_today(int(row_id)):
             continue
         todo.append((int(row_id), acc, int(port or 0)))
@@ -951,15 +969,22 @@ def _pairs(realm: str = "intl", only_pending: bool = False
            ) -> list[tuple[int, Account, int]]:
     """账号 → [(行 id, Account, exit_port)]。
 
-    只取「每日活跃开着」的国际版号：账户库里关掉的号不该被自己跑起来，
-    那个开关的语义是「不参与活跃」，不是「只是给 hub 看的」。
+    两个排除项，都是账户级的：
+
+    - 每日活跃关掉的号（`daily_active is False`）。开关的语义是「不参与活跃」，
+      不是「只是给 hub 看的」，本程序自己也不该跑它。
+    - 风控账号（`recheck_state == 'banned'`）。封着的号跑也是白跑：桌面腿会被
+      403 / 11140 顶回来，网页腿建会话就失败，一天跑几十次只会把出口 IP 和号
+      一起弄得更脏。解封后（复检判 revived 或手动移出风控）下一轮自动恢复参与，
+      不需要回来重新开一次。
     """
-    off = {int(r["id"]) for r in store.list_accounts(realm=realm, limit=2000)
-           if r.get("daily_active") is False}
+    rows = store.list_accounts(realm=realm, limit=2000)
+    skip = {int(r["id"]) for r in rows
+            if r.get("daily_active") is False or is_risk(r)}
     out: list[tuple[int, Account, int]] = []
     for row_id, acc, port in store.load_for_export(realm=realm, with_ids=True):
         row_id = int(row_id)
-        if row_id in off:
+        if row_id in skip:
             continue
         if only_pending and store.activity_done_today(row_id):
             continue

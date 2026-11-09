@@ -224,8 +224,6 @@
       <div class="sel-actions">
         <button class="btn small" id="btn-sel-probe" disabled>校验</button>
         <button class="btn small" id="btn-sel-export" disabled>导出</button>
-        <button class="btn small" id="btn-sel-daily-on" disabled title="把选中的国际版账号设为参与每日活跃，导出的 hub 账户文件带 tasksEnabled=true">开活跃</button>
-        <button class="btn small ghost" id="btn-sel-daily-off" disabled title="把选中的国际版账号设为不参与每日活跃，导出的 hub 账户文件带 tasksEnabled=false">关活跃</button>
         <button class="btn small" id="btn-sel-risk" disabled title="把选中的号直接移进「封号中」名单，不用重新导入">标为风控</button>
         <button class="btn small" id="btn-sel-relogin" disabled title="从官网重新登录这一个账号，按选中行覆盖 token 和资料">重登</button>
         <button class="btn small ghost" id="btn-sel-unrisk" disabled title="把选中的号移出复检名单，回到正常账号">移出风控</button>
@@ -248,7 +246,6 @@
           <col style="width:62px">
           <col style="width:92px">
           <col style="width:148px">
-          <col style="width:76px">
           <col style="width:112px">
           <col style="width:86px">
           <col style="width:92px">
@@ -261,7 +258,6 @@
             <th>名称</th><th>版本</th><th class="col-uid">uid</th><th>状态</th>
             <th class="col-credit">积分</th>
             <th class="col-store-exit">出口</th>
-            <th class="col-daily" title="国际版每日活跃（hub 的 tasksEnabled）。仅国际版可设置，关掉后导出的 hub 账户文件不再参与每日活跃">活跃</th>
             <th class="col-batch">批次 / 导入</th>
             <th class="col-exp">到期</th><th class="col-at">AT</th><th class="col-rt">RT</th><th></th>
           </tr>
@@ -545,20 +541,27 @@
       <table class="grid" id="da-accounts">
         <colgroup>
           <col style="width:32px">
-          <col style="width:200px">
-          <col style="width:78px">
-          <col style="width:78px">
-          <col style="width:120px">
-          <col style="width:96px">
+          <col style="width:180px">
+          <col style="width:84px">
+          <col style="width:66px">
+          <col style="width:72px">
+          <col style="width:110px">
+          <col style="width:84px">
         </colgroup>
         <thead>
           <tr><th class="col-check"><input type="checkbox" id="da-check-all" title="全选国际版账号"></th>
-            <th>名称</th><th>出口</th><th>今日</th><th>上次活跃</th><th class="row-actions"></th></tr>
+            <th>名称</th>
+            <th title="账户级开关：关掉的号本程序不跑，导出的 hub 账户文件也带 tasksEnabled=false">活跃</th>
+            <th>出口</th><th>今日</th><th>上次活跃</th><th class="row-actions"></th></tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
-    <p class="hint" id="da-accounts-hint"></p>
+    <div class="store-actions da-bulk">
+      <button class="btn small" id="btn-da-active-on" disabled title="把勾选账号设为参与每日活跃">开活跃</button>
+      <button class="btn small ghost" id="btn-da-active-off" disabled title="把勾选账号设为不参与每日活跃">关活跃</button>
+      <span class="hint" id="da-accounts-hint"></span>
+    </div>
   </section>
 
   <section class="card">

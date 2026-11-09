@@ -965,7 +965,7 @@ class Handler(BaseHTTPRequestHandler):
                          "summary": store.activity_summary()})
 
     def _activity_accounts(self) -> None:
-        """国际版账号 + 今日状态。账号列表页要一次拿全，别在循环里查库。"""
+        """国际版账号 + 今日状态 + 是否参与活跃。账号列表页要一次拿全，别在循环里查库。"""
         last = store.activity_last()
         today = clock.day_start()
         rows = []
@@ -974,13 +974,21 @@ class Handler(BaseHTTPRequestHandler):
             seen = last.get(row_id) or {}
             at = int(seen.get("at") or 0)
             today_ok = bool(seen.get("ok")) and at >= today
+            risk = activity.is_risk(row)
+            on = row.get("daily_active") is not False
             rows.append({
                 "id": row_id,
                 "name": row["name"],
                 "realm": row["realm"],
                 "uid": row["uid"],
                 "exit_port": int(row.get("exit_port") or 0),
-                "daily_active": row.get("daily_active") is not False,
+                # 账户级开关原值（导出 hub 时写 tasksEnabled 的就是它）
+                "daily_active": on,
+                # 风控账号不参与：界面把开关置灰，跑批也不会碰它。
+                # 两个字段分开给，前端才能区分「人关的」和「风控挡的」。
+                "risk": risk,
+                "risk_label": row.get("recheck_label") or ("封号中" if risk else ""),
+                "participates": on and not risk,
                 "today_ok": today_ok,
                 "last_ok": bool(seen.get("ok")),
                 "last_at": at,

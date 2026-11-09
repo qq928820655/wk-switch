@@ -1043,7 +1043,7 @@ function syncStoreCols() {
   const narrow = window.matchMedia('(max-width: 720px)').matches;
   const widths = narrow
     ? [24, 88, 48, 58, 52, 76]              // 勾选/名称/版本/状态/积分/出口
-    : [36, 132, 64, 88, 62, 92, 148, 76, 112, 86, 92, 44, 92];
+    : [36, 132, 64, 88, 62, 92, 148, 112, 86, 92, 44, 92];
   cg.innerHTML = widths.map((w) => `<col style="width:${w}px">`).join('');
 }
 
@@ -1051,7 +1051,7 @@ function renderStoreTable(rows) {
   syncStoreCols();
   const body = $('#store-table tbody');
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="13" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
     $('#store-hint').textContent = '';
     return;
   }
@@ -1060,13 +1060,12 @@ function renderStoreTable(rows) {
   body.innerHTML = rows.map((r) => `
     <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}${r.recheck_state ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="row-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
-      <td title="最近更新 ${esc(r.updated_at)}">${r.realm === 'intl' && r.daily_active === false ? '<i class="dot-da-off" title="每日活跃已关闭"></i>' : ''}<b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
+      <td title="最近更新 ${esc(r.updated_at)}"><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
       <td><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
       <td class="mono col-uid" title="${esc(r.uid)}">${esc(shortUid(r.uid))}</td>
       <td class="col-state">${statusCell(r)}</td>
       <td class="col-credit">${creditCell(r)}</td>
       <td class="col-store-exit">${storeExitCell(r)}</td>
-      <td class="col-daily">${dailyActiveCell(r)}</td>
       <td class="col-batch">${batchCell(r)}</td>
       <td class="mono col-exp">${esc(r.expires) || '—'}</td>
       <td class="mono col-at" title="${esc(r.at)}">${esc(r.at)}</td>
@@ -1079,44 +1078,6 @@ function renderStoreTable(rows) {
     </tr>`).join('');
 
   $('#store-hint').textContent = `共 ${rows.length} 条`;
-}
-
-/**
- * 每日活跃开关：对应 hub 账户文件里的 `tasksEnabled`，默认开。
- * 窄屏这一列会被藏掉，所以名称后面另挂一个小红点，手机上也能看出关没关。
- */
-function dailyActiveCell(r) {
-  if (r.realm !== 'intl') return '<span class="hint" title="国内版没有每日活跃">—</span>';
-  const on = r.daily_active !== false;
-  const next = on ? 'false' : 'true';
-  return `<button class="link da-toggle ${on ? 'ok' : 'off'}" data-act="daily" data-on="${on ? 1 : 0}" title="点一下${on ? '关闭' : '开启'}每日活跃；导出的 hub 账户文件带 tasksEnabled=${next}">${on ? '开' : '关'}</button>`;
-}
-
-/** 勾选集里只有国际版能改每日活跃，国内版在前端就剔掉，省一次无效请求。 */
-function intlSelectedIds() {
-  return [...storeState.selected].filter((id) => {
-    const row = storeState.rows.find((r) => r.id === id);
-    return row && row.realm === 'intl';
-  });
-}
-
-async function setDailyActive(ids, enabled, sourceBtn) {
-  if (!ids.length) return;
-  const btn = sourceBtn || (enabled ? $('#btn-sel-daily-on') : $('#btn-sel-daily-off'));
-  const label = btn ? btn.textContent : (enabled ? '开活跃' : '关活跃');
-  if (btn) { btn.disabled = true; btn.textContent = '处理中'; }
-  try {
-    const data = await api('/api/store/daily-active', { ids, enabled });
-    if (!data.ok) throw new Error(data.error || '设置失败');
-    const skipped = data.skipped ? `，跳过 ${data.skipped} 个国内版` : '';
-    toast(`已${enabled ? '开启' : '关闭'} ${data.changed} 个国际版账号的每日活跃${skipped}`);
-    // 重画表格：行内开关、小红点、导出用的快照都要跟着变
-    await loadStore();
-  } catch (err) {
-    toast(err.message, true);
-  } finally {
-    if (btn && btn.isConnected) { btn.textContent = label; btn.disabled = false; }
-  }
 }
 
 /**
@@ -1211,10 +1172,6 @@ function refreshSelBar() {
   $('#sel-count').textContent = picked ? `已选 ${picked} 条` : '未选择';
   $('#btn-sel-probe').disabled = picked === 0;
   $('#btn-sel-export').disabled = picked === 0;
-  // 每日活跃只管国际版：全是国内版时两个按钮直接灰掉，不给后端送空请求
-  const intl = intlSelectedIds().length;
-  $('#btn-sel-daily-on').disabled = intl === 0;
-  $('#btn-sel-daily-off').disabled = intl === 0;
   $('#btn-sel-risk').disabled = picked === 0;
   // 一次只重登一个号：官方授权是单账号流程，多选没有明确的覆盖目标
   $('#btn-sel-relogin').disabled = picked !== 1;
@@ -3015,9 +2972,6 @@ function bind() {
     if (btn.dataset.act === 'relogin') openWebLogin(row);
     if (btn.dataset.act === 'rename') storeRename(id, row.name);
     if (btn.dataset.act === 'delete') storeDelete(id, row.name);
-    if (btn.dataset.act === 'daily' && row.realm === 'intl') {
-      setDailyActive([id], btn.dataset.on !== '1', btn);
-    }
   });
 
   // 勾选 + 逐行出口下拉：都走 change 委托，表格重绘不会丢事件
@@ -3077,8 +3031,6 @@ function bind() {
     });
   });
   $('#btn-sel-export').addEventListener('click', exportSelected);
-  $('#btn-sel-daily-on').addEventListener('click', () => setDailyActive(intlSelectedIds(), true));
-  $('#btn-sel-daily-off').addEventListener('click', () => setDailyActive(intlSelectedIds(), false));
   $('#btn-sel-risk').addEventListener('click', () => setStoreRisk('banned'));
   $('#btn-sel-relogin').addEventListener('click', () => {
     const id = [...storeState.selected][0];
@@ -3242,11 +3194,32 @@ function daExitText(port) {
   return port ? String(port) : '直连';
 }
 
+/** 账号卡上那一格「活跃」：开关 + 风控说明。
+ *
+ *  风控账号（recheck_state=banned）不允许参与每日活跃：开关置灰、显式标「风控不
+ *  参与」，点也点不动。不是把它显示成「关」——那会让人以为是自己关的，回头解封
+ *  了还去找开关。这里分三种状态：参与 / 手动关 / 风控挡。
+ */
+function daActiveCell(r) {
+  if (r.risk) {
+    // 桌面写全「风控不参与」，窄屏 60px 装不下 5 个字，换「风控」两字；
+    // 完整原因放 title，手机上点不出来但至少不误导成「被封了」。
+    return '<span class="da-off-reason" title="风控账号不参与每日活跃；移出风控后自动恢复">'
+      + '<span class="da-reason-full">风控不参与</span>'
+      + '<span class="da-reason-short">风控</span></span>';
+  }
+  const on = r.daily_active !== false;
+  return `<button class="rc-mini ${on ? 'on' : ''}" data-act="da-toggle" data-on="${on ? 1 : 0}"
+    title="${on ? '点一下关闭：本程序不再跑这个号，导出的 hub 账户文件也带 tasksEnabled=false' : '点一下开启：本程序会跑这个号，导出的 hub 账户文件带 tasksEnabled=true'}">
+    <span class="rc-mini-box"></span>${on ? '开' : '关'}</button>`;
+}
+
 function renderDaAccounts() {
   const body = $('#da-accounts tbody');
   if (!daState.rows.length) {
-    body.innerHTML = '<tr><td colspan="6" class="empty-cell">账户库里还没有国际版账号。先在「导入转换」或「官网登录」里加号。</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="empty-cell">账户库里还没有国际版账号。先在「导入转换」或「官网登录」里加号。</td></tr>';
     $('#da-accounts-hint').textContent = '';
+    daSyncBulk();
     return;
   }
   body.innerHTML = daState.rows.map((r) => {
@@ -3255,10 +3228,10 @@ function renderDaAccounts() {
       ? '<span class="pill ok">已完成</span>'
       : (r.last_at && !r.last_ok ? '<span class="pill bad">失败</span>'
         : '<span class="pill mute">未跑</span>');
-    const off = r.daily_active ? '' : ' <span class="pill mute" title="账户库里关掉了每日活跃">已关</span>';
-    return `<tr data-id="${r.id}" class="${on ? 'sel' : ''}">
+    return `<tr data-id="${r.id}" class="${on ? 'sel' : ''}${r.risk ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="da-check" ${on ? 'checked' : ''}></td>
-      <td title="${esc(r.uid)}"><b>${esc(r.name)}</b>${off}</td>
+      <td title="${esc(r.uid)}"><b>${esc(r.name)}</b></td>
+      <td class="da-active">${daActiveCell(r)}</td>
       <td class="mono">${esc(daExitText(r.exit_port))}</td>
       <td>${today}</td>
       <td class="mono" title="${esc(r.last_detail || '')}">${esc(r.last_at_text || '—')}</td>
@@ -3266,8 +3239,47 @@ function renderDaAccounts() {
     </tr>`;
   }).join('');
   const sel = daState.selected.size;
+  const risky = daState.rows.filter((r) => r.risk).length;
   $('#da-accounts-hint').textContent =
-    `共 ${daState.rows.length} 个国际版账号${sel ? ` · 已选 ${sel} 个` : ''}`;
+    `共 ${daState.rows.length} 个国际版账号`
+    + (risky ? ` · 其中 ${risky} 个风控号不参与` : '')
+    + (sel ? ` · 已选 ${sel} 个` : '');
+  daSyncBulk();
+}
+
+/** 批量开/关按钮：勾了才亮，勾的全是风控号时也不亮（改了也不生效）。 */
+function daSyncBulk() {
+  const ids = [...daState.selected];
+  const usable = ids.filter((id) => {
+    const row = daState.rows.find((r) => r.id === id);
+    return row && !row.risk;
+  });
+  $('#btn-da-active-on').disabled = usable.length === 0;
+  $('#btn-da-active-off').disabled = usable.length === 0;
+}
+
+/** 账户级开关落库。走的是账户库那条接口：写得进 DB，导出 hub 时就是 tasksEnabled。 */
+async function daSetActive(ids, enabled, sourceBtn) {
+  const usable = ids.filter((id) => {
+    const row = daState.rows.find((r) => r.id === id);
+    return row && !row.risk;
+  });
+  if (!usable.length) {
+    toast('选中的都是风控账号，不参与每日活跃', true);
+    return;
+  }
+  if (sourceBtn) sourceBtn.disabled = true;
+  try {
+    const data = await api('/api/store/daily-active', { ids: usable, enabled });
+    if (!data.ok) throw new Error(data.error || '设置失败');
+    const skipped = data.changed < usable.length
+      ? `，${usable.length - data.changed} 个没改成` : '';
+    toast(`已${enabled ? '开启' : '关闭'} ${data.changed} 个账号的每日活跃${skipped}`);
+    await loadDaAccounts();
+  } catch (err) {
+    toast(err.message, true);
+    if (sourceBtn) sourceBtn.disabled = false;
+  }
 }
 
 function renderDaLog(rows) {
@@ -3385,6 +3397,12 @@ function bindActivity() {
     renderDaAccounts();
   });
 
+  // 批量开 / 关活跃：走账户级开关，同一份数据导出 hub 时就是 tasksEnabled
+  $('#btn-da-active-on').addEventListener('click', () =>
+    daSetActive([...daState.selected], true));
+  $('#btn-da-active-off').addEventListener('click', () =>
+    daSetActive([...daState.selected], false));
+
   $('#da-accounts tbody').addEventListener('click', (e) => {
     const tr = e.target.closest('tr');
     if (!tr) return;
@@ -3392,6 +3410,11 @@ function bindActivity() {
     if (e.target.classList.contains('da-check')) {
       if (e.target.checked) daState.selected.add(id); else daState.selected.delete(id);
       renderDaAccounts();
+      return;
+    }
+    const toggle = e.target.closest('button[data-act="da-toggle"]');
+    if (toggle) {
+      daSetActive([id], toggle.dataset.on !== '1', toggle);
       return;
     }
     if (e.target.dataset.act === 'run-one') {

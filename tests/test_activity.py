@@ -316,5 +316,50 @@ class SweepTest(ActivityBase):
         self.assertEqual(out["why"], "nothing_pending")
 
 
+class PairFilterTest(ActivityBase):
+    """哪些号不该被跑：账户级开关关掉的、风控账号。
+
+    这两条都是「不参与」而非「失败」——不产生记录，也不占并发额度。
+    """
+
+    def _seed(self) -> list[int]:
+        store.upsert([self.acc("u-a"), self.acc("u-b"), self.acc("u-c")])
+        return [int(r["id"]) for r in store.list_accounts(limit=10)]
+
+    def test_is_risk_only_counts_banned(self) -> None:
+        self.assertTrue(activity.is_risk({"recheck_state": "banned"}))
+        # 已解封的号要能重新参与：risk_src 只是来源标记，不能当判据
+        self.assertFalse(activity.is_risk({"recheck_state": "revived",
+                                          "risk_src": "recheck"}))
+        self.assertFalse(activity.is_risk({}))
+
+    def test_pairs_skips_banned_and_disabled(self) -> None:
+        ids = self._seed()
+        store.set_track([ids[0]], "banned", "test")
+        store.set_daily_active([ids[1]], False)
+        got = [row_id for row_id, _acc, _port in activity.pending_pairs()]
+        self.assertEqual(got, [ids[2]])
+
+    def test_all_pairs_still_skips_them(self) -> None:
+        """「全部重跑」也不能把风控号和关掉的号拉进来。"""
+        ids = self._seed()
+        store.set_track([ids[0]], "banned", "test")
+        store.set_daily_active([ids[1]], False)
+        got = [row_id for row_id, _acc, _port in activity.all_pairs()]
+        self.assertEqual(got, [ids[2]])
+
+    def test_run_batch_skips_risk_even_when_selected(self) -> None:
+        """勾选跑走的是 load_for_export，绕过了 _pairs —— run_batch 必须再挡一次。"""
+        ids = self._seed()
+        store.set_track([ids[0]], "banned", "test")
+        rows = store.load_for_export(ids=ids, with_ids=True)
+        with mock.patch.object(activity, "_run_and_record",
+                               return_value={"ok": True}) as run:
+            activity.run_batch(rows, trigger="manual", background=False)
+        ran = [c.args[0] for c in run.call_args_list]
+        self.assertNotIn(ids[0], ran)
+        self.assertEqual(len(ran), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
