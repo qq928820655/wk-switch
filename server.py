@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import traceback
@@ -89,15 +90,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 基础响应 -------------------------------------------------
     def _send(self, status: int, body: bytes, content_type: str, extra: dict | None = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for key, value in (extra or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        # 浏览器导航/关标签页会在请求还没写完时就重置连接（WinError 10053 /
+        # EPIPE）。这时客户端已经不要这份响应了，没有任何人能补救，写失败只
+        # 意味着「这趟白干」；不接住的话 socketserver 会把整段 traceback 打到
+        # stderr，一次刷新就能刷出十几屏，把真正的错误埋掉。
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
 
     def _json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1817,9 +1825,25 @@ def start_auto_recheck() -> None:
     t.start()
 
 
+class _Server(ThreadingHTTPServer):
+    """只改一处：客户端中途断开不算服务端错误。
+
+    socketserver 默认把 handler 抛出的任何异常都打成 traceback。断连是浏览器
+    的日常动作，不是故障；真正的 5xx 由 _error() 记，走不到这里。
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((host, port), Handler)
-    httpd.daemon_threads = True
+    httpd = _Server((host, port), Handler)
     start_auto_recheck()
     activity.start_scheduler()
     return httpd
