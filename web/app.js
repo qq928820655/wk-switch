@@ -2109,12 +2109,13 @@ function exitCell(r) {
   // 库里存着一个本轮没列出来的端口（池子重排过、或还没点检测）：也要能
   // 显示出来，否则下拉会静默跳回「直连」，看起来像分配丢了
   if (cur && !seen.has(cur)) {
-    opts.push(`<option value="${cur}" selected>${cur}（未检测到）</option>`);
+    opts.push(`<option value="${cur}" selected>${cur} 未检测</option>`);
   }
   // title 放完整端口与节点名：这一列宽度有限，「17951 新加坡机房-02」会被
   // 浏览器截掉尾巴，悬停要能看全
   const curName = (recheckState.nodes.find((n) => Number(n.port) === cur) || {});
-  const label = cur ? `${cur} ${curName.name || curName.listener || ''}`.trim() : '直连';
+  const nodeName = curName.name || curName.listener || '';
+  const label = cur ? `${cur} ${nodeName || '未检测到'}`.trim() : '直连';
   return `<select class="rc-exit-pick mono" data-id="${r.id}" title="出口：${esc(label)}">${opts.join('')}</select>`;
 }
 

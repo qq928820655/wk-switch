@@ -1672,10 +1672,18 @@ div[id^="view-"].hidden { display: none !important; }
 
 .col-rc-state { width: 92px; }
 .col-rc-count { width: 58px; }
-.col-rc-at { width: 84px; }
+.col-rc-at { width: 100px; }
 /* 出口列：一个下拉，窄到能放下「17950 香港住宅01」的半截就行——
    完整名字在 title 和下拉展开里看 */
 .col-rc-exit { width: 156px; }
+
+/* 复检名单必须 fixed + colgroup。原来走 auto 布局：结论列一句长文案会把
+   表格撑到容器宽度以上，浏览器反过来把有 width 的列压到 min-content，
+   实测 1000px 内容区下出口列只剩 54px、width:100% 的原生 select 缩到 30px，
+   五位端口被截成「17:」。fixed 布局列宽只认 col，不受内容抢。
+   min-width 给名称和结论留够位置，剩下的交给 .table-wrap 横向滚动 ——
+   滚动比把端口截没好。 */
+#rc-table { table-layout: fixed; min-width: 940px; }
 
 /* 名单里的出口下拉。做成输入框的矮版：这一列每行都有，做大了会把
    名称列挤掉，而那才是用户扫表时的锚点。 */
@@ -1731,7 +1739,11 @@ div[id^="view-"].hidden { display: none !important; }
     border-radius: 0;
     background: transparent;
   }
+  /* 卡片布局下 colgroup 的固定像素宽会把 grid 撑破（每日活跃页踩过同一个
+     坑）；fixed 布局和 min-width 也一并撤掉，整页只留纵向滚动。 */
   #rc-table, #rc-table tbody { display: block; width: 100%; }
+  #rc-table { table-layout: auto; min-width: 0; }
+  #rc-table colgroup { display: none; }
   #rc-table thead { display: none; }
   #rc-table tbody { display: flex; flex-direction: column; gap: 9px; }
   #rc-table tbody tr {
