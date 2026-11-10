@@ -154,6 +154,17 @@ def save_config(patch: dict[str, Any]) -> dict[str, Any]:
 
 # ------------------------------------------------------------------ 出口选择
 
+def sort_for_display(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """账号卡的分组顺序：参与中 → 手动关掉 → 风控挡的。
+
+    这一页是拿来跑活跃的，会跑的号必须在前。组内保持传入顺序（`list_accounts`
+    给的 updated_at 倒序），`list.sort` 是稳定的，不会打乱。
+    单独抽出来是为了能测 —— 排序写在 handler 里就只能靠截图看。
+    """
+    rows.sort(key=lambda r: 2 if r.get("risk") else (0 if r.get("daily_active") else 1))
+    return rows
+
+
 def is_risk(row: dict[str, Any]) -> bool:
     """这一行是不是风控账号。
 

@@ -459,6 +459,13 @@ table.grid tbody tr.picked:hover td { background: #eef0ff; }
 .pill.warn { background: var(--warn-soft); color: var(--warn); }
 .pill.bad { background: var(--bad-soft); color: var(--bad); }
 .pill.mute { background: #eef0f6; color: var(--ink-3); }
+/* 「跳过」不是「未跑」：本地判定就不跑（无 token / 加密信封 / 静态 key /
+   两条腿都关），有记录但没发请求。虚线描边跟纯灰的「未跑」区分开。 */
+.pill.skip {
+  background: #f7f8fb;
+  color: #7c8496;
+  box-shadow: inset 0 0 0 1px #d9dde8;
+}
 .pill.brand { background: var(--brand-soft); color: var(--brand); }
 
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--ink-2); }

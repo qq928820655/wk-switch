@@ -3164,7 +3164,7 @@ function renderDaStats(summary) {
       <h3>今日成功 <b>${summary.today_ok || 0}</b></h3>
       <div class="mini-row">
         <span class="stat-mini"><i style="background:#16a34a"></i>失败 ${summary.today_failed || 0}</span>
-        <span class="stat-mini"><i style="background:#94a3b8"></i>跳过 ${summary.today_skipped || 0}</span>
+        <span class="stat-mini" title="本地判定就不跑的：国内版、没有 access token、token 是加密信封、静态 API Key、网页腿和桌面腿都关着。具体原因见记录表的「说明」列"><i style="background:#94a3b8"></i>跳过 ${summary.today_skipped || 0}</span>
       </div>
     </div>
     <div class="stat-box">
@@ -3224,10 +3224,15 @@ function renderDaAccounts() {
   }
   body.innerHTML = daState.rows.map((r) => {
     const on = daState.selected.has(r.id);
+    // 今日状态四态。以前把「跳过」（本地判定不跑：无 token / 加密信封 / 静态 key /
+    // 两条腿都关）也算成「失败」，看板上「跳过 18」在列表里对不上任何一格。
     const today = r.today_ok
       ? '<span class="pill ok">已完成</span>'
-      : (r.last_at && !r.last_ok ? '<span class="pill bad">失败</span>'
-        : '<span class="pill mute">未跑</span>');
+      : r.today_skipped
+        ? `<span class="pill skip" title="${esc(r.last_detail || '本地判定不跑')}">跳过</span>`
+        : r.today_failed
+          ? '<span class="pill bad">失败</span>'
+          : '<span class="pill mute">未跑</span>';
     // 窄屏靠 CSS 把 tr 变成两行网格（名称独占第一行），不在这里做结构分叉。
     return `<tr data-id="${r.id}" class="${on ? 'sel' : ''}${r.risk ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="da-check" ${on ? 'checked' : ''}></td>
@@ -3243,9 +3248,10 @@ function renderDaAccounts() {
   }).join('');
   const sel = daState.selected.size;
   const risky = daState.rows.filter((r) => r.risk).length;
+  const off = daState.rows.filter((r) => !r.risk && r.daily_active === false).length;
   $('#da-accounts-hint').textContent =
     `共 ${daState.rows.length} 个国际版账号`
-    + (risky ? ` · 其中 ${risky} 个风控号不参与` : '')
+    + `（按 参与 ${daState.rows.length - risky - off} · 关闭 ${off} · 风控 ${risky} 排列）`
     + (sel ? ` · 已选 ${sel} 个` : '');
   daSyncBulk();
 }

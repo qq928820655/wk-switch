@@ -283,6 +283,30 @@ class WebDailyTest(ActivityBase):
         self.assertIn("link/token", res["error"])
 
 
+class DisplayOrderTest(ActivityBase):
+    """账号卡分组：参与中 → 手动关 → 风控。
+
+    以前按 updated_at 倒序，界面上会出现「关」的号夹在「开」中间，
+    看着像排序坏了。这一页是拿来跑活跃的，会跑的必须在前面。
+    """
+
+    def _row(self, name: str, risk: bool = False, active: bool = True) -> dict:
+        return {"name": name, "risk": risk, "daily_active": active}
+
+    def test_groups(self) -> None:
+        rows = [self._row("a", risk=True), self._row("b", active=False),
+                self._row("c"), self._row("d", risk=True, active=False)]
+        out = activity.sort_for_display(rows)
+        self.assertEqual([r["name"] for r in out], ["c", "b", "a", "d"])
+        # 风控优先于「关」：风控号即使开关还开着，也排在关掉的号后面
+        self.assertEqual([bool(r["risk"]) for r in out], [False, False, True, True])
+
+    def test_stable_inside_group(self) -> None:
+        rows = [self._row(str(i)) for i in range(5)]
+        out = activity.sort_for_display(rows)
+        self.assertEqual([r["name"] for r in out], ["0", "1", "2", "3", "4"])
+
+
 class SweepTest(ActivityBase):
     def test_disabled_does_nothing(self) -> None:
         activity.save_config({"enabled": False})

@@ -973,9 +973,11 @@ class Handler(BaseHTTPRequestHandler):
             row_id = int(row["id"])
             seen = last.get(row_id) or {}
             at = int(seen.get("at") or 0)
-            today_ok = bool(seen.get("ok")) and at >= today
             risk = activity.is_risk(row)
             on = row.get("daily_active") is not False
+            # 「今日」只认今天的记录：昨天失败、今天还没跑，显示「未跑」而不是「失败」。
+            # 三种结果分开给，界面才不会把「跳过」（本地判定不跑）说成失败。
+            seen_today = bool(at) and at >= today
             rows.append({
                 "id": row_id,
                 "name": row["name"],
@@ -989,12 +991,17 @@ class Handler(BaseHTTPRequestHandler):
                 "risk": risk,
                 "risk_label": row.get("recheck_label") or ("封号中" if risk else ""),
                 "participates": on and not risk,
-                "today_ok": today_ok,
+                "today_ok": bool(seen.get("ok")) and seen_today,
+                "today_skipped": bool(seen.get("skipped")) and seen_today,
+                "today_failed": seen_today and not seen.get("ok") and not seen.get("skipped"),
                 "last_ok": bool(seen.get("ok")),
                 "last_at": at,
                 "last_at_text": seen.get("at_text") or "",
                 "last_detail": str(seen.get("detail") or "")[:200],
             })
+        # 这一页是拿来跑活跃的，会跑的号必须在第一屏：参与 → 手动关 → 风控。
+        # 组内保持 list_accounts 的顺序（updated_at 倒序）。
+        activity.sort_for_display(rows)
         self._json(200, {"ok": True, "rows": rows,
                          "summary": store.activity_summary(),
                          "state": activity.state()})
