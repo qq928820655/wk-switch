@@ -200,11 +200,19 @@
         <label><input type="radio" name="store-realm" value="intl"><span>国际版</span></label>
       </div>
 
+      <!-- 两分区：正常账户 = recheck_state 为空；风控账户 = 复检名单里任意档位。
+           计数是整库的，不随搜索词和版本筛选变，避免看起来「号被筛没了」。 -->
+      <div class="seg" id="store-zone-seg" title="正常账户 = 不在封号复检名单里；风控账户 = 名单里的任意档位（封号中 / 待复检 / 已解封 / 凭据失效）">
+        <label><input type="radio" name="store-zone" value="" checked><span>全部 <b class="seg-num" id="store-zone-all">0</b></span></label>
+        <label><input type="radio" name="store-zone" value="normal"><span>正常 <b class="seg-num" id="store-zone-normal">0</b></span></label>
+        <label><input type="radio" name="store-zone" value="risk"><span>风控 <b class="seg-num" id="store-zone-risk">0</b></span></label>
+      </div>
+
       <label class="search-box">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
         </svg>
-        <input type="search" id="store-search" placeholder="搜索名称 / uid / 邮箱 / 批次">
+        <input type="search" id="store-search" placeholder="搜索名称 / uid / 邮箱 / 批次 / 风控 / 正常">
       </label>
 
       <select class="select-batch" id="store-batch" title="按导入批次筛选">
@@ -537,6 +545,19 @@
       <span class="hint" id="da-state">未运行</span>
     </div>
     <div class="store-stats" id="da-stats"></div>
+    <div class="store-toolbar da-account-tools">
+      <div class="seg" id="da-zone-seg" title="风控账户不参与每日活跃；正常账户再按「参与 / 手动关」排列">
+        <label><input type="radio" name="da-zone" value="" checked><span>全部 <b class="seg-num" id="da-zone-all">0</b></span></label>
+        <label><input type="radio" name="da-zone" value="normal"><span>正常 <b class="seg-num" id="da-zone-normal">0</b></span></label>
+        <label><input type="radio" name="da-zone" value="risk"><span>风控 <b class="seg-num" id="da-zone-risk">0</b></span></label>
+      </div>
+      <label class="search-box">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
+        </svg>
+        <input type="search" id="da-account-search" placeholder="搜索名称 / uid / 邮箱 / 出口 / 风控">
+      </label>
+    </div>
     <div class="table-wrap tall">
       <table class="grid" id="da-accounts">
         <colgroup>
@@ -840,8 +861,13 @@
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
         </svg>
-        <input type="search" id="rc-add-search" placeholder="先搜名称 / uid / 邮箱，再选账号">
+        <input type="search" id="rc-add-search" placeholder="先搜名称 / uid / 邮箱 / 风控，再选账号">
       </label>
+      <select id="rc-add-zone" class="select-batch" title="限定搜索范围：正常账户 / 风控账户；下拉里也会按这两组分好">
+        <option value="">全部账户</option>
+        <option value="normal">只看正常账户</option>
+        <option value="risk">只看风控账户</option>
+      </select>
       <select id="rc-add-select" class="rc-pick">
         <option value="">从账户库里选一个账号…</option>
       </select>

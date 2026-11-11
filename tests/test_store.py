@@ -878,5 +878,106 @@ class DailyActiveTests(StoreTestBase):
         self.assertFalse(fake.out[1]["enabled"])
 
 
+class AccountZoneTests(StoreTestBase):
+    """账户搜索的两分区：正常账户 = 不在复检名单，风控账户 = 名单里任意档位。
+
+    这组测试钉住的是「搜风控能搜到已解封 / 待复检」——只按 banned 判会把
+    名单里其它档位漏掉，界面就会显示「风控 1」而列表里有 2 条。
+    """
+
+    def _seed(self):
+        store.upsert([
+            self.acc("u-z1", "甲", realm="cn"),
+            self.acc("u-z2", "乙", realm="intl"),
+            self.acc("u-z3", "丙", realm="cn"),
+            self.acc("u-z4", "丁", realm="intl"),
+        ])
+        ids = {r["uid"]: r["id"] for r in store.list_accounts()}
+        store.set_track([ids["u-z3"]], "banned")
+        store.set_track([ids["u-z4"]], "revived")
+        return ids
+
+    def _call_get(self, method: str, path: str):
+        import server
+
+        class Fake:
+            def __init__(self, p):
+                self.path = p
+                self.out = None
+
+            def _json(self, status, payload):
+                self.out = (status, payload)
+
+        fake = Fake(path)
+        getattr(server.Handler, method)(fake)
+        return fake.out
+
+    def test_zone_filter_and_counts(self):
+        self._seed()
+        normal = {r["uid"] for r in store.list_accounts(zone="normal")}
+        risk = {r["uid"] for r in store.list_accounts(zone="risk")}
+        self.assertEqual(normal, {"u-z1", "u-z2"})
+        self.assertEqual(risk, {"u-z3", "u-z4"})
+        # 非法值不过滤，别让前端一个手滑把整库显示成空的
+        self.assertEqual(len(store.list_accounts(zone="bogus")), 4)
+        self.assertEqual(len(store.list_accounts(realm="intl", zone="risk")), 1)
+        self.assertEqual(len(store.list_accounts(track="banned", zone="risk")), 1)
+        self.assertEqual(store.list_accounts(zone="risk")[0]["zone_label"], "风控账户")
+        self.assertEqual(store.stats()["zones"], {"normal": 2, "risk": 2})
+
+    def test_zone_rows_carry_explicit_flag(self):
+        self._seed()
+        got = {r["uid"]: r for r in store.list_accounts()}
+        self.assertEqual(got["u-z1"]["zone"], "normal")
+        self.assertEqual(got["u-z3"]["zone"], "risk")
+        self.assertEqual(got["u-z4"]["recheck_label"], "已解封")
+        self.assertEqual(got["u-z4"]["zone"], "risk")
+
+    def test_status_words_in_search(self):
+        self._seed()
+        self.assertEqual(len(store.list_accounts(query="风控")), 2)
+        self.assertEqual(len(store.list_accounts(query="正常")), 2)
+        self.assertEqual(len(store.list_accounts(query="封号")), 1)
+        self.assertEqual(len(store.list_accounts(query="解封")), 1)
+        self.assertEqual(len(store.list_accounts(query="banned")), 1)
+        # 分区筛选与状态词叠加，不会互相放水
+        self.assertEqual(len(store.list_accounts(zone="normal", query="风控")), 0)
+        self.assertEqual(len(store.list_accounts(zone="risk", query="封号")), 1)
+        # 原来的字段搜索不受影响
+        self.assertEqual(len(store.list_accounts(query="甲")), 1)
+
+    def test_picker_rows_group_by_zone(self):
+        ids = self._seed()
+        normal = store.picker_rows("banned", zone="normal")
+        risk = store.picker_rows("banned", zone="risk")
+        self.assertEqual({r["id"] for r in normal}, {ids["u-z1"], ids["u-z2"]})
+        self.assertEqual({r["id"] for r in risk}, {ids["u-z4"]})
+        self.assertTrue(all(r["zone"] == "normal" for r in normal))
+        self.assertTrue(all(r["zone"] == "risk" for r in risk))
+        # u-z3 已在目标档 banned，不该出现在任何分组里
+        self.assertNotIn(ids["u-z3"], {r["id"] for r in normal + risk})
+
+    def test_api_routes_pass_zone(self):
+        self._seed()
+        status, data = self._call_get(
+            "_store_list", "/api/store/list?zone=risk")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["zone"], "risk")
+        self.assertEqual(len(data["rows"]), 2)
+        self.assertEqual(data["stats"]["zones"], {"normal": 2, "risk": 2})
+
+        status, data = self._call_get(
+            "_store_list", "/api/store/list?zone=normal&q=乙")
+        self.assertEqual(status, 200)
+        self.assertEqual([r["uid"] for r in data["rows"]], ["u-z2"])
+
+        status, data = self._call_get(
+            "_recheck_picker", "/api/recheck/picker?track=banned&zone=risk")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["zone"], "risk")
+        self.assertEqual(len(data["rows"]), 1)
+        self.assertEqual(data["rows"][0]["zone"], "risk")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

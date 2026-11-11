@@ -792,6 +792,9 @@ div[id^="view-"].hidden { display: none !important; }
   box-shadow: 0 1px 3px rgba(20, 26, 45, .12);
 }
 .seg input:focus-visible + span { outline: 2px solid var(--brand); outline-offset: 1px; }
+/* 分段按钮里的计数：等宽数字，选中态才加深，平时不抢文字 */
+.seg-num { margin-left: 2px; font-weight: 650; font-variant-numeric: tabular-nums; opacity: .68; }
+.seg input:checked + span .seg-num { opacity: 1; color: var(--brand); }
 
 /* 搜索框：图标 + 无边框输入，高度和按钮对齐 */
 .search-box {
@@ -840,6 +843,22 @@ div[id^="view-"].hidden { display: none !important; }
 }
 .store-toolbar .seg { flex: none; }
 .store-toolbar .btn { flex: none; height: 34px; }
+
+/* 账户名后面的分区徽标：正常 / 风控一眼分开，不用读状态列的档位名。
+   窄屏收成 6px 圆点（见末尾 @media），名称列不会被胶囊撑破。 */
+.zone-flag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+.zone-flag.risk { background: #fee9e9; color: #b42318; }
+.zone-flag.normal { background: #eaf6ee; color: #16794a; }
 /* 工具栏按钮独立成组：窄屏时整组可以单独切 2 列网格，不会和上面的
    搜索框 / 版本筛选一起被 column 布局压成一行一个 */
 .store-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
@@ -2084,6 +2103,9 @@ div[id^="view-"].hidden { display: none !important; }
 }
 .da-bulk .btn { flex: none; height: 30px; }
 .da-bulk .hint { margin: 0; }
+.da-account-tools { margin: 0 0 10px; }
+.da-account-tools .seg { flex: none; }
+.da-account-tools .search-box { flex: 1 1 220px; }
 .da-active { white-space: nowrap; }
 #da-accounts tbody tr.risk-row { background: #fffafa; }
 
@@ -2187,4 +2209,24 @@ div[id^="view-"].hidden { display: none !important; }
 @media (max-width: 720px) {
   .da-at .at-full { display: none; }
   .da-at .at-short { display: inline; }
+}
+
+/* 手机上分区徽标收成圆点：账户库名称列只有 88px，账号卡名称列是 ellipsis，
+   两字胶囊会把账号名挤没。圆点颜色仍分红 / 绿，title 里带完整说明。 */
+@media (max-width: 720px) {
+  #store-table .zone-flag,
+  #da-accounts .zone-flag {
+    width: 6px; height: 6px; padding: 0; margin-left: 4px;
+    border-radius: 50%; font-size: 0; line-height: 0;
+    color: transparent; overflow: hidden;
+  }
+  #store-table .zone-flag.normal,
+  #da-accounts .zone-flag.normal { background: #16a34a; }
+  #store-table .zone-flag.risk,
+  #da-accounts .zone-flag.risk { background: var(--bad); }
+  /* 账号卡名称格会裁超长文本，圆点绝对定位贴右边才不会被一起裁掉 */
+  #da-accounts td:nth-child(2) { position: relative; padding-right: 14px; }
+  #da-accounts td:nth-child(2) .zone-flag {
+    position: absolute; right: 3px; top: 50%; margin: -3px 0 0;
+  }
 }

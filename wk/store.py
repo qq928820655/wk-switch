@@ -592,11 +592,27 @@ def _payload_bool(payload: str, key: str, default: bool = True) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+#: 搜索时用来把 `recheck_state` 映射成「人话」的 SQL 片段。
+#:
+#: 用户搜「风控」时不需要记住四个档位分别叫什么，搜「封号」「解封」「待复检」
+#: 也能直接落到对应档位；不在名单里的号则统一挂「正常」。放在 SQL 里而不是
+#: Python 里过滤，是因为分页/排序都在 SQL 侧，捞出来再筛会把 LIMIT 用歪。
+_ZONE_WORDS = """(CASE IFNULL(recheck_state,'')
+    WHEN 'banned'  THEN '风控 风控账户 封号 封号中 banned'
+    WHEN 'pending' THEN '风控 风控账户 待复检 待确认 pending'
+    WHEN 'revived' THEN '风控 风控账户 解封 已解封 revived'
+    WHEN 'auth'    THEN '风控 风控账户 凭据失效 auth'
+    WHEN 'unknown' THEN '风控 风控账户 未确认 unknown'
+    ELSE '正常 正常账户 normal' END)"""
+
+
 def list_accounts(realm: str = "", query: str = "", limit: int = 500,
-                  track: str = "", batch: str = "") -> list[dict]:
-    """按版本 / 批次筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。
+                  track: str = "", batch: str = "", zone: str = "") -> list[dict]:
+    """按版本 / 风控分区 / 批次筛选 + 关键字搜索。返回给界面的行（token 已脱敏）。
 
     `track` 按复检名单状态筛：传 "banned" 就是「封号复检」标签页要的那批。
+    `zone` 按两分区筛：`normal` = 不在复检名单里（正常账户），`risk` = 名单里
+    的任意档位（风控账户）。两者同时给时以 AND 叠加，界面不会这么传。
     `batch` 按导入批次筛：同一批导进来的号一次性全捞出来（对账、整批重打、
     整批删除都靠它）。
     用参数而不是另写一个查询，是为了让排序、脱敏、字段组装只有一份实现——
@@ -612,14 +628,22 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
         # 那种情况由 _migrate 负责，这里只管正常路径。
         sql += " AND IFNULL(recheck_state,'') = ?"
         args.append(track)
+    if zone == "normal":
+        # 空串 = 不在名单里。NULL 也按正常账户算：老库 ALTER 前可能是 NULL。
+        sql += " AND IFNULL(recheck_state,'') = ''"
+    elif zone == "risk":
+        sql += " AND IFNULL(recheck_state,'') != ''"
     if batch:
         sql += " AND IFNULL(batch,'') = ?"
         args.append(batch)
     if query:
+        # 状态词和名称/uid/邮箱/批次一起进 LIKE：搜「风控」= 只看风控区，
+        # 搜「正常」= 只看正常账户；分区筛选之上再叠一层也不会错位。
         sql += (" AND (name LIKE ? OR uid LIKE ? OR nickname LIKE ? OR email LIKE ?"
-                " OR IFNULL(batch,'') LIKE ?)")
+                " OR IFNULL(batch,'') LIKE ?"
+                " OR " + _ZONE_WORDS + " LIKE ?)")
         like = f"%{query}%"
-        args.extend([like, like, like, like, like])
+        args.extend([like, like, like, like, like, like])
     sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
     args.append(limit)
 
@@ -683,6 +707,10 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
             "checked": clock.stamp(checked_at, "%m-%d %H:%M") if checked_at else "",
             "checked_note": (row["checked_note"] if "checked_note" in keys else "") or "",
             # ---- 封号复检 ----
+            # zone 是两分区的单一事实来源：前端「正常 / 风控」筛选、图标、
+            # 下拉分组都读它，不各自按 recheck_state 再推一遍。
+            "zone": "risk" if recheck_state else "normal",
+            "zone_label": "风控账户" if recheck_state else "正常账户",
             "recheck_state": recheck_state,
             "recheck_label": RECHECK_LABELS.get(recheck_state, ""),
             "recheck_count": recheck_count,
@@ -718,9 +746,21 @@ def stats() -> dict[str, Any]:
             "SELECT batch, source, total, inserted, updated, skipped, created_at "
             "FROM import_log ORDER BY id DESC LIMIT 5"
         ).fetchall()
+        zones = conn.execute(
+            "SELECT CASE WHEN IFNULL(recheck_state,'') = '' THEN 'normal' "
+            "ELSE 'risk' END AS z, COUNT(*) AS n FROM accounts GROUP BY z"
+        ).fetchall()
+
+    zone_counts = {"normal": 0, "risk": 0}
+    for row in zones:
+        if row["z"] in zone_counts:
+            zone_counts[row["z"]] = row["n"]
 
     return {
         "total": total,
+        # 分区计数是整库的，不随当前 realm/batch/搜索变：分段按钮显示的是
+        # 「库里有多少正常号 / 多少风控号」，跟着筛选变会让人以为号丢了。
+        "zones": zone_counts,
         "realms": [
             {"key": r["realm"], "label": tok.REALM_LABEL.get(r["realm"], "未知"), "count": r["n"]}
             for r in by_realm
@@ -745,29 +785,39 @@ def stats() -> dict[str, Any]:
 
 
 def picker_rows(track: str = "banned", query: str = "",
-                limit: int = 2000) -> list[dict]:
+                limit: int = 2000, zone: str = "") -> list[dict]:
     """「把账号加进名单」下拉的数据源。
 
     只排除**已经在目标档位**的账号：在别的档位的、以及压根不在名单里的都要
     能选。以前按「recheck_state 非空」一刀切，用户把号从正常区挪进风控区
     之后，名单里看不到、下拉里也选不到，看起来像被删了。
 
+    `zone` 让用户把搜索范围限定在正常账户 / 风控账户里；每行都带 `zone`，
+    前端按它分两组显示，混在一串 option 里靠后缀分辨太费眼。
+
     账户库默认只给 500 行，库一大就有一半号永远进不了这个下拉；这里单独
-    放宽到 2000 并支持按名称 / uid / 邮箱搜。复杂度 O(n)，n = 库里行数，
-    瓶颈在 list_accounts 的整表脱敏，够用到几千条；再大就该走分页了。
+    放宽到 2000 并支持按名称 / uid / 邮箱 / 状态词搜。复杂度 O(n)，
+    n = 库里行数，瓶颈在 list_accounts 的整表脱敏，够用到几千条；
+    再大就该走分页了。
     """
-    rows = list_accounts(query=query, limit=max(1, min(int(limit or 2000), 5000)))
+    rows = list_accounts(query=query, limit=max(1, min(int(limit or 2000), 5000)),
+                         zone=zone)
     out = []
     for r in rows:
         state = r["recheck_state"] or ""
         if state == track:
             continue
+        zone_key = "risk" if state else "normal"
         out.append({
             "id": r["id"],
             "name": r["name"],
+            "uid": r["uid"],
+            "email": r["email"],
             "realm_label": r["realm_label"],
             "state": state,
             "state_label": RECHECK_LABELS.get(state, "正常账号"),
+            "zone": zone_key,
+            "zone_label": "风控账户" if zone_key == "risk" else "正常账户",
         })
     return out
 

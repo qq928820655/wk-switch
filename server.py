@@ -820,14 +820,18 @@ class Handler(BaseHTTPRequestHandler):
         realm = (query.get("realm") or [""])[0]
         keyword = (query.get("q") or [""])[0]
         batch = (query.get("batch") or [""])[0]
+        zone = (query.get("zone") or [""])[0]
+        if zone not in ("normal", "risk", ""):
+            zone = ""
         try:
             limit = int((query.get("limit") or ["500"])[0] or 500)
         except ValueError:
             limit = 500
         rows = store.list_accounts(realm=realm, query=keyword,
-                                   limit=min(limit, 2000), batch=batch)
+                                   limit=min(limit, 2000), batch=batch,
+                                   zone=zone)
         self._json(200, {"ok": True, "rows": rows, "total": len(rows),
-                         "batch": batch, "stats": store.stats()})
+                         "batch": batch, "zone": zone, "stats": store.stats()})
 
     def _store_exits(self) -> None:
         """账户库出口栏要用的端口清单：节点表 + 两区各自占用的端口。
@@ -983,6 +987,7 @@ class Handler(BaseHTTPRequestHandler):
                 "name": row["name"],
                 "realm": row["realm"],
                 "uid": row["uid"],
+                "email": row.get("email") or "",
                 "exit_port": int(row.get("exit_port") or 0),
                 # 账户级开关原值（导出 hub 时写 tasksEnabled 的就是它）
                 "daily_active": on,
@@ -1336,14 +1341,19 @@ class Handler(BaseHTTPRequestHandler):
         if track not in ("banned", "pending", "revived", "auth"):
             track = "banned"
         keyword = (query.get("q") or [""])[0]
+        zone = (query.get("zone") or [""])[0]
+        if zone not in ("normal", "risk", ""):
+            zone = ""
         try:
             limit = int((query.get("limit") or ["2000"])[0] or 2000)
         except ValueError:
             limit = 2000
-        rows = store.picker_rows(track=track, query=keyword, limit=limit)
+        rows = store.picker_rows(track=track, query=keyword, limit=limit,
+                                 zone=zone)
         self._json(200, {
             "ok": True,
             "track": track,
+            "zone": zone,
             "rows": rows,
             "total": len(rows),
         })

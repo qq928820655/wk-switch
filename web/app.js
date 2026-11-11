@@ -536,7 +536,7 @@ function realmOf(name) {
 /* ---------- 账户库 ---------- */
 
 const storeState = {
-  rows: [], profile: null, realm: '', q: '', batch: '', loaded: false,
+  rows: [], allRows: [], profile: null, realm: '', q: '', batch: '', zone: '', loaded: false,
   selected: new Set(),
   // 出口下拉的选项来自 mihomo 节点表；busyRisk 是风控区已经占住的端口，
   // 一键分配要避开它们，下拉里则照样列出（那是用户手动自定义的范围）。
@@ -809,19 +809,53 @@ async function copyWebLoginLink() {
   }
 }
 
-async function loadStore() {
+/**
+ * 账户库请求的序号：切分区 / 敲搜索词比一个请求返回快得多，旧响应会盖掉
+ * 新结果，界面就出现「按钮在风控、表里还是全部」。节点表第一次拉可能卡
+ * 一秒，这个竞态在快速连点时必现。
+ */
+let storeLoadSeq = 0;
+
+/**
+ * 按两分区过滤当前搜索结果。zone 由后端每行给，前端不再自己推档位。
+ * O(n)，n ≤ 2000；切分区走纯本地，不发请求。
+ */
+function storeZoneRows(rows) {
+  if (!storeState.zone) return rows;
+  return rows.filter((r) => (r.zone || (r.recheck_state ? 'risk' : 'normal'))
+    === storeState.zone);
+}
+
+async function loadStore(opts) {
+  const seq = ++storeLoadSeq;
+  const noExits = !!(opts && opts.noExits);
   const params = new URLSearchParams();
   if (storeState.realm) params.set('realm', storeState.realm);
   if (storeState.q) params.set('q', storeState.q);
   if (storeState.batch) params.set('batch', storeState.batch);
 
   const data = await apiGet('/api/store/list?' + params.toString());
+  if (seq !== storeLoadSeq) return;
   if (!data.ok) throw new Error(data.error || '账户库读取失败');
-  // 节点表只拉一次：搜索框每敲一个字都去问池面板，面板没开时会白等 1 秒。
-  // 想重读时点「刷新节点」。
-  await loadStoreExits();
 
-  storeState.rows = data.rows || [];
+  // 节点表不阻塞账户列表：问池面板可能卡好几秒，先让表格出来。
+  // 节点到了再重绘一次，出口下拉里才有节点名可选。
+  // 首屏那次只取 tab 徽章数量，没必要顺手探测节点（会白占一条 HTTP 连接）。
+  const needExits = !noExits && !storeState.exitsLoaded;
+  const exitsDone = loadStoreExits();
+  if (needExits) {
+    exitsDone.finally(() => {
+      if (seq === storeLoadSeq && storeState.exitsLoaded) {
+        renderStoreTable(storeState.rows);
+      }
+    });
+  }
+
+  // 分区不交给后端：allRows 留着完整的搜索结果，切「正常 / 风控」纯本地
+  // 过滤，0ms 生效。账户库每次刷新都可能撞上 3 秒的节点表探测，靠网络
+  // 往返做分区会让按钮点了没反应。后端 zone 参数保留给 API 调用方。
+  storeState.allRows = data.rows || [];
+  storeState.rows = storeZoneRows(storeState.allRows);
   storeState.loaded = true;
 
   // 库里已经删掉的 id 不能留在选择集里，否则「导出」会带上不存在的行
@@ -837,6 +871,12 @@ function renderStoreStats(stats) {
   const total = stats.total || 0;
   $('#store-count').textContent = total;
   $('#store-db').textContent = stats.db_path || '';
+
+  // 分区计数取整库，不跟搜索词 / 版本筛选联动：按钮回答的是「库里各有多少」。
+  const zones = stats.zones || { normal: 0, risk: 0 };
+  $('#store-zone-all').textContent = total;
+  $('#store-zone-normal').textContent = zones.normal || 0;
+  $('#store-zone-risk').textContent = zones.risk || 0;
 
   const realms = (stats.realms || []).map((r) => `
     <div class="stat-mini">
@@ -895,27 +935,35 @@ function fillBatchSelect(list) {
 
 /* ---------- 账户库出口 ---------- */
 
+/** 并发的 loadStore 共用同一个节点表请求：池面板探测慢，重复打没意义。 */
+let storeExitsInflight = null;
+
 /** 读一次 mihomo 节点表 + 两区端口占用。失败不让账户库整页挂掉。 */
 async function loadStoreExits(force) {
   if (storeState.exitsLoaded && !force) return;
-  try {
-    const data = await apiGet('/api/store/exits');
-    if (!data.ok) throw new Error(data.error || '读取节点表失败');
-    storeState.nodes = data.nodes || [];
-    storeState.available = data.available || [];
-    storeState.busyRisk = data.busy_risk || [];
-    storeState.exitsLoaded = true;
-    renderStoreExitHint();
-  } catch (err) {
-    storeState.nodes = [];
-    storeState.available = [];
-    storeState.busyRisk = [];
-    const el = $('#store-exit-hint');
-    if (el) {
-      el.textContent = `节点表读取失败：${err.message}（点「刷新节点」重试）`;
-      el.classList.add('bad');
+  if (storeExitsInflight && !force) return storeExitsInflight;
+  const run = async () => {
+    try {
+      const data = await apiGet('/api/store/exits');
+      if (!data.ok) throw new Error(data.error || '读取节点表失败');
+      storeState.nodes = data.nodes || [];
+      storeState.available = data.available || [];
+      storeState.busyRisk = data.busy_risk || [];
+      storeState.exitsLoaded = true;
+      renderStoreExitHint();
+    } catch (err) {
+      storeState.nodes = [];
+      storeState.available = [];
+      storeState.busyRisk = [];
+      const el = $('#store-exit-hint');
+      if (el) {
+        el.textContent = `节点表读取失败：${err.message}（点「刷新节点」重试）`;
+        el.classList.add('bad');
+      }
     }
-  }
+  };
+  storeExitsInflight = run().finally(() => { storeExitsInflight = null; });
+  return storeExitsInflight;
 }
 
 function renderStoreExitHint() {
@@ -1047,20 +1095,38 @@ function syncStoreCols() {
   cg.innerHTML = widths.map((w) => `<col style="width:${w}px">`).join('');
 }
 
+/**
+ * 名称列后面的分区徽标：正常 / 风控一眼分开，不用去读状态列的档位名。
+ * 窄屏靠 CSS 收成 6px 圆点，88px 的名称列不会被胶囊挤破。
+ */
+function zoneFlag(r) {
+  // 账户库给 recheck_state，每日活跃接口给 risk/risk_label，两边共用这一个标记。
+  const risk = !!(r.recheck_state || r.zone === 'risk' || r.risk);
+  const label = risk ? '风控' : '正常';
+  const tip = risk
+    ? `风控账户 · ${r.recheck_label || r.risk_label || '复检名单'}`
+    : '正常账户 · 不在复检名单里';
+  return `<span class="zone-flag ${risk ? 'risk' : 'normal'}" title="${esc(tip)}">${label}</span>`;
+}
+
 function renderStoreTable(rows) {
   syncStoreCols();
   const body = $('#store-table tbody');
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="12" class="empty-cell">账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。</td></tr>';
-    $('#store-hint').textContent = '';
+    const filtering = storeState.q || storeState.zone || storeState.realm || storeState.batch;
+    // 空库与「筛没了」是两回事：后者不该让人以为账号被删掉。
+    body.innerHTML = '<tr><td colspan="12" class="empty-cell">' + (filtering
+      ? '没有符合当前筛选的账户。切回「全部」或清空搜索词再试。'
+      : '账户库是空的。先在「导入转换」里转一遍，再点「保存到账户库」。') + '</td></tr>';
+    $('#store-hint').textContent = '共 0 条';
     return;
   }
 
   const sel = storeState.selected;
   body.innerHTML = rows.map((r) => `
-    <tr data-id="${r.id}" class="${sel.has(r.id) ? 'sel' : ''}${r.recheck_state ? ' risk-row' : ''}">
+    <tr data-id="${r.id}" data-zone="${r.recheck_state ? 'risk' : 'normal'}" class="${sel.has(r.id) ? 'sel' : ''}${r.recheck_state ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="row-check" data-id="${r.id}" ${sel.has(r.id) ? 'checked' : ''}></td>
-      <td title="最近更新 ${esc(r.updated_at)}"><b>${esc(r.name)}</b>${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
+      <td title="最近更新 ${esc(r.updated_at)}"><b>${esc(r.name)}</b>${zoneFlag(r)}${r.nickname && r.nickname !== r.name ? `<br><small class="hint">${esc(r.nickname)}</small>` : ''}</td>
       <td><span class="pill ${REALM_PILL[r.realm] || 'mute'}">${esc(r.realm_label || REALM_TEXT[r.realm] || '未知')}</span></td>
       <td class="mono col-uid" title="${esc(r.uid)}">${esc(shortUid(r.uid))}</td>
       <td class="col-state">${statusCell(r)}</td>
@@ -1077,7 +1143,9 @@ function renderStoreTable(rows) {
       </td>
     </tr>`).join('');
 
-  $('#store-hint').textContent = `共 ${rows.length} 条`;
+  const zoneText = storeState.zone === 'risk' ? '（仅风控账户）'
+    : storeState.zone === 'normal' ? '（仅正常账户）' : '';
+  $('#store-hint').textContent = `共 ${rows.length} 条${zoneText}`;
 }
 
 /**
@@ -2589,24 +2657,43 @@ async function trackSelected(state) {
    用户把号从正常区挪进风控区之后，名单里看不见、下拉里也选不到，
    看起来就是号被删了。搜索走后端，能覆盖账户库默认 500 行之外的老号。 */
 let pickerTimer = null;
+let pickerSeq = 0;
 async function loadRecheckPicker() {
+  const seq = ++pickerSeq;
   const select = $('#rc-add-select');
   const params = new URLSearchParams();
   params.set('track', recheckState.track || 'banned');
   const q = ($('#rc-add-search') && $('#rc-add-search').value || '').trim();
   if (q) params.set('q', q);
+  const zone = ($('#rc-add-zone') && $('#rc-add-zone').value || '').trim();
+  if (zone) params.set('zone', zone);
   try {
     const data = await apiGet('/api/recheck/picker?' + params.toString());
+    if (seq !== pickerSeq) return;   // 搜索词又变了，旧结果别盖上来
     if (!data.ok) return;
     const rows = data.rows || [];
     const keep = select.value;
     const head = rows.length
       ? '<option value="">从账户库里选一个账号…</option>'
       : `<option value="">${q ? '没搜到账号' : '这一档已包含全部账号'}</option>`;
-    select.innerHTML = head + rows.map((r) => {
-      const tag = r.state_label || '正常账号';
-      return `<option value="${r.id}">${esc(r.name)} · ${esc(r.realm_label || '')} · ${esc(tag)}</option>`;
-    }).join('');
+    // 下拉按「正常账户 / 风控账户」分组。混成一串 option 靠后缀分辨太费眼，
+    // 也看不出某一组是不是压根没号。zone 由后端给，前端不再自己推档位。
+    const groups = [
+      { key: 'normal', label: '正常账户' },
+      { key: 'risk', label: '风控账户' },
+    ];
+    let html = head;
+    groups.forEach((g) => {
+      const list = rows.filter((r) => (r.zone || (r.state ? 'risk' : 'normal')) === g.key);
+      if (!list.length) return;
+      html += `<optgroup label="${g.label} · ${list.length} 个">`
+        + list.map((r) => {
+          const tag = r.state ? (r.state_label || '风控账户') : '正常账户';
+          return `<option value="${r.id}">${esc(r.name)} · ${esc(r.realm_label || '')} · ${esc(tag)}</option>`;
+        }).join('')
+        + '</optgroup>';
+    });
+    select.innerHTML = html;
     if (keep) select.value = keep;
   } catch (err) {
     // 选人列表拿不到不影响主流程，静默
@@ -2879,6 +2966,14 @@ function bind() {
       pickerTimer = setTimeout(() => loadRecheckPicker(), 200);
     });
   }
+  // 搜索范围限定到某一分区：搜「一批号」时不该被另一区的同名号淹没。
+  const rcAddZone = $('#rc-add-zone');
+  if (rcAddZone) {
+    rcAddZone.addEventListener('change', () => {
+      $('#rc-add-select').value = '';
+      loadRecheckPicker();
+    });
+  }
 
   // 名单档位切换与搜索：切了立刻重查
   document.querySelectorAll('input[name="rc-track"]').forEach((el) => {
@@ -2938,6 +3033,20 @@ function bind() {
     el.addEventListener('change', () => {
       storeState.realm = el.value;
       loadStore().catch((err) => toast(err.message, true));
+    });
+  });
+
+  // 正常 / 风控分区：本地过滤，点了立刻生效，不等网络。
+  // 搜索词 / 版本 / 批次仍走后端，回来后按当前分区重新筛一遍。
+  document.querySelectorAll('input[name="store-zone"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      storeState.zone = el.value;
+      storeState.rows = storeZoneRows(storeState.allRows);
+      // 筛选外的勾选不能留在批量操作里
+      const alive = new Set(storeState.rows.map((r) => r.id));
+      storeState.selected = new Set([...storeState.selected].filter((id) => alive.has(id)));
+      renderStoreTable(storeState.rows);
+      refreshSelBar();
     });
   });
 
@@ -3090,7 +3199,14 @@ const daState = {
   selected: new Set(),
   pollTimer: null,
   loaded: false,
+  // 账号卡的本地筛选：行数最多 2000，前端过滤比每次敲字都问后端快，
+  // 也不会和 1.8s 的状态轮询抢请求。
+  q: '',
+  zone: '',
 };
+
+/** 轮询和手工刷新可能同时在飞，旧响应不能盖掉新状态。 */
+let daLoadSeq = 0;
 
 /** 配置 → 表单。缺字段按默认值填，不让输入框空着。 */
 function daFillForm(cfg) {
@@ -3142,8 +3258,13 @@ async function loadActivity() {
 }
 
 async function loadDaAccounts() {
+  const seq = ++daLoadSeq;
   const data = await apiGet('/api/activity/accounts');
+  if (seq !== daLoadSeq) return;
   daState.rows = data.rows || [];
+  // 筛选外的勾选不能留着：批量开关、批量跑都会按 selected 全量执行，
+  // 用户看不见的号被改了会莫名其妙。
+  daPruneSelection();
   renderDaAccounts();
   renderDaStats(data.summary);
   daRenderState(data.state);
@@ -3195,6 +3316,49 @@ function daExitText(port) {
   return port ? String(port) : '直连';
 }
 
+/**
+ * 一条账号能不能被当前搜索词命中。
+ *
+ * 状态词和真实字段拼进同一份 haystack：搜「风控」「正常」「关闭」「参与」
+ * 「已完成」「失败」「跳过」都能直接定位，不必先想清楚去哪个分段找。
+ * 纯前端比较，O(n·len)，n ≤ 2000，瓶颈是 join 出的临时字符串。
+ */
+function daMatch(r, q) {
+  if (!q) return true;
+  const words = [
+    r.name || '', r.uid || '', r.email || '',
+    r.exit_port ? String(r.exit_port) : '直连',
+    r.risk ? '风控 风控账户' : '正常 正常账户',
+    r.risk ? '' : (r.daily_active === false ? '关闭 关 不参与' : '参与 开'),
+    r.today_ok ? '已完成 成功' : r.today_skipped ? '跳过'
+      : r.today_failed ? '失败' : '未跑',
+  ].join(' ').toLowerCase();
+  // 空格分隔的词逐个命中，允许「风控 7890」这种组合查询。
+  return q.split(/\s+/).every((word) => word && words.includes(word));
+}
+
+/** 当前分区 + 搜索词之后的行。排序沿用服务端的「参与 → 关闭 → 风控」。 */
+function daVisibleRows() {
+  const q = daState.q.trim().toLowerCase();
+  return daState.rows.filter((r) => {
+    if (daState.zone === 'risk' && !r.risk) return false;
+    if (daState.zone === 'normal' && r.risk) return false;
+    return daMatch(r, q);
+  });
+}
+
+/** 分段按钮的计数取整批账号，不随搜索词变，避免「搜索把号搜少了」的错觉。 */
+function daZoneCounts() {
+  const risky = daState.rows.filter((r) => r.risk).length;
+  return { all: daState.rows.length, normal: daState.rows.length - risky, risk: risky };
+}
+
+/** 只保留当前可见行的勾选；搜索 / 分区 / 轮询重绘后都调一次。 */
+function daPruneSelection() {
+  const visible = new Set(daVisibleRows().map((r) => r.id));
+  daState.selected = new Set([...daState.selected].filter((id) => visible.has(id)));
+}
+
 /** 账号卡上那一格「活跃」：开关 + 风控说明。
  *
  *  风控账号（recheck_state=banned）不允许参与每日活跃：开关置灰、显式标「风控不
@@ -3215,15 +3379,35 @@ function daActiveCell(r) {
     <span class="rc-mini-box"></span>${on ? '开' : '关'}</button>`;
 }
 
+/** 全选框跟当前可见行对齐：筛选后的「全选」不该覆盖看不见的号。 */
+function daSyncCheckAll(rows) {
+  const box = $('#da-check-all');
+  if (!box) return;
+  const picked = rows.filter((r) => daState.selected.has(r.id)).length;
+  box.checked = rows.length > 0 && picked === rows.length;
+  box.indeterminate = picked > 0 && picked < rows.length;
+}
+
 function renderDaAccounts() {
   const body = $('#da-accounts tbody');
-  if (!daState.rows.length) {
-    body.innerHTML = '<tr><td colspan="7" class="empty-cell">账户库里还没有国际版账号。先在「导入转换」或「官网登录」里加号。</td></tr>';
-    $('#da-accounts-hint').textContent = '';
+  const counts = daZoneCounts();
+  $('#da-zone-all').textContent = counts.all;
+  $('#da-zone-normal').textContent = counts.normal;
+  $('#da-zone-risk').textContent = counts.risk;
+
+  const rows = daVisibleRows();
+  if (!rows.length) {
+    const emptyLib = counts.all === 0;
+    body.innerHTML = '<tr><td colspan="7" class="empty-cell">' + (emptyLib
+      ? '账户库里还没有国际版账号。先在「导入转换」或「官网登录」里加号。'
+      : '没有符合当前搜索 / 分区的账号。切回「全部」或清空搜索词再试。') + '</td></tr>';
+    $('#da-accounts-hint').textContent = emptyLib
+      ? '' : `共 ${counts.all} 个国际版账号 · 当前显示 0 个`;
+    daSyncCheckAll(rows);
     daSyncBulk();
     return;
   }
-  body.innerHTML = daState.rows.map((r) => {
+  body.innerHTML = rows.map((r) => {
     const on = daState.selected.has(r.id);
     // 今日状态四态。以前把「跳过」（本地判定不跑：无 token / 加密信封 / 静态 key /
     // 两条腿都关）也算成「失败」，看板上「跳过 18」在列表里对不上任何一格。
@@ -3235,9 +3419,9 @@ function renderDaAccounts() {
           ? '<span class="pill bad">失败</span>'
           : '<span class="pill mute">未跑</span>';
     // 窄屏靠 CSS 把 tr 变成两行网格（名称独占第一行），不在这里做结构分叉。
-    return `<tr data-id="${r.id}" class="${on ? 'sel' : ''}${r.risk ? ' risk-row' : ''}">
+    return `<tr data-id="${r.id}" data-zone="${r.risk ? 'risk' : 'normal'}" class="${on ? 'sel' : ''}${r.risk ? ' risk-row' : ''}">
       <td class="col-check"><input type="checkbox" class="da-check" ${on ? 'checked' : ''}></td>
-      <td title="${esc(r.uid)}"><b>${esc(r.name)}</b></td>
+      <td title="${esc(r.uid)}${r.email ? ' · ' + esc(r.email) : ''}"><b>${esc(r.name)}</b>${zoneFlag(r)}</td>
       <td class="da-active">${daActiveCell(r)}</td>
       <td class="mono">${esc(daExitText(r.exit_port))}</td>
       <td class="da-today">${today}</td>
@@ -3248,12 +3432,14 @@ function renderDaAccounts() {
     </tr>`;
   }).join('');
   const sel = daState.selected.size;
-  const risky = daState.rows.filter((r) => r.risk).length;
   const off = daState.rows.filter((r) => !r.risk && r.daily_active === false).length;
+  const zoneText = daState.zone === 'risk' ? '仅风控' : daState.zone === 'normal' ? '仅正常' : '';
   $('#da-accounts-hint').textContent =
-    `共 ${daState.rows.length} 个国际版账号`
-    + `（按 参与 ${daState.rows.length - risky - off} · 关闭 ${off} · 风控 ${risky} 排列）`
+    `共 ${counts.all} 个国际版账号（参与 ${counts.all - counts.risk - off} · 关闭 ${off} · 风控 ${counts.risk}）`
+    + ` · 当前显示 ${rows.length} 个${zoneText ? '（' + zoneText + '）' : ''}`
+    + (daState.q ? ` · 搜索「${daState.q}」` : '')
     + (sel ? ` · 已选 ${sel} 个` : '');
+  daSyncCheckAll(rows);
   daSyncBulk();
 }
 
@@ -3409,8 +3595,24 @@ function bindActivity() {
 
   // 账号勾选：只用来「跑选中的」，与账户库那套勾选集不共享
   $('#da-check-all').addEventListener('change', (e) => {
-    daState.selected.clear();
-    if (e.target.checked) daState.rows.forEach((r) => daState.selected.add(r.id));
+    // 只全选当前可见行：搜索 / 分区筛掉的号不该被悄悄勾上。
+    daState.selected = new Set();
+    if (e.target.checked) daVisibleRows().forEach((r) => daState.selected.add(r.id));
+    renderDaAccounts();
+  });
+
+  // 账号卡本地筛选：正常 / 风控分区 + 关键字。换筛选时把落在筛选外的
+  // 勾选清掉，批量开关不会改到看不见的号。
+  document.querySelectorAll('input[name="da-zone"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      daState.zone = el.value;
+      daPruneSelection();
+      renderDaAccounts();
+    });
+  });
+  $('#da-account-search').addEventListener('input', (e) => {
+    daState.q = e.target.value.trim();
+    daPruneSelection();
     renderDaAccounts();
   });
 
@@ -3453,4 +3655,4 @@ bindActivity();
 loadProfiles()
   .then(() => loadStoreProfiles())
   .catch(() => toast('格式列表加载失败', true));
-loadStore().catch(() => { /* 空库不是错误，切到账户库时会再拉一次 */ });
+loadStore({ noExits: true }).catch(() => { /* 空库不是错误，切到账户库时会再拉一次 */ });
