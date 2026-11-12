@@ -210,6 +210,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/store/login/config":
             self._store_login_config()
             return
+        if path == "/api/store/login/exits":
+            self._store_login_exits()
+            return
         if path == "/api/store/exit-proxy/config":
             self._store_exit_proxy_config()
             return
@@ -711,6 +714,143 @@ class Handler(BaseHTTPRequestHandler):
                        for key, cfg2 in weblogin.REALM_CONFIGS.items()],
             "platform": weblogin.DEFAULT_PLATFORM,
             "ttl": weblogin.LOGIN_TTL_SECONDS,
+        })
+
+    def _store_login_exits(self) -> None:
+        """登录弹窗「登录出口代理」下拉的数据源。
+
+        输入框一直可以手填；这个接口只负责把**目前支持的端口**列出来，
+        每一项给出可直接填进输入框的完整代理串，前端不做任何地址拼接：
+
+        - 配置里的 mihomo 端口区间（`discover_nodes`，默认只列不探测）
+        - 账户库里已经在用、但当前端口表没列出的端口（换过池子 / 改过区间）
+        - 固定验证代理、`exit_custom` 自定义出口、直连
+
+        `probe=1` 才真去探出口，默认不探测——打开弹窗不能替用户发十个请求。
+        选中的端口按 `mihomo.host` 拼地址，绕过 `verify_proxy`：用户在下拉里
+        明确挑了线，就不该被固定代理无声覆盖（那正是 `port_proxy` 的用途）。
+        """
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlparse(self.path).query)
+        probe_now = (query.get("probe") or [""])[0].lower() in ("1", "true", "yes")
+        cfg = recheck.load_config()
+        disc = recheck.discover_nodes(cfg, probe_now=probe_now)
+        nodes = disc.get("nodes") or []
+        busy_risk = {int(p) for p in store.exit_ports_in_use("risk") if p}
+        busy_normal = {int(p) for p in store.exit_ports_in_use("normal") if p}
+        fixed = str(cfg.get("verify_proxy") or "").strip()
+        direct_value = "wl:direct"
+
+        ports: dict[int, dict] = {}
+        for node in nodes:
+            port = int(node.get("port") or recheck.port_of(str(node.get("url") or "")) or 0)
+            if not port:
+                continue
+            url = str(node.get("url") or "") or recheck.port_proxy(cfg, port)
+            if not url:
+                continue
+            ports[port] = {
+                "value": url,
+                "port": port,
+                "name": str(node.get("name") or node.get("listener") or "").strip(),
+                "ok": bool(node["ok"]) if probe_now and "ok" in node else None,
+                "exit_ip": str(node.get("exit_ip") or ""),
+                "configured": True,
+                "busy_risk": port in busy_risk,
+                "busy_normal": port in busy_normal,
+            }
+        # 库里存着的端口必须能选回来，哪怕池子重排后它已经不在配置区间里
+        for port in sorted(busy_risk | busy_normal):
+            if port in ports:
+                continue
+            url = recheck.port_proxy(cfg, port)
+            if not url:
+                continue
+            ports[port] = {
+                "value": url,
+                "port": port,
+                "name": "",
+                "ok": None,
+                "exit_ip": "",
+                "configured": False,
+                "busy_risk": port in busy_risk,
+                "busy_normal": port in busy_normal,
+            }
+
+        def option(item: dict) -> dict:
+            bits = [str(item["port"])]
+            if item["name"]:
+                bits.append(item["name"])
+            tags: list[str] = []
+            if item["ok"] is True:
+                tags.append("已测通")
+            elif item["ok"] is False:
+                tags.append("未通")
+            if item["busy_risk"]:
+                tags.append("风控在用")
+            elif item["busy_normal"]:
+                tags.append("账户在用")
+            if not item["configured"]:
+                tags.append("端口表外")
+            if tags:
+                bits.append("· " + " / ".join(tags))
+            tip = [item["value"]]
+            if item["exit_ip"]:
+                tip.append("出口 " + item["exit_ip"])
+            return {
+                "value": item["value"],
+                "label": " ".join(bits),
+                "title": " ｜ ".join(tip),
+                "port": item["port"],
+                "ok": item["ok"],
+                "busy_risk": item["busy_risk"],
+                "busy_normal": item["busy_normal"],
+                "configured": item["configured"],
+            }
+
+        def ordered(items: list[dict]) -> list[dict]:
+            # 测通的排前面；没探测时保持配置顺序（same 模式取第一个，顺序有意义）
+            items.sort(key=lambda x: (0 if x["ok"] is True else (1 if x["ok"] is None else 2),
+                                      x["port"]))
+            return [option(x) for x in items]
+
+        basic = [{"value": direct_value, "label": "直连（留空）",
+                  "title": "不下发代理，本机 IP 直接出去", "port": 0, "ok": None,
+                  "busy_risk": False, "busy_normal": False, "configured": False}]
+        if fixed:
+            basic.append({"value": fixed, "label": f"固定验证代理 · {fixed}",
+                          "title": fixed, "port": recheck.port_of(fixed), "ok": None,
+                          "busy_risk": False, "busy_normal": False, "configured": False})
+        for url in recheck.parse_urls(cfg.get("exit_custom")):
+            basic.append({"value": url, "label": f"自定义出口 · {url}",
+                          "title": url, "port": recheck.port_of(url), "ok": None,
+                          "busy_risk": False, "busy_normal": False, "configured": False})
+
+        free, in_risk, extra = [], [], []
+        for item in ports.values():
+            if not item["configured"]:
+                extra.append(item)
+            elif item["busy_risk"]:
+                in_risk.append(item)
+            else:
+                free.append(item)
+        groups = [
+            {"key": "basic", "label": "常用", "options": basic},
+            {"key": "free", "label": f"可用端口（{len(free)}）", "options": ordered(free)},
+            {"key": "risk", "label": f"风控区在用（{len(in_risk)}）", "options": ordered(in_risk)},
+            {"key": "extra", "label": f"端口表外在用（{len(extra)}）", "options": ordered(extra)},
+        ]
+        self._json(200, {
+            "ok": True,
+            "host": disc.get("host") or "",
+            "probed": probe_now,
+            "ok_count": int(disc.get("ok_count") or 0) if probe_now else 0,
+            "groups": [g for g in groups if g["options"]],
+            "total": len(ports),
+            "fixed_proxy": fixed,
+            "api_error": disc.get("api_error") or "",
+            "direct_value": direct_value,
         })
 
     def _store_login_start(self, payload: dict) -> None:

@@ -1345,6 +1345,24 @@ def plan_port(cfg: dict, port: int, names: dict | None = None,
     }
 
 
+def port_proxy(cfg: dict, port: int) -> str:
+    """显式选中某个端口时的代理地址：不受 `verify_proxy` 覆盖。
+
+    登录弹窗里用户从下拉挑了端口，那就是他这一趟要走的线。`plan_port`
+    里固定验证代理优先级最高，直接复用会把选中的端口无声换成另一个出口；
+    这里只按 mihomo 主机拼地址，把「选了哪个端口」如实写进输入框。
+    """
+    port = int(port or 0)
+    host = str((cfg or {}).get("mihomo", {}).get("host") or "").strip().rstrip("/")
+    if not port or not (0 < port < 65536) or not host:
+        return ""
+    # 配置一般是裸主机名；手填了带协议的地址时取 netloc，别拼成
+    # `http://http://host:port`。
+    if "://" in host:
+        host = urllib.parse.urlsplit(host).netloc
+    return _proxy_url(host, port) if host else ""
+
+
 # ------------------------------------------------------------------ 名单判定
 def looks_banned(text: str) -> bool:
     """这段文字里有没有「封号」的证据。"""

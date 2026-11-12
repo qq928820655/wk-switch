@@ -613,7 +613,99 @@ function batchLabel(batch) {
 
 /* ---------- 从官网登录账户（官方 OAuth 设备流） ---------- */
 
-const wlState = { state: '', timer: null, busy: false, proxyReady: false, target: null };
+const wlState = {
+  state: '', timer: null, busy: false, proxyReady: false, target: null,
+  exits: null, exitsSeq: 0, directValue: 'wl:direct',
+};
+
+/* 登录出口代理：输入框一直可以手填，下拉只是把「目前已支持的端口」列出来。
+   option 的 value 就是完整代理串，选完写进输入框，发起登录走的还是原来那个
+   `proxy` 参数——后端不用为「从下拉选的」另开一条分支。 */
+
+/** 读端口表。probe=true 才真去探出口：打开弹窗不该替用户发十个请求。 */
+async function loadWlExits(probe) {
+  const seq = ++wlState.exitsSeq;
+  const sel = $('#wl-proxy-pick');
+  const btn = $('#btn-wl-exits');
+  const hint = $('#wl-exits-hint');
+  if (btn) { btn.disabled = true; btn.textContent = probe ? '检测中…' : '读取中…'; }
+  if (sel) sel.disabled = true;
+  if (hint) {
+    hint.classList.remove('bad');
+    hint.textContent = probe
+      ? '正在逐个探测端口，可能要等十几秒…'
+      : '正在读取已支持的端口…';
+  }
+  try {
+    const data = await apiGet('/api/store/login/exits' + (probe ? '?probe=1' : ''));
+    if (seq !== wlState.exitsSeq) return;   // 又点了一次检测，旧结果作废
+    if (!data.ok) throw new Error(data.error || '端口表读取失败');
+    wlState.exits = data;
+    wlState.directValue = data.direct_value || 'wl:direct';
+    wlRenderExits(data);
+  } catch (err) {
+    if (seq !== wlState.exitsSeq) return;
+    if (sel) sel.innerHTML = '<option value="">端口表读取失败，可直接手填</option>';
+    if (hint) {
+      hint.textContent = `端口表读取失败：${err.message}；输入框仍可手填`;
+      hint.classList.add('bad');
+    }
+  } finally {
+    if (seq !== wlState.exitsSeq) return;
+    if (sel) sel.disabled = false;
+    if (btn) { btn.disabled = false; btn.textContent = '检测端口'; }
+  }
+}
+
+/** 后端给的分好组的选项直接铺成 optgroup，前端不拼地址也不排序。 */
+function wlRenderExits(data) {
+  const el = $('#wl-proxy-pick');
+  if (!el) return;
+  let html = '<option value="">从已支持的端口下拉选择…</option>';
+  (data.groups || []).forEach((g) => {
+    html += `<optgroup label="${esc(g.label || g.key)}">`;
+    (g.options || []).forEach((o) => {
+      html += `<option value="${esc(o.value)}" title="${esc(o.title || o.value)}">`
+        + `${esc(o.label)}</option>`;
+    });
+    html += '</optgroup>';
+  });
+  el.innerHTML = html;
+  wlSyncProxyPick();
+  const hint = $('#wl-exits-hint');
+  if (!hint) return;
+  hint.classList.remove('bad');
+  const total = Number(data.total || 0);
+  hint.textContent = data.probed
+    ? `已检测：${data.ok_count} / ${total} 个端口能出网；选中即填入上方输入框。`
+    : `已列出 ${total} 个端口（未探测）。点「检测端口」可测哪些能出网；选中即填入上方输入框。`;
+  if (data.api_error) hint.textContent += `｜节点名：${data.api_error}`;
+}
+
+/** 输入框当前值 ↔ 下拉选中态。手填的地址不在列表里就退回占位项。 */
+function wlSyncProxyPick() {
+  const pick = $('#wl-proxy-pick');
+  const input = $('#wl-proxy');
+  if (!pick || !input) return;
+  const cur = input.value.trim();
+  const wanted = cur || wlState.directValue;
+  let found = false;
+  for (const opt of pick.options) {
+    if (opt.value === wanted) { found = true; break; }
+  }
+  pick.value = found ? wanted : '';
+}
+
+/** 选下拉 = 显式指定这一趟的出口；手填的值不会被默默改掉。 */
+function wlPickProxy() {
+  const pick = $('#wl-proxy-pick');
+  const input = $('#wl-proxy');
+  if (!pick || !input || !pick.value) return;   // 占位项不动输入框
+  input.value = pick.value === wlState.directValue ? '' : pick.value;
+  input.dataset.touched = '1';
+  wlState.proxyReady = true;
+  wlSyncProxyPick();
+}
 
 function wlTargetView(target) {
   // 目标行只留界面要显示的四个字段，别把整行（含脱敏 token）挂在全局状态里
@@ -681,6 +773,8 @@ async function openWebLogin(target) {
   delete $('#wl-proxy').dataset.touched;
   wlState.proxyReady = false;
   const query = wlState.target ? `?target_id=${encodeURIComponent(wlState.target.id)}` : '';
+  // 端口表异步读：问节点名可能要等 1~2 秒，不能挡住输入框和「获取登录链接」。
+  loadWlExits(false);
   // 预填固定验证代理 / 目标行出口：授权 / 取 token / 拉资料 / 查积分全走这一条线。
   // 读不到默认值时保持 proxyReady=false，发起时不传 proxy，让后端自己按
   // 目标行出口算——绝不能拿空串把「读失败」变成「显式直连」。
@@ -688,6 +782,7 @@ async function openWebLogin(target) {
     const cfg = await apiGet('/api/store/login/config' + query);
     const proxy = cfg.proxy || '';
     if (!$('#wl-proxy').dataset.touched) $('#wl-proxy').value = proxy;
+    wlSyncProxyPick();   // 预填的地址本身可能就是下拉里的某个端口
     wlState.proxyReady = true;
   } catch (err) {
     wlState.proxyReady = false;
@@ -3198,7 +3293,9 @@ function bind() {
 
   $('#btn-sel-probe').addEventListener('click', probeSelected);
   $('#btn-probe-all').addEventListener('click', probeAll);
-  $('#btn-store-login').addEventListener('click', openWebLogin);
+  // 直接把函数交给 addEventListener 会把 MouseEvent 当 target 传进去，
+  // 弹窗会误进「重新登录：未命名」。新增按钮必须显式传 null。
+  $('#btn-store-login').addEventListener('click', () => openWebLogin(null));
   $('#wl-close').addEventListener('click', closeWebLogin);
   $('#wl-mask').addEventListener('click', closeWebLogin);
   $('#wl-start').addEventListener('click', startWebLogin);
@@ -3211,7 +3308,10 @@ function bind() {
   $('#wl-proxy').addEventListener('input', (e) => {
     e.target.dataset.touched = '1';
     wlState.proxyReady = true;
+    wlSyncProxyPick();   // 手填了新地址，下拉别还高亮着上一个端口
   });
+  $('#wl-proxy-pick').addEventListener('change', wlPickProxy);
+  $('#btn-wl-exits').addEventListener('click', () => loadWlExits(true));
   $('#wl-realm').addEventListener('change', () => {
     // 换了版本旧 state 就作废，直接按新版本重新申请一个链接
     if (!$('#wl-modal').hidden && wlState.state) startWebLogin();

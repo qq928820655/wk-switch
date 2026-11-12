@@ -921,13 +921,21 @@
         </div>
       </div>
 
-      <label class="field">
+      <div class="field wl-proxy-field">
         <span>登录出口代理</span>
         <input type="text" id="wl-proxy" spellcheck="false" placeholder="http://127.0.0.1:7891">
-      </label>
+        <div class="wl-proxy-pick-row">
+          <select id="wl-proxy-pick" aria-label="从目前已支持的端口里选一个出口">
+            <option value="">正在读取已支持的端口…（也可以直接手填上面）</option>
+          </select>
+          <button class="btn small" type="button" id="btn-wl-exits"
+                  title="重新读取端口表并逐个探测哪些出口能出网">检测端口</button>
+        </div>
+        <p class="hint" id="wl-exits-hint">手动输入任意代理地址，或从下面下拉里选一个已支持的端口。</p>
+      </div>
       <p class="hint wl-proxy-tip">
         留空 = 直连。打开弹窗时预填设置页的「固定验证代理」，用独立出口隔开本机其它账号，
-        授权、取 token、拉资料、查积分都走这一条线。
+        授权、取 token、拉资料、查积分都走这一条线。下拉里选中的端口会覆盖固定验证代理。
       </p>
 
       <label class="wl-check"><input type="checkbox" id="wl-credits" checked><span>登录后自动查询积分与套餐</span></label>

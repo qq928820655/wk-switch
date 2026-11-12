@@ -153,5 +153,47 @@ class BackupScopeLayoutTest(unittest.TestCase):
         self.assertIn("#backup-downloads.stale {", css)
 
 
+class LoginExitPickLayoutTest(unittest.TestCase):
+    """登录弹窗必须同时留着手填输入框和端口下拉，删一个都会让另一半功能失效。"""
+
+    def test_modal_has_manual_input_and_port_pick(self):
+        html = read(INDEX)
+        for needle in ('id="wl-proxy"', 'id="wl-proxy-pick"',
+                       'id="btn-wl-exits"', 'id="wl-exits-hint"', '</select>'):
+            self.assertIn(needle, html, f"登录弹窗少了 {needle}")
+        self.assertNotIn('<label class="field">\n        <span>登录出口代理</span>',
+                         html, "里面放了 button，外层不能再用 label")
+
+    def test_app_wires_pick_and_manual_input(self):
+        app = read(APP)
+        for needle in ("'/api/store/login/exits'", "loadWlExits(false)",
+                       "loadWlExits(true)", "function wlRenderExits(",
+                       "function wlSyncProxyPick()", "function wlPickProxy()",
+                       "wlState.directValue", "data.probed", "<optgroup label="):
+            self.assertIn(needle, app, f"前端少接了 {needle}")
+        i = app.index("$('#wl-proxy').addEventListener('input'")
+        self.assertIn("wlSyncProxyPick();", app[i:i + 300],
+                      "手填地址后下拉还高亮旧端口")
+        self.assertIn("$('#btn-store-login').addEventListener('click', () => openWebLogin(null));",
+                      app, "新增按钮直接传函数会把点击事件当目标行，弹窗进「重新登录」模式")
+        self.assertIn("$('#btn-wl-exits').addEventListener('click', () => loadWlExits(true));",
+                      app, "检测按钮没接真探测")
+
+    def test_server_wires_login_exits_route(self):
+        srv = read(SERVER)
+        self.assertIn('if path == "/api/store/login/exits":\n'
+                      '            self._store_login_exits()', srv)
+        self.assertIn("def _store_login_exits(self)", srv)
+        self.assertIn("recheck.port_proxy(cfg, port)", srv)
+        self.assertIn("probe_now = (query.get(\"probe\")", srv)
+
+    def test_css_keeps_pick_row_readable_on_mobile(self):
+        css = read(CSS)
+        self.assertIn(".wl-proxy-pick-row {", css)
+        self.assertIn(".wl-form .field select {", css)
+        self.assertIn(".wl-proxy-pick-row { flex-wrap: wrap; }", css,
+                      "窄屏并排会把端口名挤掉")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

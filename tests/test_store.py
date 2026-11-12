@@ -1160,5 +1160,125 @@ class BackupScopeTests(StoreTestBase):
         self.assertIn("-filtered-1.zip", post.out[1]["file"]["name"])
 
 
+class LoginExitPickTests(StoreTestBase):
+    """登录弹窗「出口代理」下拉的数据源：只测取数与地址拼装，不碰真实网络。"""
+
+    def _fixture(self, probed: bool = False):
+        import copy
+        from unittest import mock
+
+        import server
+        from wk import recheck
+
+        cfg = copy.deepcopy(recheck.DEFAULTS)
+        cfg["mihomo"]["host"] = "127.0.0.1"
+        cfg["mihomo"]["ports"] = "17901-17903"
+        cfg["verify_proxy"] = "http://127.0.0.1:7891"
+        cfg["exit_custom"] = "http://10.0.0.9:8080"
+        nodes = [
+            {"url": f"http://127.0.0.1:{p}", "port": p, "name": f"节点-{p}",
+             "listener": "", "exit_ip": "1.2.3.4" if p == 17901 and probed else "",
+             "ok": p != 17903, "latency_ms": 12}
+            for p in (17901, 17902, 17903)
+        ]
+        disc = {
+            "host": "127.0.0.1", "ports": [17901, 17902, 17903],
+            "nodes": nodes, "probed": probed,
+            "ok_count": sum(1 for n in nodes if n["ok"]) if probed else 0,
+            "api_error": "",
+        }
+
+        class Fake:
+            def __init__(self, path):
+                self.path = path
+                self.out = None
+
+            def _json(self, status, payload):
+                self.out = (status, payload)
+
+        def call(path="/api/store/login/exits"):
+            fake = Fake(path)
+            with mock.patch.object(recheck, "load_config", return_value=cfg), \
+                 mock.patch.object(recheck, "discover_nodes", return_value=disc) as dn:
+                server.Handler._store_login_exits(fake)
+            return fake.out, dn
+
+        return cfg, call
+
+    def test_groups_cover_config_and_in_use_ports(self):
+        store.upsert([self.acc(f"u-{i}", f"号-{i}") for i in range(1, 5)])
+        ids = {r["uid"]: r["id"] for r in store.list_accounts()}
+        store.set_track([ids["u-3"]], "banned")
+        store.set_exit_port([ids["u-1"]], 17901)   # 正常区在用，仍在端口表里
+        store.set_exit_port([ids["u-3"]], 17903)   # 风控区在用
+        store.set_exit_port([ids["u-4"]], 18999)   # 端口表外在用
+
+        _cfg, call = self._fixture()
+        (status, data), dn = call()
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["probed"])
+        self.assertFalse(dn.call_args.kwargs["probe_now"], "打开弹窗不能真探测")
+        self.assertEqual(data["total"], 4)
+
+        groups = {g["key"]: g for g in data["groups"]}
+        self.assertEqual(set(groups), {"basic", "free", "risk", "extra"})
+        basic = [o["value"] for o in groups["basic"]["options"]]
+        self.assertEqual(basic[0], "wl:direct")
+        self.assertEqual(data["direct_value"], "wl:direct")
+        self.assertIn("http://127.0.0.1:7891", basic)
+        self.assertIn("http://10.0.0.9:8080", basic)
+        self.assertEqual([o["port"] for o in groups["free"]["options"]], [17901, 17902])
+        self.assertEqual([o["port"] for o in groups["risk"]["options"]], [17903])
+        self.assertEqual([o["port"] for o in groups["extra"]["options"]], [18999])
+
+        # 选端口必须按 host 明拼地址，不能被 verify_proxy 无声换掉
+        for group in groups.values():
+            for o in group["options"]:
+                if o["configured"]:
+                    self.assertEqual(o["value"], f"http://127.0.0.1:{o['port']}")
+        self.assertEqual(groups["extra"]["options"][0]["value"],
+                         "http://127.0.0.1:18999")
+        self.assertIn("端口表外", groups["extra"]["options"][0]["label"])
+        self.assertIn("风控在用", groups["risk"]["options"][0]["label"])
+
+    def test_probe_flag_is_parsed_and_ok_ports_sort_first(self):
+        _cfg, call = self._fixture(probed=True)
+        (status, data), dn = call("/api/store/login/exits?probe=1")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["probed"])
+        self.assertTrue(dn.call_args.kwargs["probe_now"])
+        self.assertEqual(data["ok_count"], 2)
+        labels = [o["label"] for g in data["groups"] for o in g["options"]]
+        self.assertTrue(any("已测通" in x for x in labels))
+        self.assertTrue(any("未通" in x for x in labels))
+        free = [g for g in data["groups"] if g["key"] == "free"][0]["options"]
+        # 库里没分配端口，三个都在 free；17901/17902 测通，17903 未通排最后
+        self.assertEqual([o["port"] for o in free], [17901, 17902, 17903])
+        self.assertIn("未通", free[-1]["label"])
+
+    def test_no_in_use_ports_omits_risk_and_extra_groups(self):
+        _cfg, call = self._fixture()
+        (status, data), _dn = call("/api/store/login/exits?probe=0")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["total"], 3)   # 只有配置里的三个端口，库里没占用
+        groups = {g["key"]: g for g in data["groups"]}
+        self.assertNotIn("risk", groups)
+        self.assertNotIn("extra", groups)
+        self.assertTrue(groups["basic"]["options"], "没有端口也要能选直连 / 固定代理")
+
+    def test_port_proxy_ignores_fixed_and_validates_host(self):
+        from wk import recheck
+
+        cfg, _call = self._fixture()
+        self.assertEqual(recheck.port_proxy(cfg, 17901), "http://127.0.0.1:17901")
+        self.assertEqual(recheck.port_proxy(cfg, 0), "")
+        self.assertEqual(recheck.port_proxy(cfg, 70000), "")
+        cfg["mihomo"]["host"] = "http://127.0.0.1"
+        self.assertEqual(recheck.port_proxy(cfg, 17902), "http://127.0.0.1:17902")
+        cfg["mihomo"]["host"] = ""
+        self.assertEqual(recheck.port_proxy(cfg, 17902), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
