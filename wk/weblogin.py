@@ -189,7 +189,11 @@ def build_account(info: dict, data: dict, profile: dict) -> Account:
     acc.source = SOURCE
     acc.platform = str(info.get("platform") or DEFAULT_PLATFORM)
     acc.product = "WorkBuddy"
-    acc.proxy = normalize_proxy(info.get("proxy"))
+    # 登录时选的出口**不写进 payload.proxy**：那是导入数据的字段，写进去之后
+    # 用户在账户库里点「直连」也清不掉（列清了、payload 还在，出站会回落
+    # 到旧代理）。它由 store.set_login_exit 单独落在账户行的 exit_proxy 列，
+    # 导出时 exitproxy.apply() 再按那一列写账户文件的 proxy。
+    acc.proxy = ""
     acc.enabled = True
     acc.created_at = normalize_epoch(_pick(profile, "createdAt", "created_at", "loginAt")) \
         or int(time.time())
@@ -266,11 +270,15 @@ class LoginManager:
     # ---- 三段流程 -------------------------------------------------
     def start(self, realm: str = "intl", platform: str = DEFAULT_PLATFORM,
               proxy: str = "", timeout: float = DEFAULT_TIMEOUT,
-              fetch_credits: bool = True, target: dict | None = None) -> dict:
+              fetch_credits: bool = True, target: dict | None = None,
+              proxy_explicit: bool = False) -> dict:
         """向官方申请一个登录 state，返回给浏览器打开的 authUrl。
 
         `target` 是已有账户那一行的摘要（id / uid / realm / name）：带上它，
         poll 成功后按行 id 覆盖凭据，而不是另插一行。
+        `proxy_explicit` 表示这个代理是用户在弹窗里**明确**选的（含「直连」）。
+        只有它为 True 时，poll 成功才把出口写进账户行；没传 proxy、由后端
+        按设置页兜底的那一次不该把用户原来配的出口改掉。
         """
         cfg = realm_config(realm)
         proxy = normalize_proxy(proxy)
@@ -300,6 +308,7 @@ class LoginManager:
         self._gc()
         self._put(state, {"created": time.time(), "realm": str(realm).strip().lower(),
                           "platform": platform, "proxy": proxy, "state": state,
+                          "proxy_explicit": bool(proxy_explicit),
                           "fetch_credits": bool(fetch_credits), "target": target_info})
         return {
             "ok": True,
@@ -412,6 +421,18 @@ class LoginManager:
             return {"ok": True, "status": "error",
                     "message": "目标行已不存在，请刷新账户库后重试", "target": target}
 
+        # 用户明确选过出口才落库：这一趟用什么线，之后校验 / 复检 / 每日活跃 /
+        # 导出就都用什么线。以前只把代理用在登录那四个请求上，账户行的
+        # exit_port 仍是 0，导入完界面显示「直连」，导出又被 exitproxy 覆盖成
+        # 直连——用户看到的正是「登录时配了代理，进来还是直连」。
+        bound: dict = {}
+        if info.get("proxy_explicit"):
+            from . import exitproxy  # 延迟导入：exitproxy → recheck → store，避免启动环
+
+            port = exitproxy.port_for_proxy(proxy)
+            store.set_login_exit(row_id, proxy, port)
+            bound = {"exit_proxy": proxy, "exit_port": port}
+
         credits: dict = {}
         if fetch_credits and row_id:
             try:
@@ -442,6 +463,7 @@ class LoginManager:
             "credits": credits,
             "proxy": proxy,
             "target": target,
+            **bound,
         }
 
     @staticmethod

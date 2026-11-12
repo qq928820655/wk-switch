@@ -150,6 +150,33 @@ class ApplyTests(ExitProxyTestBase):
         self.assertTrue(all(formats.to_hub_flat(a)["proxySlot"] == ""
                             for _, a, _ in rows))
 
+    def test_login_bound_proxy_wins_over_zero_port_and_fill_mode(self):
+        """官网登录绑的精确代理不能被 exit_port=0 清成直连，也不能被「仅补空」跳过。"""
+        url = "http://127.0.0.1:7891"
+        self.seed([0])
+        rows = self.rows()
+        rows[0][1].exit_proxy = url
+        rows[0][1].proxy = "http://old:8080"
+        rows[0][1].proxy_slot = "slot-9"
+        cfg = {**exitproxy.load_config(), "mode": "fill"}
+        stat = exitproxy.apply(rows, cfg)
+        self.assertEqual(stat["bound"], 1)
+        self.assertEqual(stat["cleared"], 0)
+        flat = formats.to_hub_flat(rows[0][1])
+        self.assertEqual(flat["proxy"], url)
+        self.assertEqual(flat["proxySlot"], "")
+        self.assertNotIn("exitProxy", flat)
+
+    def test_port_for_proxy_only_matches_configured_mihomo_host(self):
+        self.assertEqual(exitproxy.port_for_proxy("http://cli-proxy-mihomo:17955"), 17955)
+        self.assertEqual(exitproxy.port_for_proxy("cli-proxy-mihomo:17955"), 17955)
+        self.assertEqual(exitproxy.port_for_proxy("http://user:pw@cli-proxy-mihomo:17955"),
+                         17955)
+        # 手填的独立代理主机名对不上，硬取端口会拼到另一台机器
+        self.assertEqual(exitproxy.port_for_proxy("http://127.0.0.1:7891"), 0)
+        self.assertEqual(exitproxy.port_for_proxy(""), 0)
+        self.assertEqual(exitproxy.port_for_proxy("http://cli-proxy-mihomo:99999"), 0)
+
     def test_zero_port_clears_proxy_to_direct(self):
         self.seed([17901, 0])
         rows = self.rows()

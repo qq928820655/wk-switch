@@ -499,6 +499,21 @@ class RiskImportTests(StoreTestBase):
         store.set_track([row["id"]], "")
         self.assertEqual(store.list_accounts()[0]["risk_src"], "")
 
+    def test_backup_restore_keeps_login_bound_proxy(self) -> None:
+        """登录绑的精确代理和 exit_port 一样属于「导入后产生的状态」，
+        备份还原漏了它，还原完这行会静默退回直连。"""
+        store.upsert([self.acc("u-r8", "甲")], batch="b1")
+        row_id = store.list_accounts()[0]["id"]
+        store.set_login_exit(row_id, "http://127.0.0.1:7891", 17955)
+        blob, _ = store.backup_bytes()
+        store.clear()
+        store.restore_bytes(blob, "backup.zip", mode="replace")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["exit_port"], 17955)
+        self.assertEqual(row["exit_proxy"], "http://127.0.0.1:7891")
+        self.assertEqual(store.load_for_export()[0].exit_proxy,
+                         "http://127.0.0.1:7891")
+
     def test_backup_restore_keeps_risk_state(self) -> None:
         """还原不能把风控区放空——那是备份最该保住的东西。"""
         store.upsert([self.acc("u-r7", "甲")], batch="b1", risk=True)

@@ -179,12 +179,17 @@ def is_risk(row: dict[str, Any]) -> bool:
 def proxy_for(acc: Account, cfg: dict[str, Any], exit_port: int = 0) -> str:
     """这一号从哪出去。
 
-    顺序：固定代理 → 账号自己的 exit_port → 兜底代理 → 直连。
+    顺序：固定代理 → 官网登录绑的精确 URL → 账号自己的 exit_port
+          → 导入数据自带的 proxy → 兜底代理 → 直连。
     端口转 URL 用 mihomo.host（和复检、导出同一份配置），不在这里再猜地址。
     """
     fixed = str(cfg.get("proxy") or "").strip()
     if fixed:
         return fixed
+    # 登录时手填的完整地址（可能不是 mihomo 端口）优先，按端口重拼会写错主机
+    bound = str(getattr(acc, "exit_proxy", "") or "").strip()
+    if bound:
+        return bound
     port = int(exit_port or 0)
     if cfg.get("use_exit", True) and port:
         rc = {}
@@ -196,6 +201,9 @@ def proxy_for(acc: Account, cfg: dict[str, Any], exit_port: int = 0) -> str:
         host = str((rc.get("mihomo") or {}).get("host") or "").strip()
         if host:
             return f"http://{host}:{port}"
+    own = str(getattr(acc, "proxy", "") or "").strip()
+    if own:
+        return own
     return str(cfg.get("fallback_proxy") or "").strip()
 
 

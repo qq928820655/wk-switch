@@ -577,7 +577,8 @@ function exitProxyToast(data, prefix) {
   const ep = (data.report && data.report.opts && data.report.opts.exit_proxy) || {};
   if (!ep.enabled) return `${prefix}（未改 proxy）`;
   if (!ep.host) return `${prefix}（出口主机没配，proxy 未写）`;
-  return `${prefix}，按出口写 ${ep.applied || 0} 个 proxy` +
+  return `${prefix}，按出口写 ${(ep.applied || 0) + (ep.bound || 0)} 个 proxy` +
+    (ep.bound ? `（其中 ${ep.bound} 个用登录时绑的地址）` : '') +
     (ep.cleared ? `、${ep.cleared} 个直连` : '') +
     (ep.skipped ? `、跳过 ${ep.skipped} 个` : '');
 }
@@ -873,6 +874,10 @@ function renderWebLoginProfile(data) {
   const a = data.account || {};
   const c = data.credits || {};
   const s = data.store || {};
+  const persisted = Object.prototype.hasOwnProperty.call(data, 'exit_proxy');
+  const savedExit = !persisted ? '沿用原出口'
+    : (data.exit_port ? `端口 ${data.exit_port}（已绑定）`
+      : (data.exit_proxy ? '自定义代理（已绑定）' : '直连（已绑定）'));
   const pairs = [
     ['账号', a.name || '—'],
     ['uid', a.uid || '—'],
@@ -885,6 +890,7 @@ function renderWebLoginProfile(data) {
     ['入库', s.inserted ? '新增 1 条' : (s.updated ? '更新 1 条' : '—')],
     ['模式', data.target ? `重登第 ${data.target.id} 行` : '新增账户'],
     ['出口', data.proxy || '直连'],
+    ['落库出口', savedExit],
   ];
   const el = $('#wl-profile');
   el.innerHTML = '<h4>获取到的账户信息</h4><div class="wl-grid">'
@@ -1093,9 +1099,12 @@ function statusCell(r) {
 /** 出口下拉：直连 + 节点表。手动改一行就是「自定义出口」。 */
 function storeExitCell(r) {
   const cur = Number(r.exit_port || 0);
+  const bound = String(r.exit_proxy || '').trim();
   const narrow = window.matchMedia('(max-width: 720px)').matches;
   const seen = new Set([0]);
-  const opts = ['<option value="0">直连</option>'];
+  // 绑了精确代理但没端口时，下拉显示「直连」会让人以为出口丢了；
+  // 加个后缀说明当前实际走的是自定义线，选任一端口即清掉绑定。
+  const opts = [`<option value="0">直连${bound && !cur ? ' / 自定义代理' : ''}</option>`];
   storeState.nodes.forEach((n) => {
     const port = Number(n.port || 0);
     if (!port || seen.has(port)) return;
@@ -1113,8 +1122,12 @@ function storeExitCell(r) {
     opts.push(`<option value="${cur}" selected>${cur}（未检测到）</option>`);
   }
   const curName = (storeState.nodes.find((n) => Number(n.port) === cur) || {});
-  const label = cur ? `${cur} ${curName.name || curName.listener || ''}`.trim() : '直连';
-  return `<select class="store-exit-pick mono" data-id="${r.id}" title="出口：${esc(label)}">${opts.join('')}</select>`;
+  const label = cur ? `${cur} ${curName.name || curName.listener || ''}`.trim()
+    : (bound ? `自定义代理 ${bound}` : '直连');
+  const hint = bound && !cur
+    ? `<small class="hint store-exit-bound" title="${esc(bound)}">登录时绑定：${esc(bound)}</small>`
+    : '';
+  return `<select class="store-exit-pick mono" data-id="${r.id}" title="出口：${esc(label)}">${opts.join('')}</select>${hint}`;
 }
 
 async function setStoreRowExit(id, port) {
@@ -1122,7 +1135,10 @@ async function setStoreRowExit(id, port) {
   try {
     await api('/api/store/exit', { ids: [Number(id)], port: num });
     const row = storeState.rows.find((r) => r.id === Number(id));
-    if (row) row.exit_port = num;   // 不重绘整表，下拉焦点和滚动位置都要保住
+    if (row) {
+      row.exit_port = num;   // 不重绘整表，下拉焦点和滚动位置都要保住
+      row.exit_proxy = '';   // 显式选了端口/直连，登录时绑的精确代理作废
+    }
     toast(num ? `这一行改走 ${num}` : '这一行改回直连');
   } catch (err) {
     toast(err.message, true);
@@ -2484,8 +2500,9 @@ async function setRowExit(id, port) {
 /* 出口下拉：直连 + 检测到的端口。手动改一行就是「自定义出口」。 */
 function exitCell(r) {
   const cur = Number(r.exit_port || 0);
+  const bound = String(r.exit_proxy || '').trim();
   const seen = new Set([0]);
-  const opts = ['<option value="0">直连</option>'];
+  const opts = [`<option value="0">直连${bound && !cur ? ' / 自定义代理' : ''}</option>`];
   // 窄屏只写端口号：那一列就那么宽，带上节点名会把号码也挤掉，而号码
   // 才是「这个号走哪条线」的答案。完整名字在 title 里。
   const narrow = window.matchMedia('(max-width: 720px)').matches;
@@ -2506,7 +2523,8 @@ function exitCell(r) {
   // 浏览器截掉尾巴，悬停要能看全
   const curName = (recheckState.nodes.find((n) => Number(n.port) === cur) || {});
   const nodeName = curName.name || curName.listener || '';
-  const label = cur ? `${cur} ${nodeName || '未检测到'}`.trim() : '直连';
+  const label = cur ? `${cur} ${nodeName || '未检测到'}`.trim()
+    : (bound ? `自定义代理 ${bound}` : '直连');
   return `<select class="rc-exit-pick mono" data-id="${r.id}" title="出口：${esc(label)}">${opts.join('')}</select>`;
 }
 
@@ -3690,8 +3708,9 @@ function daRenderState(st) {
   $('#da-state').textContent = '未运行';
 }
 
-function daExitText(port) {
-  return port ? String(port) : '直连';
+function daExitText(port, exitProxy) {
+  if (port) return String(port);
+  return String(exitProxy || '').trim() ? '自定义代理' : '直连';
 }
 
 /**
@@ -3705,7 +3724,7 @@ function daMatch(r, q) {
   if (!q) return true;
   const words = [
     r.name || '', r.uid || '', r.email || '',
-    r.exit_port ? String(r.exit_port) : '直连',
+    r.exit_port ? String(r.exit_port) : (String(r.exit_proxy || '').trim() ? '自定义代理 自定义 出口代理' : '直连'),
     r.risk ? '风控 风控账户' : '正常 正常账户',
     r.risk ? '' : (r.daily_active === false ? '关闭 关 不参与' : '参与 开'),
     r.today_ok ? '已完成 成功' : r.today_skipped ? '跳过'
@@ -3801,7 +3820,7 @@ function renderDaAccounts() {
       <td class="col-check"><input type="checkbox" class="da-check" ${on ? 'checked' : ''}></td>
       <td title="${esc(r.uid)}${r.email ? ' · ' + esc(r.email) : ''}"><b>${esc(r.name)}</b>${zoneFlag(r)}</td>
       <td class="da-active">${daActiveCell(r)}</td>
-      <td class="mono">${esc(daExitText(r.exit_port))}</td>
+      <td class="mono" title="${esc(r.exit_proxy || r.exit_port || '直连')}">${esc(daExitText(r.exit_port, r.exit_proxy))}</td>
       <td class="da-today">${today}</td>
       <td class="mono" title="${esc(r.last_detail || '')}">${esc(r.last_at_text || '—')}</td>
       <td class="row-actions">${r.risk

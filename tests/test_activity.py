@@ -97,6 +97,19 @@ class ProxyTest(ActivityBase):
         cfg["fallback_proxy"] = ""
         self.assertEqual(activity.proxy_for(self.acc(), cfg, 0), "")
 
+    def test_login_bound_proxy_beats_port_and_fallback(self) -> None:
+        a = self.acc()
+        a.exit_proxy = "http://127.0.0.1:7891"
+        cfg = {"proxy": "", "use_exit": True,
+               "fallback_proxy": "http://127.0.0.1:1080"}
+        self.assertEqual(activity.proxy_for(a, cfg, 17901),
+                         "http://127.0.0.1:7891")
+        self.assertEqual(activity.proxy_for(a, cfg, 0),
+                         "http://127.0.0.1:7891")
+        cfg["proxy"] = "http://10.0.0.1:8080"
+        self.assertEqual(activity.proxy_for(a, cfg, 0),
+                         "http://10.0.0.1:8080")
+
     def test_use_exit_off_skips_port(self) -> None:
         cfg = {"proxy": "", "use_exit": False, "fallback_proxy": "http://127.0.0.1:7891"}
         self.assertEqual(activity.proxy_for(self.acc(), cfg, 17903),

@@ -26,7 +26,7 @@
 - **封号复检**：被上游风控拦掉的账号单独进「封号复检」标签页，定时发一次最小对话探活；出口按**每个账号一个 mihomo 端口**分配（单一出口单选、随机出口多选，名单里每行还能单独改，改完就是自定义），也能**按公网出口 IP 钉住**（逐个探端口挑当前出口匹配的那条线，之后每号发请求前复核，漂了自动换回匹配端口或停手不出网，端口换节点 / 重连也骗不过），支持端口自动检测（显示节点名 / 类型 / 延迟，不只是一串 IP），每个端口还能单独换成别的节点
 - **国际版每日活跃真跑**：不只是开关。每日到点自动跑，网页端 agent 会话（建会话 → 接沙箱 → ACP `session/prompt` → 轮询到 `completed` → `stop`）加一条桌面对话兜底，逐账号走自己的 `exit_port`，一次尝试一行落 `activity` 表。「每日活跃」页能看今日汇总、每个号的今日状态、历史记录（按今天 / 1 天 / 7 天 / 30 天 / 全部筛），也能手动跑「今天还没成功的 / 全部国际版号 / 勾选的几个」。会话有 10 条硬上限，撞上了自动 `prune` 旧会话再重试，不会跑到第十天开始集体失败。详见下文
 - **每个账号一个活跃开关**：「每日活跃」页的账号卡里逐行一个开关，点一下就落库，勾选后还能批量「开活跃 / 关活跃」。这个值就是 hub 账户文件里的 `tasksEnabled`（默认开，`wb_accounts.py:2264 task_active()` / `wb_scheduler.py:561` 据此决定要不要跑每日活跃对话）：导出 hub 文档或账户目录时随文件走，从 hub 导入时读回来，来回只有一份状态。**开关只在这一处**——账户库那张表不再重复这一列，同一个开关摆在两个标签页，改完还得回头确认哪边是准的，没有意义。风控账号不参与：开关位置直接显示「风控不参与」，跑批也跳过它，解封后自动恢复。国内版没有这项任务，账号卡里不会出现
-- **导出按每个账户自己的出口走**：账户库「从账户库导出」卡片里的「按账户出口写 proxy」默认开着，导出时把 DB 里每行 `exit_port` 翻成该账户的 `proxy`（`http://<主机>:<端口>`），同时**清掉 `proxySlot`** —— hub 的 `wb_accounts.py:4614 apply_proxy_slots()` 会拿槽 id 去 `settings.json` 的 `proxy_slots` 查 URL 覆盖静态 `proxy`，槽不清的话本工具配的端口会被无声丢掉。清掉后 `wb_accounts.py:2889` 的每日活跃桌面腿和 `:2619` 的网页腿都用 `self.proxy`，于是每个号跑各自的节点，不是全批一个出口。`exit_port=0` 写成直连。策略「覆盖」一律改写，「仅补空」保留账户原有的 hub 槽绑定；范围可限「仅国际版」；主机留空沿用 `config/recheck.json` 的 `mihomo.host`（默认 `cli-proxy-mihomo`，是 docker 网络服务名，hub 不在同一网络时填宿主机 IP 或可达域名）。设置随每次导出写进 `config/exitproxy.json`，接口 `GET/POST /api/store/exit-proxy/config`。改完要重新导出并导进 hub 才生效，`hub_document` / `hub_dir_zip` 两个格式都带
+- **导出按每个账户自己的出口走**：账户库「从账户库导出」卡片里的「按账户出口写 proxy」默认开着，导出时把 DB 里每行 `exit_port` 翻成该账户的 `proxy`（`http://<主机>:<端口>`），同时**清掉 `proxySlot`** —— hub 的 `wb_accounts.py:4614 apply_proxy_slots()` 会拿槽 id 去 `settings.json` 的 `proxy_slots` 查 URL 覆盖静态 `proxy`，槽不清的话本工具配的端口会被无声丢掉。清掉后 `wb_accounts.py:2889` 的每日活跃桌面腿和 `:2619` 的网页腿都用 `self.proxy`，于是每个号跑各自的节点，不是全批一个出口。`exit_port=0` 且没绑精确代理时写成直连。若这一行在官网登录时绑过精确代理（`exit_proxy`），导出的 `proxy` 用那个原串、优先级高于 `exit_port`，「仅补空」也不会跳过它。策略「覆盖」一律改写，「仅补空」保留账户原有的 hub 槽绑定；范围可限「仅国际版」；主机留空沿用 `config/recheck.json` 的 `mihomo.host`（默认 `cli-proxy-mihomo`，是 docker 网络服务名，hub 不在同一网络时填宿主机 IP 或可达域名）。设置随每次导出写进 `config/exitproxy.json`，接口 `GET/POST /api/store/exit-proxy/config`。改完要重新导出并导进 hub 才生效，`hub_document` / `hub_dir_zip` 两个格式都带
 - **验证模型可配、400 自动绕开**：复检与账户验证默认送 `deepseek-v4.1-flash`；国际版上游只认 `deepseek-v4.1-flash-sg`，裸名被拒时自动按候选模型 / 请求体 / 路径往下试（最多 8 次），勾选一个号点「诊断 400」能看到每次尝试的状态码和上游原话，且不写库
 - **访问口令**：登录页口令换会话 cookie，默认 `qq928820655`（改 `config/auth.json`）
 - **应用图标**：indigo 双向箭头，favicon / 页头 / 任务栏 / PWA 主屏同一张图，随代码生成，`python tools/make_icon.py` 可重出任意尺寸
@@ -116,7 +116,9 @@ clock.day_start()          # 北京时间当天 00:00 的 epoch
 
 拿到资料后组装 `Account`：`uid` 取 JWT 里的 `uid`（解不出时用 token 指纹兜底，保证重复登录命中同一行），`expiresAt` 取上游值、没有就退回 JWT 的 `exp`，原始资料整包存进 `profile_raw` 随导出带走。写库走 `store.upsert`，`source=oauth`、批次 `oauth-<北京时间>`，所以同一个号重新扫码只更新 token 和资料，不会多出一行；token 变了会清掉上一次的积分快照。默认再跑一次只读积分查询，把余额和套餐也填上（弹窗里可取消勾选）。
 
-**出口代理**：授权、取 token、拉资料、查积分全走同一条线。弹窗打开时预填设置页的「固定验证代理」（`config/recheck.json` 的 `verify_proxy`，例如 `http://127.0.0.1:7891`），留空才是直连；`proxy` 参数不传时后端也按 `verify_proxy` 兜底，不会因为一次前端读取失败就退回本机 IP。代理只收 `http://` / `https://`，带认证的 `http://user:pass@host:port` 原样保留。没配代理时装空 `ProxyHandler`，**不吃 `HTTPS_PROXY` 环境变量**。
+**出口代理**：授权、取 token、拉资料、查积分全走同一条线，**并且登录成功后把这一趟的出口钉到账户行**——不是只用在登录那四个请求上。弹窗打开时预填设置页的「固定验证代理」（`config/recheck.json` 的 `verify_proxy`，例如 `http://127.0.0.1:7891`），留空才是直连；`proxy` 参数不传时后端也按 `verify_proxy` 兜底，不会因为一次前端读取失败就退回本机 IP。代理只收 `http://` / `https://`，带认证的 `http://user:pass@host:port` 原样保留。没配代理时装空 `ProxyHandler`，**不吃 `HTTPS_PROXY` 环境变量**。
+
+落库写的是 `accounts` 表的两列（schema v8）：`exit_proxy` 存精确代理 URL 原串，`exit_port` 只在它是 mihomo listener 地址（主机名 == `mihomo.host`）时才写端口，否则保持 0。手填 `http://127.0.0.1:7891` 硬取 7891 会让后续链路重拼成 `http://cli-proxy-mihomo:7891`（另一台机器），所以不还原端口，精确 URL 由 `exit_proxy` 单独管。账户库「出口」列、复检、每日活跃、积分校验、导出写 `proxy` 全部优先读这两个值；导出时 `exitproxy.apply()` 把 `exit_proxy` 原串写进账户文件的 `proxy` 并清掉 `proxySlot`，不会再按 `exit_port=0` 把它抹成直连。登录时选的代理**不写进 payload.proxy**：那份是导入数据，写进去后用户在账户库点「直连」也清不干净。在账户库里手动改出口（逐行下拉、一键分配、全部直连）会清掉 `exit_proxy`，于是「点直连」真的回到直连。重登时若这一行绑过出口，预填的是原串 / 原端口的 URL，不会被 `verify_proxy` 顶掉、也不会把 `exit_port` 清成 0；用户显式选「直连」则两列一起清。前端没传 `proxy`（读默认值失败）时后端只兜底这一趟登录，不改账户行原有绑定。弹窗结果卡新增「落库出口」一行，写的是端口 / 自定义代理 / 直连 / 沿用原出口。
 
 输入框下面还有一条端口下拉：打开弹窗自动调 `GET /api/store/login/exits` 列出**目前已支持的端口**，按「常用 / 可用端口 / 风控区在用 / 端口表外在用」分组，选中就把完整代理串填进上方输入框，发起登录仍走原来的 `proxy` 参数。来源合并了 `mihomo.ports` 配置的端口表（带节点名）、账户库里已经在用的端口（池子重排后不在配置区间里的也能选回来）、固定验证代理、`exit_custom` 自定义出口和直连。下拉选端口是按 `mihomo.host` 明拼的地址，**覆盖** `verify_proxy`——不然用户挑了线却被固定代理无声换掉。默认只列不探测（问节点名约 1~2 秒，不阻塞输入框）；点「检测端口」走 `?probe=1` 逐个探出口，把测通的排到前面并标上出口 IP。端口表读失败时下拉给出提示，手填照常可用。
 
@@ -207,7 +209,7 @@ curl -s http://127.0.0.1:8765/api/store/login/exits
 
 `concurrency` 会被夹在 1~16，`timeout` 夹在 3~60 秒。
 
-**出站顺序**：账户库「出口」列配了端口（`exit_port > 0`）就用那个 mihomo 端口，覆盖账号自带的 `proxy`；`exit_port = 0` 时保留导入数据里的 `proxy`；两者都没有就显式直连，不读 `HTTPS_PROXY`——批量校验时环境变量会把该走代理和不该走代理的账号混在一起。风控账号在账户库里被勾选校验时走的是同一套规则，用的是它自己那一行配的端口。
+**出站顺序**：全局「固定验证代理」（`verify_proxy`）最高；其次账户行绑的精确 URL（`exit_proxy`，官网登录时选的）；再是账户库「出口」列配的端口（`exit_port > 0`，覆盖账号自带的 `proxy`）；`exit_port = 0` 且没绑精确代理时保留导入数据里的 `proxy`；都没有就显式直连，不读 `HTTPS_PROXY`——批量校验时环境变量会把该走代理和不该走代理的账号混在一起。风控账号在账户库里被勾选校验时走的是同一套规则，用的是它自己那一行配的出口。
 
 **会不会影响在用的服务**
 
@@ -531,9 +533,11 @@ POST /console/as/conversations/          # body 带 prompt / model / conversatio
 
 ```
 固定 proxy（config 里填了就用它，调试用）
-  → 账户 exit_port（http://<mihomo.host>:<端口>）
-    → fallback_proxy
-      → 直连
+  → 账户 exit_proxy（官网登录时绑的精确 URL 原串）
+    → 账户 exit_port（http://<mihomo.host>:<端口>）
+      → 导入数据自带的 proxy
+        → fallback_proxy
+          → 直连
 ```
 
 一台机器上跑几十个号，直连等于把它们的请求特征全绑在一个 IP 上，所以直连排在最后，且 `detail`/记录里的「出口」列会把实际用的地址写出来，配错了能直接看见。
@@ -745,6 +749,8 @@ Windows 上反过来，**不能设**：那边 `SO_REUSEADDR` 会放过正在 LIS
 | 4 | 加封号复检列（名单状态、次数、时间、结论） |
 | 5 | 加导入批次列与风控来源 `risk_src` |
 | 6 | 加复检出口端口 `exit_port`（0 = 直连） |
+| 7 | 加每日活跃历史表 `activity` |
+| 8 | 加账户级精确出口 `exit_proxy`（官网登录时选的代理 URL 原串） |
 
 升级时逐列判断缺什么补什么，不按版本号整表重建——有人可能跑过中间版本、也
 可能手工改过库。老数据原样保留。

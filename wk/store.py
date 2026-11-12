@@ -37,7 +37,8 @@ DB_PATH = os.path.join(DATA_DIR, "accounts.db")
 #: 4 = 加封号复检列（名单状态 / 次数 / 时间 / 结论），见 wk/recheck.py
 #: 5 = 加导入批次列（最近批次 / 首次批次 / 导入时间）+ 风控来源标记
 #: 7 = 加每日活跃历史表 activity，见 wk/activity.py
-SCHEMA_VERSION = 7
+#: 8 = 加账户级精确出口 exit_proxy（官网登录时选的代理 URL）
+SCHEMA_VERSION = 8
 
 #: 探针状态的中文名。与 wk/probe.py 的 STATE_* 常量一一对应，
 #: 界面上不再自己拼字符串。
@@ -135,6 +136,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- 存端口而不是代理 URL，是因为池子重排时端口是稳定坐标，节点名会变；
     -- 而且用户是按端口绑账号的（一个端口 = 一个固定出口）。
     exit_port INTEGER DEFAULT 0,
+    -- 官网登录时选的精确代理 URL。端口表里的项由前端按 mihomo.host 拼好，
+    -- 手填的可能是 http://127.0.0.1:7891 / 带认证的独立代理，拼不回端口；
+    -- 这一个字段存原串，出站和导出都优先用它。空串 = 没绑，按 exit_port 走。
+    exit_proxy TEXT DEFAULT '',
     UNIQUE (uid, realm)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_realm ON accounts(realm);
@@ -238,6 +243,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 老库全 0，等于「没分配」，复检按直连走 —— 这正是升级前没配过
         # 出口的人本来在做的事。
         "exit_port": "INTEGER DEFAULT 0",
+        # ---- v7 → v8：官网登录时绑定的精确代理 URL ----
+        # 老库全空，行为与升级前完全一致（按 exit_port 走）。
+        "exit_proxy": "TEXT DEFAULT ''",
     }
     current = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
     for name, decl in extra_cols.items():
@@ -522,7 +530,8 @@ def row_by_id(row_id: int) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute(
             "SELECT id, uid, realm, name, nickname, email, "
-            "IFNULL(exit_port,0) AS exit_port FROM accounts WHERE id = ?",
+            "IFNULL(exit_port,0) AS exit_port, "
+            "IFNULL(exit_proxy,'') AS exit_proxy FROM accounts WHERE id = ?",
             (int(row_id),),
         ).fetchone()
     if row is None:
@@ -530,7 +539,8 @@ def row_by_id(row_id: int) -> dict[str, Any] | None:
     return {"id": int(row["id"]), "uid": row["uid"] or "",
             "realm": row["realm"] or "", "name": row["name"] or "",
             "nickname": row["nickname"] or "", "email": row["email"] or "",
-            "exit_port": int(row["exit_port"] or 0)}
+            "exit_port": int(row["exit_port"] or 0),
+            "exit_proxy": str(row["exit_proxy"] or "")}
 
 
 def rebind(row_id: int, acc: Account, batch: str = "",
@@ -720,6 +730,9 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
             # 出口端口：0 = 直连。节点名由前端拿端口去 nodes 表里查，
             # store 不认识 mihomo，别在这里硬塞一份名单。
             "exit_port": int((row["exit_port"] if "exit_port" in keys else 0) or 0),
+            # 官网登录时绑的精确代理 URL。界面要能显示「这行不是直连」，
+            # 否则 exit_port=0 的手填代理号看起来跟真的直连一模一样。
+            "exit_proxy": str((row["exit_proxy"] if "exit_proxy" in keys else "") or ""),
             # 每日活跃（hub: tasksEnabled）。默认开，与 hub 的账户缺省一致。
             "daily_active": daily,
         })
@@ -848,7 +861,8 @@ def load_for_export(realm: str = "", ids: list[int] | None = None,
     proxy（见 wk/exitproxy.py），所以这里一次 SQL 带出来，别让调用方再查
     一遍库靠 uid 对齐——uid 可能重复，row_id 才是唯一身份。
     """
-    sql = "SELECT id, payload, IFNULL(exit_port,0) AS exit_port FROM accounts WHERE 1=1"
+    sql = "SELECT id, payload, IFNULL(exit_port,0) AS exit_port, " \
+          "IFNULL(exit_proxy,'') AS exit_proxy FROM accounts WHERE 1=1"
     args: list[Any] = []
     if realm in ("cn", "intl"):
         sql += " AND realm = ?"
@@ -867,6 +881,9 @@ def load_for_export(realm: str = "", ids: list[int] | None = None,
             except ValueError:
                 continue
             acc = _account_from_payload(data)
+            # 行级出口绑定不进 payload：出站和导出都从 DB 列读，挂到对象上
+            # 供调用方使用（Account.to_dict 会剥掉它，不会泄漏到账户文件）。
+            acc.exit_proxy = str(row["exit_proxy"] or "")
             if with_ids:
                 out.append((int(row["id"]), acc, int(row["exit_port"] or 0)))
             else:
@@ -917,7 +934,8 @@ def load_for_probe(ids: list[int] | None = None, realm: str = "") -> list[tuple[
     和 load_for_export 的区别是它要回填结果，所以必须知道每一条对应哪一行。
     ids 为空表示「库里全部」（可按 realm 再筛一层），界面上「校验全部」走这条。
     """
-    sql = "SELECT id, payload, IFNULL(recheck_state,'') AS recheck_state, "
+    sql = "SELECT id, payload, IFNULL(exit_proxy,'') AS exit_proxy, "
+    sql += "IFNULL(recheck_state,'') AS recheck_state, "
     sql += "IFNULL(recheck_count,0) AS recheck_count, IFNULL(recheck_at,0) AS recheck_at "
     sql += "FROM accounts WHERE 1=1"
     args: list[Any] = []
@@ -936,6 +954,8 @@ def load_for_probe(ids: list[int] | None = None, realm: str = "") -> list[tuple[
             except ValueError:
                 continue
             acc = _account_from_payload(data)
+            # 官网登录绑的精确代理优先于 exit_port，复检要按它出站
+            acc.exit_proxy = str(row["exit_proxy"] or "")
             # 复检状态只活在库里，不在 payload 里（payload 是导入时的快照，
             # 我们后写的状态不该混进去，否则导出的文件会带上本机的复检记录）。
             acc.recheck_state = row["recheck_state"] or ""
@@ -1138,15 +1158,39 @@ def exit_ports_in_use(group: str = "") -> set[int]:
 
 
 def set_exit_port(ids: list[int], port: int) -> int:
-    """把一批账号的出口钉到同一个端口。`port=0` 改回直连。"""
+    """把一批账号的出口钉到同一个端口。`port=0` 改回直连。
+
+    这是用户在账户库里**显式**改出口的入口（逐行下拉、一键分配、全部直连）。
+    既然他又选了一次，官网登录时绑的精确代理就作废：不清的话 `exit_proxy`
+    会一直压过端口，用户点「直连」也还是从旧代理出去。
+    """
     if not ids:
         return 0
     port = max(0, int(port or 0))
     placeholders = ",".join("?" * len(ids))
     with connect() as conn:
         cur = conn.execute(
-            f"UPDATE accounts SET exit_port = ? WHERE id IN ({placeholders})",
+            f"UPDATE accounts SET exit_port = ?, exit_proxy = '' "
+            f"WHERE id IN ({placeholders})",
             [port] + [int(i) for i in ids],
+        )
+        return cur.rowcount or 0
+
+
+def set_login_exit(row_id: int, proxy: str, port: int = 0) -> int:
+    """官网登录成功后把这一趟的出口钉到该行。
+
+    `proxy` 存原串（可能是 http://127.0.0.1:7891、带认证的独立代理），
+    `port` 只在它是 mihomo listener URL 时给端口（由 exitproxy.port_for_proxy
+    算），否则 0。两列一起写，界面「出口」列才不会把手填代理显示成直连。
+
+    `proxy=""` 是用户在弹窗里显式选了「直连」：两列一起清，重登才会真的
+    改回直连。前端读取默认值失败、没传 proxy 时不调这个函数，保留原绑定。
+    """
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE accounts SET exit_port = ?, exit_proxy = ? WHERE id = ?",
+            (max(0, int(port or 0)), str(proxy or "").strip(), int(row_id)),
         )
         return cur.rowcount or 0
 
@@ -1335,7 +1379,8 @@ def set_exit_map(pairs: Iterable[tuple[int, int]]) -> int:
     if not rows:
         return 0
     with connect() as conn:
-        conn.executemany("UPDATE accounts SET exit_port = ? WHERE id = ?", rows)
+        conn.executemany(
+            "UPDATE accounts SET exit_port = ?, exit_proxy = '' WHERE id = ?", rows)
         return len(rows)
 
 
@@ -1454,6 +1499,8 @@ def dump_records(row_ids: list[int] | None = None) -> list[dict]:
         "recheck_note": r["recheck_note"],
         # 出口端口也是导入后配的，和复检状态一样必须跟着备份走
         "exit_port": (r["exit_port"] if "exit_port" in r.keys() else 0) or 0,
+        # 官网登录绑的精确代理 URL 同理：漏了它，还原后这行会静默退回直连
+        "exit_proxy": (r["exit_proxy"] if "exit_proxy" in r.keys() else "") or "",
         "account": json.loads(r["payload"] or "{}"),
     } for r in rows] + [{
         "__import_log__": True,
@@ -1579,7 +1626,7 @@ def backup_bytes(row_ids: list[int] | None = None,
 #: 而复检下一次跑就从本机 IP 出去了——正好是最不该发生的那种偏差。
 _META_COLS = ("batch", "imported_at", "first_batch", "first_imported_at",
               "risk_src", "recheck_state", "recheck_count", "recheck_at",
-              "recheck_note", "exit_port")
+              "recheck_note", "exit_port", "exit_proxy")
 
 
 def _restore_meta(items: list[dict]) -> int:

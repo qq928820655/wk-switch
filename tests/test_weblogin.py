@@ -349,6 +349,134 @@ class ReLoginTests(LoginTestBase):
         self.assertEqual(len(store.list_accounts()), 0)
 
 
+class LoginExitBindingTests(LoginTestBase):
+    """官网登录选的出口必须落到账户行，不能只用在登录那四个请求上。
+
+    以前 `build_account` 把代理写进 payload.proxy，账户行的 exit_port 仍是 0：
+    界面显示「直连」，导出时 exitproxy.apply(override) 又按 0 把 proxy 清成
+    空串，复检 / 每日活跃 / 校验也都按 0 走本机 IP。这一组测试锁住新口径：
+    精确 URL 进 exit_proxy 列，能还原成池子端口的还同时写 exit_port。
+    """
+
+    def test_mihomo_port_proxy_binds_exit_port(self):
+        mgr = self.manager()
+        url = "http://cli-proxy-mihomo:17955"
+        with mock.patch("wk.recheck.load_config",
+                        return_value={"mihomo": {"host": "cli-proxy-mihomo"}}):
+            self.start(mgr, proxy=url, proxy_explicit=True)
+            out = self.poll_ok(mgr)
+        self.assertEqual(out["exit_port"], 17955)
+        self.assertEqual(out["exit_proxy"], url)
+        row = store.list_accounts()[0]
+        self.assertEqual(row["exit_port"], 17955)
+        self.assertEqual(row["exit_proxy"], url)
+        acc = store.load_for_export(with_ids=True)[0][1]
+        self.assertEqual(acc.exit_proxy, url)
+        # 精确绑定只活在 DB 列里，账户文件不该凭空多一个字段
+        self.assertNotIn("exit_proxy", acc.to_dict())
+
+    def test_custom_proxy_kept_verbatim_and_port_stays_zero(self):
+        mgr = self.manager()
+        url = "http://127.0.0.1:7891"
+        with mock.patch("wk.recheck.load_config",
+                        return_value={"mihomo": {"host": "cli-proxy-mihomo"}}):
+            self.start(mgr, proxy=url, proxy_explicit=True)
+            out = self.poll_ok(mgr)
+        self.assertEqual(out["exit_port"], 0)
+        self.assertEqual(out["exit_proxy"], url)
+        row = store.list_accounts()[0]
+        self.assertEqual(row["exit_proxy"], url)
+        # 硬取 7891 会让后续链路拼成 http://cli-proxy-mihomo:7891（另一台机器）
+        self.assertEqual(row["exit_port"], 0)
+        acc = store.load_for_export()[0]
+        self.assertEqual(acc.proxy, "")     # 不在 payload 里留一份清不掉的旧代理
+        self.assertEqual(acc.exit_proxy, url)
+
+    def test_explicit_direct_clears_existing_binding(self):
+        row_id = self.seed_row(uid="u-oauth", exit_port=17953)
+        store.set_login_exit(row_id, "http://127.0.0.1:7891", 0)
+        mgr = self.manager()
+        with mock.patch("wk.recheck.load_config",
+                        return_value={"mihomo": {"host": "cli-proxy-mihomo"}}):
+            self.start(mgr, target=store.row_by_id(row_id), proxy="",
+                       proxy_explicit=True)
+            out = self.poll_ok(mgr)
+        self.assertEqual(out["exit_port"], 0)
+        self.assertEqual(out["exit_proxy"], "")
+        row = store.list_accounts()[0]
+        self.assertEqual(row["exit_port"], 0)
+        self.assertEqual(row["exit_proxy"], "")
+
+    def test_backend_default_never_overwrites_existing_binding(self):
+        """前端读默认值失败、没传 proxy：只兜底这一趟，不动用户原有的出口。"""
+        row_id = self.seed_row(uid="u-oauth", exit_port=17953)
+        mgr = self.manager()
+        self.start(mgr, target=store.row_by_id(row_id))   # proxy_explicit 默认 False
+        out = self.poll_ok(mgr)
+        self.assertNotIn("exit_proxy", out)
+        row = store.list_accounts()[0]
+        self.assertEqual(row["exit_port"], 17953)
+        self.assertEqual(row["exit_proxy"], "")
+
+    def test_relogin_with_fixed_verify_proxy_keeps_its_port(self):
+        """设了固定验证代理时重登，预填不能把这一行原有的端口清成 0。"""
+        import server
+
+        class Fake:
+            def __init__(self, path):
+                self.path, self.out = path, None
+
+            def _json(self, status, payload):
+                self.out = (status, payload)
+
+        row_id = self.seed_row(uid="u-oauth", exit_port=17953)
+        cfg = {"verify_proxy": "http://127.0.0.1:7891",
+               "mihomo": {"host": "cli-proxy-mihomo"}}
+        with mock.patch.object(server.recheck, "load_config", return_value=cfg):
+            fake = Fake("/api/store/login/config?target_id=%d" % row_id)
+            server.Handler._store_login_config(fake)
+        _, data = fake.out
+        self.assertEqual(data["proxy"], "http://cli-proxy-mihomo:17953")
+
+        mgr = self.manager()
+        with mock.patch("wk.recheck.load_config",
+                        return_value={"mihomo": {"host": "cli-proxy-mihomo"}}):
+            self.start(mgr, target=store.row_by_id(row_id),
+                       proxy=data["proxy"], proxy_explicit=True)
+            out = self.poll_ok(mgr)
+        self.assertEqual(out["exit_port"], 17953)
+        self.assertEqual(out["exit_proxy"], "http://cli-proxy-mihomo:17953")
+
+    def test_full_chain_export_carries_login_proxy(self):
+        """登录 → 落库 → 从库加载 → 导出：proxy 一路上不能丢。"""
+        from wk import exitproxy, formats
+
+        url = "http://127.0.0.1:7891"
+        mgr = self.manager()
+        with mock.patch("wk.recheck.load_config",
+                        return_value={"mihomo": {"host": "cli-proxy-mihomo"}}):
+            self.start(mgr, proxy=url, proxy_explicit=True)
+            self.poll_ok(mgr)
+        rows = store.load_for_export(with_ids=True)
+        exitproxy.apply(rows, exitproxy.load_config())
+        flat = formats.to_hub_flat(rows[0][1])
+        self.assertEqual(flat["proxy"], url)
+        self.assertEqual(flat["proxySlot"], "")
+        self.assertNotIn("exitProxy", flat)
+
+    def test_manual_exit_change_clears_login_binding(self):
+        mgr = self.manager()
+        with mock.patch("wk.recheck.load_config",
+                        return_value={"mihomo": {"host": "cli-proxy-mihomo"}}):
+            self.start(mgr, proxy="http://127.0.0.1:7891", proxy_explicit=True)
+            self.poll_ok(mgr)
+        row_id = store.list_accounts()[0]["id"]
+        store.set_exit_port([row_id], 0)
+        row = store.list_accounts()[0]
+        self.assertEqual(row["exit_proxy"], "")
+        self.assertEqual(store.load_for_export()[0].exit_proxy, "")
+
+
 class HttpRouteTests(LoginTestBase):
     """直接调 Handler 方法，验证路由参数与默认代理，不启 HTTP 服务。"""
 
@@ -430,6 +558,40 @@ class HttpRouteTests(LoginTestBase):
         self.assertEqual(status, 200)
         self.assertEqual(data["proxy"], "http://127.0.0.1:7891")
         self.assertEqual(self.calls[0]["proxy"], "http://127.0.0.1:7891")
+
+    def test_start_route_marks_explicit_proxy_only_when_present(self):
+        """只有前端真的传了 proxy 才允许改账户行的出口绑定。"""
+        import server
+
+        explicit = self.manager()
+        implicit = self.manager()
+        with mock.patch.object(server.weblogin, "LOGINS", explicit):
+            fake = self._fake()
+            server.Handler._store_login_start(
+                fake, {"realm": "intl", "proxy": "http://127.0.0.1:7891"})
+        with mock.patch.object(server.weblogin, "LOGINS", implicit), \
+             mock.patch.object(server.recheck, "load_config",
+                               return_value={"verify_proxy": ""}):
+            fake = self._fake()
+            server.Handler._store_login_start(fake, {"realm": "intl"})
+        with explicit._lock:
+            self.assertTrue(explicit._sessions["state-1"]["proxy_explicit"])
+        with implicit._lock:
+            self.assertFalse(implicit._sessions["state-1"]["proxy_explicit"])
+
+    def test_config_route_prefers_bound_proxy_over_port_rebuild(self):
+        """重登预填必须给原串，按 mihomo.host 重拼会指向另一台机器。"""
+        import server
+
+        row_id = self.seed_row(uid="u-oauth", exit_port=17953)
+        store.set_login_exit(row_id, "http://127.0.0.1:7891", 0)
+        cfg = {"verify_proxy": "", "mihomo": {"host": "127.0.0.1"}}
+        with mock.patch.object(server.recheck, "load_config", return_value=cfg):
+            fake = self._fake("/api/store/login/config?target_id=%d" % row_id)
+            server.Handler._store_login_config(fake)
+        status, data = fake.out
+        self.assertEqual(status, 200)
+        self.assertEqual(data["proxy"], "http://127.0.0.1:7891")
 
     def test_start_route_explicit_empty_proxy_is_direct(self):
         import server

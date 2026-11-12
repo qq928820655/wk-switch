@@ -1728,6 +1728,19 @@ div[id^="view-"].hidden { display: none !important; }
 .rc-exit-pick:focus, .store-exit-pick:focus { outline: none; border-color: var(--brand);
   box-shadow: 0 0 0 3px rgba(79, 70, 229, .1); }
 
+/* 登录时绑的精确代理：没有端口时下拉只能显示「直连」，这行小字把
+   实际在用的地址点出来。地址可能很长，靠 title 看全，不撑列宽。 */
+.store-exit-bound {
+  display: block;
+  max-width: 148px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+
 /* ---------- 复检出口 ---------- */
 .rc-exit-seg { margin: 2px 0 10px; }
 .rc-exit-tip {

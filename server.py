@@ -708,7 +708,17 @@ class Handler(BaseHTTPRequestHandler):
         raw_id = (query.get("target_id") or [""])[0]
         target = store.row_by_id(int(raw_id)) if raw_id.isdigit() else None
         cfg = recheck.load_config()
-        proxy = recheck.plan_port(cfg, (target or {}).get("exit_port") or 0)["proxy"]
+        # 这一行若是在官网登录时绑过精确代理，重登就预填它原串：按端口重拼
+        # 会把 http://127.0.0.1:7891 变成 http://cli-proxy-mihomo:7891。
+        # 没绑精确代理但有端口时，同样要绕开 verify_proxy 取那个端口的 URL：
+        # 预填成固定验证代理的话，用户什么都没改、重登一次就会把这一行
+        # 原来的 exit_port 清成 0（port_for_proxy 认不出固定代理的端口）。
+        proxy = str((target or {}).get("exit_proxy") or "").strip()
+        port = int((target or {}).get("exit_port") or 0)
+        if not proxy and port:
+            proxy = recheck.port_proxy(cfg, port)
+        if not proxy:
+            proxy = recheck.plan_port(cfg, 0)["proxy"]
         self._json(200, {
             "ok": True,
             "proxy": proxy,
@@ -885,6 +895,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             started = weblogin.LOGINS.start(
                 realm=realm, platform=platform, proxy=proxy, target=target,
+                proxy_explicit=("proxy" in payload),
                 fetch_credits=bool(payload.get("fetch_credits", True)))
         except weblogin.WebLoginError as exc:
             self._error(502, str(exc))
@@ -1135,6 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
                 "uid": row["uid"],
                 "email": row.get("email") or "",
                 "exit_port": int(row.get("exit_port") or 0),
+                # 官网登录绑的精确代理：界面「出口」列不能把手填代理显示成直连
+                "exit_proxy": str(row.get("exit_proxy") or ""),
                 # 账户级开关原值（导出 hub 时写 tasksEnabled 的就是它）
                 "daily_active": on,
                 # 风控账号不参与：界面把开关置灰，跑批也不会碰它。
@@ -1991,7 +2004,8 @@ def attach_exit_proxies(pairs: list) -> None:
     「积分走出口」能单测，不必起 HTTP 服务。
 
     exit_port=0 时**不动** acc.proxy：导入数据里可能自带代理，那是有效配置，
-    不该因为「没在本站分配出口」就被抹掉。
+    不该因为「没在本站分配出口」就被抹掉。唯一例外是 `acc.exit_proxy`
+    （官网登录时绑的精确 URL），它压过端口和导入自带值。
     """
     if not pairs:
         return
@@ -2007,6 +2021,12 @@ def attach_exit_proxies(pairs: list) -> None:
         port = int(port_map.get(row_id, 0) or 0)
         if port:
             acc.proxy = recheck.plan_port(cfg, port)["proxy"]
+        # 官网登录绑的精确 URL 压过端口：手填的可能是 127.0.0.1:7891，
+        # 用 mihomo.host 重拼会指向另一台机器。exit_port=0 时也不动
+        # acc.proxy：导入数据里可能自带代理，那是有效配置。
+        bound = str(getattr(acc, "exit_proxy", "") or "").strip()
+        if bound:
+            acc.proxy = bound
 
 
 def probe_config() -> dict:

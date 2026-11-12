@@ -134,6 +134,11 @@ class Account:
     device_token: str = ""
     proxy: str = ""
     proxy_slot: str = ""
+    #: 官网登录时选的精确出口 URL。它是账户库的行级元数据（DB 的
+    #: accounts.exit_proxy 列），不是账号数据本身：load_for_export /
+    #: load_for_probe 从库里读出来挂到这个字段上，出站和导出都优先用它，
+    #: 但 to_dict() 会剥掉，绝不能混进账户文件里。
+    exit_proxy: str = ""
     enabled: bool = True
     weight: int = 1
     note: str = ""
@@ -208,6 +213,8 @@ class Account:
         # 的替代品读走。
         data.pop("ref", None)
         data.pop("base_uid", None)
+        # exit_proxy 是本机账户库的行级元数据，账号文件里不该出现这个键
+        data.pop("exit_proxy", None)
         data["has_token"] = self.has_token
         data["is_envelope"] = self.is_envelope
         data["is_api_key"] = self.is_api_key

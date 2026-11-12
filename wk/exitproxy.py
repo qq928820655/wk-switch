@@ -128,6 +128,41 @@ def proxy_url(port: int, cfg: dict | None = None) -> str:
     return f"{cfg['scheme']}://{host}:{port}"
 
 
+def port_for_proxy(proxy_url: str) -> int:
+    """精确代理 URL → mihomo listener 端口；不是池子里的端口返回 0。
+
+    登录弹窗的下拉项是按 `recheck.port_proxy()`（mihomo.host）拼出来的，
+    能把端口还原回去，落库时同时写 `exit_port`，账户库「出口」列、一键分配、
+    钉 IP 重选才认得这一行。手填的 `http://127.0.0.1:7891` / 带认证的独立
+    代理主机名对不上，硬取 7891 会让后续链路把它拼成另一台机器的地址，
+    所以这种情况返回 0，精确 URL 由 `exit_proxy` 列单独保存。
+
+    这里认的是 **mihomo 的主机**，不是导出配置里的 host：后者是给 hub 用的
+    可达地址，可能和 listener 所在机器不是同一个名字。
+
+    复杂度 O(1)：一次 urlsplit，不查库不发请求。
+    """
+    from urllib.parse import urlsplit
+
+    text = str(proxy_url or "").strip()
+    if not text:
+        return 0
+    if "://" not in text:
+        text = "http://" + text
+    try:
+        parts = urlsplit(text)
+        port = int(parts.port or 0)
+    except (ValueError, TypeError):
+        return 0
+    host = str((recheck.load_config().get("mihomo") or {}).get("host") or "").strip()
+    if "://" in host:
+        host = urlsplit(host).netloc
+    host = host.split("/", 1)[0].split(":", 1)[0].strip()
+    if not host or not port or not (0 < port < 65536):
+        return 0
+    return port if (parts.hostname or "").lower() == host.lower() else 0
+
+
 def apply(rows: Iterable[tuple[int, Any, int]], cfg: dict | None = None) -> dict:
     """把出口写进 Account，返回统计。
 
@@ -137,6 +172,9 @@ def apply(rows: Iterable[tuple[int, Any, int]], cfg: dict | None = None) -> dict
 
     原地改 Account 的 ``proxy`` / ``proxy_slot``；所有 profile 只要渲染了
     proxy 字段就自然带上，formats 不用改。
+
+    ``acc.exit_proxy``（官网登录绑的精确 URL）优先级最高：它是一个完整地址，
+    可能根本不是 mihomo 端口，按 `exit_port` 重拼会写错主机。
     """
     cfg = _coerce(cfg or load_config())
     rows = list(rows)
@@ -146,8 +184,9 @@ def apply(rows: Iterable[tuple[int, Any, int]], cfg: dict | None = None) -> dict
         "mode": cfg["mode"],
         "scope": cfg["scope"],
         "host": host,
-        "applied": 0,     # 写了具体代理 URL
-        "cleared": 0,     # exit_port=0，清成直连
+        "applied": 0,     # 写了端口拼出来的代理 URL
+        "bound": 0,       # 写了官网登录绑的精确代理 URL
+        "cleared": 0,     # exit_port=0 且没绑代理，清成直连
         "skipped": 0,     # 未按出口改写，保留账户文件原值
     }
     if not cfg["enabled"]:
@@ -158,6 +197,14 @@ def apply(rows: Iterable[tuple[int, Any, int]], cfg: dict | None = None) -> dict
         realm = str(getattr(acc, "realm", "") or "").lower()
         if cfg["scope"] == "intl" and realm != "intl":
             stat["skipped"] += 1
+            continue
+        # 登录时选的线优先：它不是端口能表达的地址，也不该被 0 清成直连。
+        # 「仅补空」也不跳过它——那是用户刚刚显式挑的出口，不是导入遗留值。
+        login_url = str(getattr(acc, "exit_proxy", "") or "").strip()
+        if login_url:
+            acc.proxy = login_url
+            acc.proxy_slot = ""
+            stat["bound"] += 1
             continue
         bound = bool(getattr(acc, "proxy_slot", "") or getattr(acc, "proxy", ""))
         if cfg["mode"] == "fill" and bound:

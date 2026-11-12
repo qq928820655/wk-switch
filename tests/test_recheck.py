@@ -536,6 +536,25 @@ class RunnerExitTests(unittest.TestCase):
         self.assertEqual(seen, [""])
         self.assertEqual(results[0]["exit_mode"], recheck.EXIT_DIRECT)
 
+    def test_login_bound_proxy_beats_exit_port(self):
+        """官网登录选的精确 URL 不是端口，复检不能按端口重拼主机。"""
+        runner = recheck.Runner(self._cfg())
+        a = acc()
+        a.exit_proxy = "http://127.0.0.1:7891"
+        seen = []
+
+        def fake(acc_, timeout=0, proxy="", model="", **kw):
+            seen.append(proxy)
+            return {"verdict": probe.RECHECK_REVIVED, "detail": "", "raw": "",
+                    "status": 200, "endpoint": "", "latency_ms": 1}
+
+        with mock.patch.object(probe, "chat_probe", fake), \
+             mock.patch.object(recheck.Runner, "_prepare", lambda self, p: None):
+            results = runner.run([(1, a)], force=True, ports={1: 17950})
+        self.assertEqual(seen, ["http://127.0.0.1:7891"])
+        self.assertEqual(results[0]["proxy"], "http://127.0.0.1:7891")
+        self.assertTrue(runner._plan(1, {1: 17950}, a)["explicit"])
+
     def test_prepare_fills_name_and_exit_ip(self):
         runner = recheck.Runner(self._cfg())
         with mock.patch.object(recheck, "_fetch_listeners",
@@ -1765,6 +1784,19 @@ class OfficialChatShapeTests(unittest.TestCase):
         chain = probe.model_chain("deepseek-v4.1-flash", None, "intl")
         self.assertIn("deepseek-v4.1-flash-sg", chain)
         self.assertIn("glm-5.3-flash", chain)
+
+    def test_login_bound_proxy_used_for_credits(self):
+        import server
+
+        cfg = dict(recheck.DEFAULTS)
+        a = acc()
+        a.exit_proxy = "http://127.0.0.1:7891"
+        pairs = [(1, a)]
+        with mock.patch.object(server.recheck, "load_config", return_value=cfg), \
+             mock.patch.object(server.store, "exit_ports_of",
+                               return_value={1: 17901}):
+            server.attach_exit_proxies(pairs)
+        self.assertEqual(a.proxy, "http://127.0.0.1:7891")
 
     def test_verify_proxy_overrides_every_row(self):
         import server

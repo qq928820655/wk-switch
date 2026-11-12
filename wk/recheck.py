@@ -1604,7 +1604,10 @@ class Runner:
 
         fixed = str(self.cfg.get("verify_proxy") or "").strip()
         action = self.cfg.get("pin_ip_action") or PIN_RESELECT
-        if action == PIN_RESELECT and not fixed:
+        explicit = bool(plan.get("explicit"))
+        # 精确 URL 不是端口：换 exit_port 改变不了实际走的那条线，重选只会
+        # 把名单改得和真实出口对不上。这种号只按 IP 闸放行或停手。
+        if action == PIN_RESELECT and not fixed and not explicit:
             if self._pin_scan is None:
                 self._pin_scan = pin_reselect(self.cfg, check["expected"],
                                               self._pin_cache)
@@ -1635,6 +1638,7 @@ class Runner:
 
         self.pin_report["blocked"] += 1
         why = ("固定验证代理覆盖了端口" if fixed
+               else "绑的是精确代理 URL，换端口无效" if explicit
                else "没有仍匹配的端口" if action == PIN_RESELECT
                else "策略为停手")
         return {
@@ -1683,9 +1687,21 @@ class Runner:
         except Exception:  # noqa: BLE001 — 出口 IP 只是结果里的注解
             pass
 
-    def _plan(self, row_id: int, ports: dict[int, int] | None) -> dict:
+    def _plan(self, row_id: int, ports: dict[int, int] | None,
+              acc: Any = None) -> dict:
         port = int((ports or {}).get(int(row_id)) or 0)
-        return plan_port(self.cfg, port, self._names, self._ips)
+        # 官网登录绑的精确 URL 不是 mihomo listener 端口能表达的地址，
+        # 直接按端口重拼会指向另一台机器。它压过 exit_port，也压过
+        # verify_proxy 之外的一切兜底（固定验证代理在 plan_port 里优先）。
+        bound = str(getattr(acc, "exit_proxy", "") or "").strip()
+        fixed = str(self.cfg.get("verify_proxy") or "").strip()
+        if bound and not fixed:
+            return {"mode": EXIT_PROXY, "mode_label": EXIT_LABELS[EXIT_PROXY],
+                    "proxy": bound, "exit_ip": "", "label": bound,
+                    "explicit": True}
+        plan = plan_port(self.cfg, port, self._names, self._ips)
+        plan["explicit"] = False
+        return plan
 
     def run(self, pairs: Iterable[tuple[int, Account]], force: bool = False,
             on_result: Callable[[int, Account, dict], None] | None = None,
@@ -1733,7 +1749,7 @@ class Runner:
             if index:
                 time.sleep(self.cfg["gap_seconds"])
 
-            plan = self._plan(row_id, port_map)
+            plan = self._plan(row_id, port_map, acc)
             guard = self._pin_guard(row_id, plan, port_map)
             if not guard["allowed"]:
                 # 标 skipped 而不是 unknown：没发请求就不该改名单状态、
