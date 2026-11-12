@@ -869,6 +869,8 @@ async function loadStore(opts) {
 
 function renderStoreStats(stats) {
   const total = stats.total || 0;
+  // 备份卡要显示「整库 N 条」；表格默认只拉 500 行，不能用 rows.length 顶替。
+  storeState.total = total;
   $('#store-count').textContent = total;
   $('#store-db').textContent = stats.db_path || '';
 
@@ -1227,6 +1229,81 @@ function fmtNum(value) {
   return n.toFixed(2);
 }
 
+/* ---------- 备份范围 ---------- */
+
+/**
+ * 备份范围跟着账户库表格走：勾了一部分就只备勾的，没勾 / 全勾就备当前
+ * 筛选后的可见集，筛选全空且没勾 = 整库。
+ *
+ * filters 一起交给后端重算，不直接把 ids 当最终结果：搜索框刚敲完字、
+ * 请求还没回来时，前端的 rows 可能是上一批数据，后端按同一套 SQL 筛一遍
+ * 才不会把看不见的号打进包里。
+ */
+function backupScope() {
+  const rows = storeState.rows || [];
+  const visible = new Set(rows.map((r) => r.id));
+  const ids = [...storeState.selected].filter((id) => visible.has(id));
+  const filters = {
+    zone: storeState.zone || '',
+    realm: storeState.realm || '',
+    q: storeState.q || '',
+    batch: storeState.batch || '',
+  };
+  const filtered = Object.values(filters).some(Boolean);
+  const partial = ids.length > 0 && ids.length < rows.length;
+  return {
+    scope: partial ? 'selected' : (filtered ? 'filtered' : 'all'),
+    filters,
+    ids: partial ? ids : [],
+    count: partial ? ids.length : rows.length,
+    filtered,
+    partial,
+  };
+}
+
+/** 范围指纹：筛选 / 勾选一变，上次生成的下载链接就不能再当成这次的结果。 */
+function backupScopeKey(s) {
+  return JSON.stringify([s.scope, s.filters, s.partial ? s.ids : []]);
+}
+
+function backupScopeLabel(s) {
+  const bits = [];
+  if (s.filters.zone) bits.push(s.filters.zone === 'risk' ? '风控区' : '正常区');
+  if (s.filters.realm) bits.push(s.filters.realm === 'cn' ? '国内版' : '国际版');
+  if (s.filters.q) bits.push(`搜索「${s.filters.q}」`);
+  if (s.filters.batch) bits.push(`批次 ${s.filters.batch}`);
+  if (s.partial) return `已勾选 ${s.count} 条（勾选优先，${bits.join(' · ') || '无筛选'}）`;
+  if (s.filtered) return `${bits.join(' · ')} · ${s.count} 条（按筛选结果备份）`;
+  return `全部 ${storeState.total || s.count} 条账号（无筛选、未勾选）`;
+}
+
+/** 分区 / 搜索 / 勾选 / 批次 / 版本任一变化都会走到这里。 */
+function renderBackupScope() {
+  const el = $('#backup-scope');
+  if (!el) return;
+  const s = backupScope();
+  el.textContent = `当前备份范围：${backupScopeLabel(s)}`;
+  el.classList.toggle('bad', s.count === 0);
+  const btn = $('#btn-store-backup');
+  if (btn) btn.disabled = s.count === 0;
+
+  // 旧下载链接还挂着上一次的范围，标灰并写明要重新生成，避免误下载。
+  const box = $('#backup-downloads');
+  if (!box) return;
+  const stale = !!(box.dataset.scopeKey && box.dataset.scopeKey !== backupScopeKey(s));
+  box.classList.toggle('stale', stale);
+  let note = $('#backup-stale');
+  if (stale && !note) {
+    note = document.createElement('p');
+    note.id = 'backup-stale';
+    note.className = 'hint bad';
+    note.textContent = '范围已变化，点「下载备份包」重新生成；上面的链接还是上一次的范围。';
+    box.insertAdjacentElement('beforebegin', note);
+  } else if (!stale && note) {
+    note.remove();
+  }
+}
+
 /** 同步「全选」勾选态与底部操作条。 */
 function refreshSelBar() {
   const total = storeState.rows.length;
@@ -1246,6 +1323,9 @@ function refreshSelBar() {
   $('#btn-sel-unrisk').disabled = picked === 0;
   $('#btn-sel-delete').disabled = picked === 0;
   $('#btn-sel-clear').disabled = picked === 0;
+
+  // 勾选集一变，备份卡的范围提示也要跟着变（含按钮禁用态）
+  renderBackupScope();
 }
 
 /** 账户库里直接把选中的号移进 / 移出风控区。
@@ -1498,29 +1578,46 @@ async function storeClear() {
   }
 }
 
+/** 按表格当前筛选 / 勾选打包。范围由后端按同一套 SQL 复算，前端只负责传条件。 */
 async function storeBackup() {
+  const s = backupScope();
+  if (!s.count) {
+    toast('当前筛选没有可备份的账号', true);
+    return;
+  }
   const btn = $('#btn-store-backup');
   btn.disabled = true;
   btn.textContent = '打包中…';
   try {
-    const data = await apiGet('/api/store/backup');
-    if (!data.ok) throw new Error(data.error || '备份失败');
+    const data = await api('/api/store/backup', {
+      scope: s.scope,
+      filters: s.filters,
+      ...(s.partial ? { ids: s.ids } : {}),
+    });
     const f = data.file;
+    const sc = data.scope || {};
+    const count = Number(sc.count == null ? s.count : sc.count);
+    const range = sc.mode === 'selected' ? `已勾选 ${count} 条`
+      : sc.mode === 'filtered' ? `当前筛选 ${count} 条`
+        : `整库 ${count} 条`;
     $('#backup-downloads').innerHTML = `
       <div class="dl">
         <div>
           <div class="dl-name">${esc(f.name)}</div>
-          <div class="dl-size">${bytesText(f.size)} · 含 accounts.db 与 accounts.json</div>
+          <div class="dl-size">${bytesText(f.size)} · ${range} · 含 accounts.db 与 accounts.json</div>
         </div>
         <a href="${esc(f.download)}" download="${esc(f.name)}">下载</a>
       </div>`;
-    $('#backup-hint').textContent = `已打包 ${data.stats.total} 条账号。包内含 token 明文，存到自己可控的位置。`;
-    toast('备份包已生成');
+    $('#backup-downloads').dataset.scopeKey = backupScopeKey(s);
+    $('#backup-hint').textContent =
+      `已打包 ${range}（库内共 ${sc.total == null ? storeState.total : sc.total} 条）。`
+      + '包内含 token 明文，存到自己可控的位置。';
+    toast(`备份包已生成（${range}）`);
   } catch (err) {
     toast(err.message, true);
   } finally {
-    btn.disabled = false;
     btn.textContent = '下载备份包';
+    renderBackupScope();
   }
 }
 

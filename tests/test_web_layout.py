@@ -18,6 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INDEX = os.path.join(ROOT, "web", "index.html")
 CSS = os.path.join(ROOT, "web", "style.css")
 APP = os.path.join(ROOT, "web", "app.js")
+SERVER = os.path.join(ROOT, "server.py")
 
 
 def read(path: str) -> str:
@@ -106,6 +107,50 @@ class AccountSearchLayoutTest(unittest.TestCase):
                             css, re.S)
         self.assertTrue(any("#da-accounts .zone-flag" in b for b in blocks),
                         "窄屏没把分区徽标收成圆点，名称列会被胶囊挤破")
+
+
+class BackupScopeLayoutTest(unittest.TestCase):
+    """备份卡「范围跟筛选/勾选走」的结构守门。
+
+    前端算范围、后端复算范围、界面给提示，三处缺一处就会退回「永远备整库」。
+    """
+
+    def test_backup_card_has_live_scope_hint(self):
+        html = read(INDEX)
+        self.assertIn('id="backup-scope"', html, "备份卡缺实时范围提示")
+        self.assertIn("按当前筛选 / 勾选打包", html, "卡片说明还写着整库")
+        self.assertIn('id="btn-store-backup"', html)
+
+    def test_frontend_posts_scope_filters_and_selection(self):
+        app = read(APP)
+        for needle in ("function backupScope()", "function renderBackupScope()",
+                       "api('/api/store/backup'", "scope: s.scope,",
+                       "filters: s.filters,", "ids: s.ids",
+                       "data.scope || {}", "renderBackupScope();",
+                       "function backupScopeKey(s)", "dataset.scopeKey",
+                       "id = 'backup-stale'"):
+            self.assertIn(needle, app, f"前端少接了 {needle}")
+        self.assertNotIn("apiGet('/api/store/backup')", app,
+                         "还在走整库 GET，筛选和勾选不会生效")
+
+    def test_scope_hint_refreshes_on_selection_change(self):
+        app = read(APP)
+        i = app.index("function refreshSelBar()")
+        self.assertIn("renderBackupScope();", app[i:i + 1400],
+                      "勾选变了不重算范围提示")
+
+    def test_server_wires_post_scope(self):
+        srv = read(SERVER)
+        self.assertIn('elif path == "/api/store/backup":\n                self._store_backup(payload)',
+                      srv, "POST 路由没接备份范围")
+        self.assertIn("store.backup_scope_ids(", srv)
+        self.assertIn("store.backup_bytes(row_ids=row_ids, scope=scope)", srv)
+
+    def test_css_has_scope_hint_style(self):
+        css = read(CSS)
+        self.assertIn(".backup-scope {", css)
+        self.assertIn(".backup-scope.bad {", css)
+        self.assertIn("#backup-downloads.stale {", css)
 
 
 if __name__ == "__main__":

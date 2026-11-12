@@ -979,5 +979,186 @@ class AccountZoneTests(StoreTestBase):
         self.assertEqual(data["rows"][0]["zone"], "risk")
 
 
+class BackupScopeTests(StoreTestBase):
+    """备份包按筛选 / 勾选裁剪：json、db、manifest 三份内容必须一致。
+
+    最容易漏的是 accounts.db：只改 json 而 db 还是整库，换机器只拿 db 还原
+    就会把没选的号带回来；DELETE 之后不 VACUUM，SQLite 页里的 token 明文
+    也还在包里。这两条都在这里钉死。
+    """
+
+    def _seed(self):
+        store.upsert([
+            self.acc("u-b1", "甲", realm="cn", token="tok-b1-UNIQUE"),
+            self.acc("u-b2", "乙", realm="intl", token="tok-b2-UNIQUE"),
+            self.acc("u-b3", "丙", realm="cn", token="tok-b3-UNIQUE"),
+            self.acc("u-b4", "丁", realm="intl", token="tok-b4-UNIQUE"),
+        ])
+        ids = {r["uid"]: r["id"] for r in store.list_accounts()}
+        store.set_track([ids["u-b3"]], "banned")
+        store.set_track([ids["u-b4"]], "revived")
+        with store.connect() as conn:
+            for uid, rid in ids.items():
+                conn.execute(
+                    "INSERT INTO activity (row_id, uid, at) VALUES (?,?,?)",
+                    (rid, uid, 1))
+        return ids
+
+    def _unpack(self, blob):
+        import io
+        import json
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            return {
+                "dump": json.loads(zf.read("accounts.json").decode("utf-8")),
+                "manifest": json.loads(zf.read("manifest.json").decode("utf-8")),
+                "db": zf.read("accounts.db"),
+            }
+
+    def _db_uids(self, blob):
+        import sqlite3
+
+        path = os.path.join(self.tmp.name, "unpacked.db")
+        with open(path, "wb") as fh:
+            fh.write(blob)
+        conn = sqlite3.connect(path)
+        try:
+            rows = conn.execute("SELECT uid FROM accounts ORDER BY id").fetchall()
+            acts = conn.execute("SELECT row_id FROM activity").fetchall()
+        finally:
+            conn.close()
+        os.unlink(path)
+        return [r[0] for r in rows], [r[0] for r in acts]
+
+    def test_default_scope_is_whole_library(self):
+        """GET / 老调用方：整库、文件名不带范围后缀。"""
+        self._seed()
+        row_ids, info = store.backup_scope_ids()
+        self.assertIsNone(row_ids)
+        self.assertEqual(info["mode"], "all")
+        self.assertFalse(info["partial"])
+        self.assertEqual(info["count"], 4)
+
+        blob, name = store.backup_bytes(row_ids, info)
+        self.assertTrue(name.startswith("wk-switch-backup-") and name.endswith(".zip"))
+        self.assertNotIn("filtered", name)
+        pack = self._unpack(blob)
+        self.assertEqual(len(pack["dump"]["accounts"]), 4)
+        self.assertEqual(pack["manifest"]["scope"]["mode"], "all")
+        self.assertEqual(len(self._db_uids(pack["db"])[0]), 4)
+
+    def test_filtered_scope_only_risk_accounts(self):
+        """风控区筛选：json / db / 活跃历史 / manifest 都只剩那 2 个号。"""
+        ids = self._seed()
+        row_ids, info = store.backup_scope_ids(scope="filtered", zone="risk")
+        self.assertEqual(set(row_ids), {ids["u-b3"], ids["u-b4"]})
+        self.assertEqual(info["mode"], "filtered")
+        self.assertEqual(info["count"], 2)
+        self.assertEqual(info["total"], 4)
+        self.assertTrue(info["partial"])
+
+        blob, name = store.backup_bytes(row_ids, info)
+        self.assertIn("-filtered-2.zip", name)
+        pack = self._unpack(blob)
+        uids = {r["uid"] for r in pack["dump"]["accounts"]}
+        self.assertEqual(uids, {"u-b3", "u-b4"})
+        self.assertEqual(pack["manifest"]["accounts"], 2)
+        self.assertEqual(pack["manifest"]["scope"]["filters"]["zone"], "risk")
+        db_uids, db_acts = self._db_uids(pack["db"])
+        self.assertEqual(set(db_uids), {"u-b3", "u-b4"})
+        self.assertEqual(set(db_acts), {ids["u-b3"], ids["u-b4"]})
+        # 复检状态跟着备份走，还原后风控区不会空
+        states = {r["uid"]: r["recheck_state"] for r in pack["dump"]["accounts"]}
+        self.assertEqual(states, {"u-b3": "banned", "u-b4": "revived"})
+
+    def test_selected_scope_intersects_filters_and_vacuums(self):
+        """勾了正常区的号、当前却在风控区：交集为空的那个不能进包。
+
+        VACUUM 之后 db 文件里连被删账号的 token 明文都不能剩。
+        """
+        ids = self._seed()
+        row_ids, info = store.backup_scope_ids(
+            scope="selected", ids=[ids["u-b1"], ids["u-b3"]], zone="risk")
+        self.assertEqual(row_ids, [ids["u-b3"]])
+        self.assertEqual(info["mode"], "selected")
+        blob, name = store.backup_bytes(row_ids, info)
+        self.assertIn("-selected-1.zip", name)
+        pack = self._unpack(blob)
+        self.assertEqual([r["uid"] for r in pack["dump"]["accounts"]], ["u-b3"])
+        self.assertEqual(self._db_uids(pack["db"])[0], ["u-b3"])
+        self.assertNotIn(b"tok-b1-UNIQUE", pack["db"])
+        self.assertNotIn(b"tok-b2-UNIQUE", pack["db"])
+        self.assertNotIn(b"tok-b4-UNIQUE", pack["db"])
+
+    def test_combined_filters(self):
+        """搜索状态词 + 版本 + 批次叠加，和 list_accounts 是同一套口径。"""
+        self._seed()
+        row_ids, info = store.backup_scope_ids(
+            scope="filtered", query="封号", realm="cn", zone="risk")
+        self.assertEqual(info["count"], 1)
+        blob, _ = store.backup_bytes(row_ids, info)
+        self.assertEqual([r["uid"] for r in self._unpack(blob)["dump"]["accounts"]],
+                         ["u-b3"])
+
+        store.upsert([self.acc("u-b5", "戊", realm="cn")], batch="b-2026")
+        row_ids, info = store.backup_scope_ids(scope="filtered", batch="b-2026")
+        self.assertEqual(info["count"], 1)
+        blob, _ = store.backup_bytes(row_ids, info)
+        self.assertEqual([r["uid"] for r in self._unpack(blob)["dump"]["accounts"]],
+                         ["u-b5"])
+
+    def test_empty_or_bad_scope_is_rejected(self):
+        self._seed()
+        with self.assertRaises(ValueError):
+            store.backup_scope_ids(scope="bogus")
+        with self.assertRaises(ValueError):
+            store.backup_scope_ids(scope="filtered", query="不存在的号")
+        with self.assertRaises(ValueError):
+            store.backup_scope_ids(scope="selected", ids=[])
+        with self.assertRaises(ValueError):
+            store.backup_scope_ids(scope="selected", ids=[99999])
+
+    def test_partial_backup_restores_only_selected_accounts(self):
+        """包还原回来只有筛出来的号，且风控标记还在。"""
+        self._seed()
+        row_ids, info = store.backup_scope_ids(scope="filtered", zone="risk")
+        blob, _ = store.backup_bytes(row_ids, info)
+        store.clear()
+        self.assertEqual(store.list_accounts(), [])
+        result = store.restore_bytes(blob, filename="part.zip", mode="replace")
+        self.assertEqual(result["restored"], 2)
+        after = {r["uid"]: r["id"] for r in store.list_accounts()}
+        got = {r["uid"]: r["recheck_state"] for r in store.list_accounts()}
+        self.assertEqual(got, {"u-b3": "banned", "u-b4": "revived"})
+        # clear 之后 AUTOINCREMENT 不回头，行 id 会重新分配；按还原后的 id 比
+        self.assertEqual(set(store.recheck_ids()), {after["u-b3"], after["u-b4"]})
+
+    def test_handler_get_is_whole_library_post_honors_scope(self):
+        import server
+
+        class Fake:
+            def __init__(self):
+                self.out = None
+
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        self._seed()
+        get = Fake()
+        server.Handler._store_backup(get)
+        self.assertEqual(get.out[1]["scope"]["mode"], "all")
+        self.assertEqual(get.out[1]["scope"]["count"], 4)
+
+        post = Fake()
+        server.Handler._store_backup(post, {
+            "scope": "filtered", "filters": {"zone": "normal", "realm": "cn"},
+        })
+        self.assertEqual(post.out[1]["scope"]["count"], 1)
+        self.assertEqual(post.out[1]["scope"]["mode"], "filtered")
+        self.assertEqual(post.out[1]["scope"]["filters"]["zone"], "normal")
+        self.assertIn("-filtered-1.zip", post.out[1]["file"]["name"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

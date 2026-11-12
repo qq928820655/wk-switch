@@ -1362,11 +1362,14 @@ def clear() -> int:
 # 只给 db 的话，跨 sqlite 版本/平台会有兼容风险；只给 json 的话，导入历史丢了。
 # 两份一起给，成本几乎为零。
 
-def _sqlite_snapshot() -> bytes:
+def _sqlite_snapshot(row_ids: list[int] | None = None) -> bytes:
     """用 sqlite 的在线备份 API 取一致性快照。
 
     直接读文件在写入过程中可能拿到半页数据（尤其 WAL 模式），备份 API 会
     自己处理锁和页边界。
+
+    `row_ids` 不为 None 时只留这些账号：部分备份里如果 db 还是整库，
+    换机器的人只拿 accounts.db 还原就会把没选的号一起带回来。
     """
     import tempfile
 
@@ -1377,6 +1380,28 @@ def _sqlite_snapshot() -> bytes:
             dest = sqlite3.connect(tmp)
             try:
                 conn.backup(dest)
+                if row_ids is not None:
+                    ids = [int(i) for i in row_ids]
+                    if ids:
+                        marks = ",".join("?" for _ in ids)
+                        dest.execute(f"DELETE FROM accounts WHERE id NOT IN ({marks})", ids)
+                        try:
+                            # 每日活跃历史按 row_id 归属账号，一起裁掉，
+                            # 否则留下的是「别人的号跑过活跃」的记录。
+                            dest.execute(
+                                f"DELETE FROM activity WHERE row_id NOT IN ({marks})", ids)
+                        except sqlite3.OperationalError:
+                            pass        # 老库可能还没有 activity 表
+                    else:
+                        dest.execute("DELETE FROM accounts")
+                        try:
+                            dest.execute("DELETE FROM activity")
+                        except sqlite3.OperationalError:
+                            pass
+                    dest.commit()
+                    # DELETE 只把页标成可用，页里被删账号的 token 明文还在文件中。
+                    # 不 VACUUM 就等于把筛选外的号物理塞进了备份包。
+                    dest.execute("VACUUM")
             finally:
                 dest.close()
             with open(tmp, "rb") as f:
@@ -1388,15 +1413,22 @@ def _sqlite_snapshot() -> bytes:
                 pass
 
 
-def dump_records() -> list[dict]:
-    """把库里每条记录原样导出（含完整 payload，token 不脱敏）。
+def dump_records(row_ids: list[int] | None = None) -> list[dict]:
+    """把库里选中的记录原样导出（含完整 payload，token 不脱敏）。
 
-    这是备份，脱敏就没有还原价值了。
+    这是备份，脱敏就没有还原价值了。import_log 是导入历史、不按账号归属，
+    部分备份也整份带着（manifest 里写明），清空还原后还能对账。
     """
+    where = ""
+    args: tuple = ()
+    if row_ids is not None:
+        ids = [int(i) for i in row_ids]
+        where = " WHERE id IN (" + ",".join("?" for _ in ids) + ")" if ids else " WHERE 0"
+        args = tuple(ids)
+
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM accounts ORDER BY id"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM accounts" + where + " ORDER BY id",
+                            args).fetchall()
         logs = conn.execute("SELECT * FROM import_log ORDER BY id").fetchall()
 
     return [{
@@ -1436,17 +1468,81 @@ def dump_records() -> list[dict]:
     } for r in logs]
 
 
-def backup_bytes() -> tuple[bytes, str]:
-    """生成备份 zip，返回 (字节, 建议文件名)。"""
+def backup_scope_ids(scope: str = "all", ids: list[int] | None = None,
+                     zone: str = "", realm: str = "", query: str = "",
+                     batch: str = "") -> tuple[list[int] | None, dict]:
+    """把界面上的「筛选 / 勾选」翻译成 accounts 表的行 id。
+
+    返回 `(row_ids, info)`；`row_ids is None` 表示整库、不裁剪，这是老版本
+    「下载备份包」和直接打 GET 接口的默认行为。
+
+    范围规则（和「从库导出」一致，但多一层筛选）：
+
+    - 勾了一部分 → 只备勾的，且必须仍落在当前筛选结果里（筛掉了就不能偷偷
+      把看不见的号打进包）；
+    - 一条不勾 / 全勾 → 备当前筛选后的可见集；
+    - 没有任何筛选、也没勾 → 整库。
+
+    筛选条件在后端按 `list_accounts` 同一套 SQL 重算一遍，不信任前端传来的
+    id 列表——前端算错或旧响应残留时，结果仍然和表格上看到的一致。
+    O(n)，n = 库内行数；瓶颈是 list_accounts 的整表脱敏，几千条以内够用。
+    """
+    if scope not in ("all", "filtered", "selected"):
+        raise ValueError("scope 只能是 all / filtered / selected")
+    filters = {
+        "zone": zone if zone in ("normal", "risk") else "",
+        "realm": realm if realm in ("cn", "intl") else "",
+        "q": (query or "").strip(),
+        "batch": (batch or "").strip(),
+    }
+    total = int(stats().get("total") or 0)
+    clean = not any(filters.values())
+    if scope == "all" and clean:
+        return None, {"mode": "all", "count": total, "total": total,
+                      "partial": False, "filters": filters}
+
+    visible = [int(r["id"]) for r in list_accounts(
+        realm=filters["realm"], query=filters["q"], batch=filters["batch"],
+        zone=filters["zone"], limit=max(1000, total * 2 + 10))]
+    if not visible:
+        raise ValueError("当前筛选没有可备份的账号")
+
+    if scope == "selected":
+        picked = {int(i) for i in (ids or [])}
+        if not picked:
+            raise ValueError("没有勾选账号")
+        chosen = [i for i in visible if i in picked]
+        if not chosen:
+            raise ValueError("勾选的账号不在当前筛选结果里")
+        mode = "selected"
+    else:
+        chosen = visible
+        mode = "filtered"
+
+    return chosen, {"mode": mode, "count": len(chosen), "total": total,
+                    "partial": True, "filters": filters}
+
+
+def backup_bytes(row_ids: list[int] | None = None,
+                 scope: dict | None = None) -> tuple[bytes, str]:
+    """生成备份 zip，返回 (字节, 建议文件名)。保持二元组，老调用方不用改。"""
     import io
     import zipfile
 
     stamp = clock.compact()
-    name = f"wk-switch-backup-{stamp}.zip"
-
-    records = dump_records()
+    records = dump_records(row_ids)
     accounts = [r for r in records if not r.get("__import_log__")]
     logs = [r for r in records if r.get("__import_log__")]
+
+    info = dict(scope or {})
+    info.setdefault("mode", "all" if row_ids is None else "selected")
+    info.setdefault("count", len(accounts))
+    info.setdefault("total", stats().get("total") or 0)
+    info.setdefault("partial", row_ids is not None)
+    info.setdefault("filters", {"zone": "", "realm": "", "q": "", "batch": ""})
+    # 部分备份文件名带范围和条数：下载目录里一眼看出哪份是风控区、哪份是整库。
+    suffix = "" if row_ids is None else f"-{info['mode']}-{info['count']}"
+    name = f"wk-switch-backup-{stamp}{suffix}.zip"
 
     manifest = {
         "format": "wk-switch-backup",
@@ -1455,7 +1551,9 @@ def backup_bytes() -> tuple[bytes, str]:
         "created_at": clock.stamp(),
         "accounts": len(accounts),
         "import_log": len(logs),
+        "import_log_scope": "all",
         "db_path": DB_PATH,
+        "scope": info,
     }
     dump = {
         "format": "wk-switch-backup",
@@ -1463,13 +1561,14 @@ def backup_bytes() -> tuple[bytes, str]:
         "created_at": manifest["created_at"],
         "accounts": accounts,
         "import_log": logs,
+        "scope": info,
     }
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr("accounts.json", json.dumps(dump, ensure_ascii=False, indent=2))
-        zf.writestr("accounts.db", _sqlite_snapshot())
+        zf.writestr("accounts.db", _sqlite_snapshot(row_ids))
     return buf.getvalue(), name
 
 

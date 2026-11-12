@@ -2230,3 +2230,19 @@ div[id^="view-"].hidden { display: none !important; }
     position: absolute; right: 3px; top: 50%; margin: -3px 0 0;
   }
 }
+
+/* 备份范围提示：筛选 / 勾选一变就重算，放在按钮下面一眼能看见。
+   长搜索词和批次号允许换行，不把卡片撑出横向滚动条。 */
+.backup-scope {
+  margin: 4px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid #e3e8f2;
+  border-radius: 8px;
+  background: #f7f9fd;
+  color: #46506a;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.backup-scope.bad { color: var(--bad); border-color: #f2c9c9; background: #fff7f7; }
+/* 范围变了之后旧下载链接不能再看起来像最新结果 */
+#backup-downloads.stale { opacity: .5; }

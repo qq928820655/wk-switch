@@ -220,6 +220,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "stats": store.stats()})
             return
         if path == "/api/store/backup":
+            # GET 保持老行为：无条件整库，脚本和外部调用方不受影响。
             self._store_backup()
             return
         if path == "/api/probe/config":
@@ -303,6 +304,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._store_clear()
             elif path == "/api/store/export":
                 self._store_export(payload)
+            elif path == "/api/store/backup":
+                self._store_backup(payload)
             elif path == "/api/store/restore":
                 self._store_restore(payload)
             elif path == "/api/probe":
@@ -1253,19 +1256,40 @@ class Handler(BaseHTTPRequestHandler):
                                                 ("repo", "index_url", "asset", "allow_prerelease", "proxy")}})
 
     # ---- 备份 / 还原 -----------------------------------------------
-    def _store_backup(self) -> None:
-        """打包整库为 zip，返回一次性下载链接。
+    def _store_backup(self, payload: dict | None = None) -> None:
+        """按当前筛选 / 勾选打包为 zip，返回一次性下载链接。
+
+        GET（无 payload）= 整库，老调用方行为不变。POST 带 scope / filters /
+        ids 时按账户库表格上看到的范围裁：accounts.json、accounts.db、
+        manifest.json 三份内容全部一致，不会出现「json 只有 2 个号、db 里
+        还是整库」的漏数据。
 
         备份包里带 token 明文——这是本地备份，脱敏就失去还原价值。
         链接和转换产物一样走 _outputs 的两小时 TTL，不落盘。
         """
-        data, name = store.backup_bytes()
+        payload = payload or {}
+        filters = payload.get("filters") or {}
+        if not isinstance(filters, dict):
+            raise ValueError("filters 必须是对象")
+        ids = payload.get("ids") or None
+        if ids is not None and not isinstance(ids, list):
+            raise ValueError("ids 必须是数组")
+        row_ids, scope = store.backup_scope_ids(
+            scope=str(payload.get("scope") or "all").strip(),
+            ids=[int(i) for i in ids] if ids else None,
+            zone=str(filters.get("zone") or ""),
+            realm=str(filters.get("realm") or ""),
+            query=str(filters.get("q") or ""),
+            batch=str(filters.get("batch") or ""),
+        )
+        data, name = store.backup_bytes(row_ids=row_ids, scope=scope)
         file_id = _new_id()
         with _lock:
             _outputs[file_id] = {"name": name, "data": data, "created": time.time()}
         self._json(200, {
             "ok": True,
             "file": {"name": name, "size": len(data), "download": f"/api/download/{file_id}"},
+            "scope": scope,
             "stats": store.stats(),
         })
 
