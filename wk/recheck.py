@@ -50,6 +50,7 @@ socks 进来只会在运行时抛错，所以在解析阶段就剔掉。
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import os
 import random
@@ -98,6 +99,12 @@ EXIT_RANDOM = "random"
 EXIT_CUSTOM = "custom"
 EXIT_MODES = (EXIT_SAME, EXIT_RANDOM)
 
+#: 钉住出口 IP 后，IP 漂移时的处置。端口只是本地 listener 编号，节点重连、
+#: 换线、订阅更新都会让它背后的公网出口变掉——「固定端口」不等于「固定 IP」。
+PIN_RESELECT = "reselect"   # 重新扫端口表，换到当前仍是目标 IP 的那个端口
+PIN_BLOCK = "block"         # 本号跳过，一个请求都不发出去
+PIN_ACTIONS = (PIN_RESELECT, PIN_BLOCK)
+
 #: 单个账号的实际出口由 `exit_port` 决定（0 = 直连）。这两个标签用于复检
 #: 结果里说明「这一趟从哪出去的」。
 EXIT_PORT = "port"
@@ -138,6 +145,13 @@ DEFAULTS: dict[str, Any] = {
     #: 本机直连 IP 上还挂着别的账号，拿它去敲风控号会把那些号一起关联上。
     #: 例：http://127.0.0.1:7891。留空按原来的按行出口逻辑。
     "verify_proxy": "",
+    #: 钉住的**公网出口 IP**。空 = 不钉，仍按端口走。
+    #: 配了之后，每个号发请求之前先探一次它实际用的那条线的出口 IP，
+    #: 不等于这里就按 pin_ip_action 处理；探不到也按不符处理。
+    #: 只收 IPv4 / IPv6 字面量，不收域名——域名要解析，判等就不可靠了。
+    "pin_exit_ip": "",
+    #: 漂移处置：reselect = 换到仍匹配目标 IP 的端口；block = 停手不出网。
+    "pin_ip_action": PIN_RESELECT,
     #: 出口策略：random / same / custom。见模块顶部那张表。
     "exit_mode": "random",
     #: same 模式固定走这个出口。空 = 不下发代理（账号自带优先，其次直连）。
@@ -222,6 +236,11 @@ def _coerce(cfg: dict) -> dict:
     # 固定代理只认 http/https 且必须是单个地址：填一串或 socks5 会在运行时
     # 抛 unknown url type，配置阶段就剔干净，坏值等价于「没配」。
     cfg["verify_proxy"] = normalize_url(cfg.get("verify_proxy"))
+    # 钉出口 IP：非法字面量等价于「没钉」，不能让一个手滑的输入把整批复检
+    # 全部挡在门外。IPv6 归一化后写回，比较时两边都是同一种写法。
+    cfg["pin_exit_ip"] = normalize_ip(cfg.get("pin_exit_ip"))
+    action = str(cfg.get("pin_ip_action") or "").strip().lower()
+    cfg["pin_ip_action"] = action if action in PIN_ACTIONS else PIN_RESELECT
     # 勾选的端口：去重、丢非法值、保序（用户点选的顺序在界面上有意义）。
     # 上限 64：端口池本身通常 32 个，留一倍余量就够，再多只是把配置写胖。
     picked: list[int] = []
@@ -1045,6 +1064,23 @@ def normalize_url(value: Any) -> str:
     return f"{parts.scheme}://{parts.hostname}:{port}"
 
 
+def normalize_ip(value: Any) -> str:
+    """把用户填的出口 IP 收拾成标准字面量，非法值返回空串。
+
+    用 ipaddress 而不是正则：IPv6 的 `::1` / `2001:db8::1` / 带括号写法
+    各有各的形态，正则漏一种就会把「钉住了」判成「没钉住」。IPv4 里
+    `001.002.003.004` 这类写法直接判非法，避免同一个 IP 两种字符串比不相等。
+    """
+    text = str(value or "").strip().strip("[]")
+    if not text:
+        return ""
+    # 带端口的 `1.2.3.4:8080` 不是出口 IP，是代理地址；拒绝，别猜意图
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return ""
+
+
 def parse_urls(spec: Any) -> list[str]:
     """自定义出口地址表 → 去重保序的 URL 列表。
 
@@ -1079,8 +1115,12 @@ def probe_exit(proxy_url: str, probe_url: str, timeout: float = 10.0) -> dict:
     started = time.time()
     req = urllib.request.Request(probe_url, method="GET",
                                  headers={"User-Agent": "curl/8.5.0"})
+    # 空 proxy 表示直连（exit_port=0）。ProxyHandler({"http": ""}) 在部分
+    # Python 版本里会把空串当成代理地址解析，显式装空表才是真的不走代理。
+    opener = (_opener(proxy_url) if proxy_url
+              else urllib.request.build_opener(urllib.request.ProxyHandler({})))
     try:
-        with _opener(proxy_url).open(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             ip = resp.read(64).decode("utf-8", "replace").strip()
         return {
             "url": proxy_url,
@@ -1109,6 +1149,148 @@ def probe_urls(urls: Iterable[str], probe_url: str, timeout: float = 10.0) -> li
     with ThreadPoolExecutor(max_workers=min(8, len(targets)),
                             thread_name_prefix="wk-exit") as pool:
         return list(pool.map(lambda u: probe_exit(u, probe_url, timeout), targets))
+
+
+def pin_candidates(cfg: dict) -> list[dict]:
+    """可以用来「钉 IP」的出口地址表：`{port, url, kind}`。
+
+    `port=0` 的项（固定验证代理）不能写回账户行的 `exit_port`：它覆盖所有
+    行，换端口根本不会改变实际出口。端口表里的项才能落库。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    fixed = str(cfg.get("verify_proxy") or "").strip()
+    if fixed:
+        out.append({"port": 0, "url": fixed, "kind": "fixed"})
+        seen.add(fixed)
+    mihomo = cfg.get("mihomo") or {}
+    host = _host_only(str(mihomo.get("host") or ""))
+    if host:
+        for port in parse_ports(mihomo.get("ports")):
+            url = _proxy_url(host, port)
+            if url and url not in seen:
+                out.append({"port": port, "url": url, "kind": "port"})
+                seen.add(url)
+    return out
+
+
+def pin_status(cfg: dict, wanted: str = "", probe_now: bool = True) -> dict:
+    """逐个探候选出口的公网 IP，给出「哪个端口现在还是目标 IP」。
+
+    界面上的「核对当前出口」和「按 IP 分配出口」都走这里，Runner 里 IP
+    漂移后的重选也走这里——三处必须是同一套判据，否则界面说匹配、复检
+    却把号挡下来。
+    """
+    target = normalize_ip(wanted) or normalize_ip(cfg.get("pin_exit_ip"))
+    action = str(cfg.get("pin_ip_action") or PIN_RESELECT)
+    if action not in PIN_ACTIONS:
+        action = PIN_RESELECT
+    cands = pin_candidates(cfg)
+    found: dict[str, dict] = {}
+    if probe_now and cands:
+        mihomo = cfg.get("mihomo") or {}
+        try:
+            found = {r["url"]: r for r in probe_urls(
+                [c["url"] for c in cands],
+                str(mihomo.get("probe_url") or DEFAULTS["mihomo"]["probe_url"]),
+                _float(mihomo.get("timeout"), DEFAULTS["mihomo"]["timeout"], 3.0, 60.0))}
+        except Exception:  # noqa: BLE001 — 探测失败要当成「没匹配」，不能抛到界面
+            found = {}
+    rows: list[dict] = []
+    for cand in cands:
+        hit = found.get(cand["url"]) or {}
+        ip = str(hit.get("exit_ip") or "")
+        rows.append({
+            **cand,
+            "ok": bool(hit.get("ok")),
+            "exit_ip": ip,
+            "matched": bool(target and ip == target),
+            "error": str(hit.get("error") or ""),
+            "latency_ms": int(hit.get("latency_ms") or 0),
+        })
+    matched_ports = [int(r["port"]) for r in rows
+                     if r["kind"] == "port" and r["matched"] and r["port"]]
+    fixed = next((r for r in rows if r["kind"] == "fixed"), None)
+    fixed_covers = fixed is not None
+    fixed_matched = bool(fixed and fixed["matched"])
+    if not target:
+        reason = "没填目标出口 IP"
+    elif not probe_now:
+        reason = "只列候选，未探测出口 IP"
+    elif fixed_covers and not fixed_matched:
+        reason = ("固定验证代理覆盖了每行出口，换端口无效：把它换成出口为 "
+                  f"{target} 的代理，或清空设置页的「固定验证代理」")
+    elif fixed_matched:
+        reason = f"固定验证代理的出口 IP 就是 {target}"
+    elif matched_ports:
+        reason = f"端口 {matched_ports[0]} 的出口 IP 是 {target}"
+    else:
+        reason = f"没有任何端口的出口 IP 等于 {target}"
+    return {
+        "wanted": target,
+        "action": action,
+        "probed": bool(probe_now),
+        "candidates": rows,
+        "matched_ports": matched_ports,
+        "best_port": 0 if fixed_covers else (matched_ports[0] if matched_ports else 0),
+        "fixed_covers": fixed_covers,
+        "fixed_matched": fixed_matched,
+        "fixed_ok": fixed_matched,
+        "ok": bool(probe_now and (fixed_matched or (matched_ports and not fixed_covers))),
+        "reason": reason,
+    }
+
+
+def pin_check_url(cfg: dict, proxy_url: str, cache: dict | None = None) -> dict:
+    """校验某条线现在的出口 IP 是否等于钉住的目标。
+
+    cache 以代理地址为键：一轮复检里几十个号可能都走同一个端口，没缓存
+    就是几十次 ipify 请求——那本身就是在给上游添特征。
+    """
+    expected = normalize_ip(cfg.get("pin_exit_ip"))
+    if not expected:
+        return {"pinned": False, "ok": True, "expected": "", "actual": "",
+                "reason": ""}
+    memo = cache if cache is not None else {}
+    url = str(proxy_url or "")
+    if url not in memo:
+        mihomo = cfg.get("mihomo") or {}
+        try:
+            hit = probe_exit(
+                url, str(mihomo.get("probe_url") or DEFAULTS["mihomo"]["probe_url"]),
+                _float(mihomo.get("timeout"), DEFAULTS["mihomo"]["timeout"], 3.0, 60.0))
+            memo[url] = str(hit.get("exit_ip") or "")
+        except Exception:  # noqa: BLE001 — 探不到 = 不符，绝不带着疑问放行
+            memo[url] = ""
+    actual = memo[url]
+    ok = bool(actual and actual == expected)
+    return {
+        "pinned": True,
+        "ok": ok,
+        "expected": expected,
+        "actual": actual,
+        "reason": "" if ok else f"出口 IP {actual or '探测不到'} ≠ 固定 IP {expected}",
+    }
+
+
+def pin_reselect(cfg: dict, expected: str, cache: dict | None = None) -> dict:
+    """IP 漂移后重新扫一遍端口表，找仍匹配目标 IP 的端口。
+
+    返回 {port, matched_ports, reason, status}。固定验证代理覆盖端口时
+    一律返回 0——换了 exit_port 也不会改变 plan_port 的返回值，那叫假修。
+    """
+    status = pin_status(cfg, wanted=expected, probe_now=True)
+    memo = cache if cache is not None else {}
+    for row in status["candidates"]:
+        if row.get("exit_ip"):
+            memo[row["url"]] = row["exit_ip"]
+    return {
+        "port": status["best_port"],
+        "matched_ports": status["matched_ports"],
+        "reason": status["reason"],
+        "status": status,
+        "cache": memo,
+    }
 
 
 def discover_nodes(cfg: dict | None = None, probe_now: bool = True) -> dict:
@@ -1334,7 +1516,11 @@ def plan_port(cfg: dict, port: int, names: dict | None = None,
     if not port:
         return {"mode": EXIT_DIRECT, "mode_label": EXIT_LABELS[EXIT_DIRECT],
                 "proxy": "", "exit_ip": "", "label": "直连"}
-    url = _proxy_url(str(cfg["mihomo"].get("host") or ""), port)
+    # 和 pin_candidates / port_proxy 用同一个 host 归一化：配置里手填了
+    # `http://host` 时，不能出现「钉 IP 校验探的地址」和「实际请求走的地址」
+    # 字符串不一样的情况，缓存会失效、判定也会对不上。
+    host = _host_only(str(cfg["mihomo"].get("host") or ""))
+    url = _proxy_url(host, port)
     name = str((names or {}).get(port) or "")
     return {
         "mode": EXIT_PORT,
@@ -1385,6 +1571,80 @@ class Runner:
         #: url → 出口 IP。只为结果里那行「出口 IP」服务，探不到就留空。
         self._ips: dict[str, str] = {}
         self._rng = rng
+        #: 钉 IP 闸的状态。probe_url 的探测结果按 URL 缓存：一批里几十个号
+        #: 常常走同一个端口，重复探等于自己给自己加特征。
+        self._pin_cache: dict[str, str] = {}
+        self._pin_scan: dict | None = None
+        self.pin_report: dict = {
+            "expected": "", "checked": 0, "blocked": 0,
+            "reselected": 0, "reselected_ports": [],
+        }
+
+    def _pin_guard(self, row_id: int, plan: dict, port_map: dict) -> dict:
+        """发请求前最后一道闸：确认这一号的真实出口 IP 就是钉住的那个。
+
+        端口只是本地 listener 编号，节点重连 / 订阅更新后出口会漂。这里
+        宁可跳过也不让请求从别的 IP 敲门——那会把「验证这个 IP 干净」
+        变成「又从新 IP 敲了一次」。
+        """
+        check = pin_check_url(self.cfg, plan["proxy"], self._pin_cache)
+        base = {
+            "allowed": True,
+            "proxy": plan["proxy"],
+            "actual": check["actual"] or plan.get("exit_ip") or "",
+            "expected": check["expected"],
+            "reselected": 0,
+            "reason": "",
+        }
+        if not check["pinned"]:
+            return base
+        self.pin_report["checked"] += 1
+        if check["ok"]:
+            return base
+
+        fixed = str(self.cfg.get("verify_proxy") or "").strip()
+        action = self.cfg.get("pin_ip_action") or PIN_RESELECT
+        if action == PIN_RESELECT and not fixed:
+            if self._pin_scan is None:
+                self._pin_scan = pin_reselect(self.cfg, check["expected"],
+                                              self._pin_cache)
+            matched = list(self._pin_scan.get("matched_ports") or [])
+            # 两区隔离：先挑正常区没占用的匹配端口。全被占用时宁可共用一个
+            # 端口，也不能让这一号从错误 IP 出去——IP 才是要控住的变量。
+            try:
+                busy = {int(p) for p in store.exit_ports_in_use("normal") if p}
+            except Exception:  # noqa: BLE001 — 库读不到不该拦住重选
+                busy = set()
+            free = [p for p in matched if p not in busy] or matched
+            if free:
+                port = int(free[0])
+                url = port_proxy(self.cfg, port)
+                self._pin_cache[url] = check["expected"]
+                # 名单上那一列必须跟着改：用户看到的端口就是这一趟真正走的
+                store.set_exit_map([(int(row_id), port)])
+                port_map[int(row_id)] = port
+                self.pin_report["reselected"] += 1
+                if port not in self.pin_report["reselected_ports"]:
+                    self.pin_report["reselected_ports"].append(port)
+                return {
+                    "allowed": True, "proxy": url,
+                    "actual": check["expected"], "expected": check["expected"],
+                    "reselected": port,
+                    "reason": f"已换到端口 {port}（出口 {check['expected']}）",
+                }
+
+        self.pin_report["blocked"] += 1
+        why = ("固定验证代理覆盖了端口" if fixed
+               else "没有仍匹配的端口" if action == PIN_RESELECT
+               else "策略为停手")
+        return {
+            "allowed": False,
+            "proxy": plan["proxy"],
+            "actual": check["actual"],
+            "expected": check["expected"],
+            "reselected": 0,
+            "reason": f"{check['reason']}；{why}",
+        }
 
     def _prepare(self, ports: dict[int, int]) -> None:
         """把本批真要用的端口收拾出来：节点名（一条 HTTP）+ 出口 IP（逐端口探）。
@@ -1441,7 +1701,11 @@ class Runner:
         `force=True` 跳过最小间隔检查（界面上「立即复检」按钮）。
         """
         items = list(pairs)[: self.cfg["batch_limit"]]
-        self._prepare(ports or {})
+        # 拷一份：IP 漂移重选端口时会就地改写，不能把调用方传进来的字典
+        # （自动复检 / 手动复检各有自己的那份）改到一半。
+        port_map = dict(ports or {})
+        self._prepare(port_map)
+        self.pin_report["expected"] = normalize_ip(self.cfg.get("pin_exit_ip"))
         now = int(time.time())
         results: list[dict] = []
 
@@ -1456,6 +1720,9 @@ class Runner:
                         "detail": f"距上次复检不足 {self.cfg['min_interval'] // 60} 分钟（还差 {left} 分）",
                         "raw": "", "status": 0, "endpoint": "", "latency_ms": 0,
                         "proxy": "", "proxy_ip": "", "exit_mode": self.cfg["exit_mode"],
+                        "exit_ip": "", "exit_ip_expected": self.pin_report["expected"],
+                        "exit_ip_ok": True, "pin_reselected": 0,
+                        "attempts": [], "model": "",
                         "checked_at": now,
                     })
                     if on_result:
@@ -1466,13 +1733,39 @@ class Runner:
             if index:
                 time.sleep(self.cfg["gap_seconds"])
 
-            plan = self._plan(row_id, ports)
+            plan = self._plan(row_id, port_map)
+            guard = self._pin_guard(row_id, plan, port_map)
+            if not guard["allowed"]:
+                # 标 skipped 而不是 unknown：没发请求就不该改名单状态、
+                # 不该刷 recheck_count，store.update_recheck 认这个标记。
+                item = {
+                    "id": row_id,
+                    "verdict": probe.RECHECK_SKIPPED,
+                    "skipped": True,
+                    "detail": f"出口 IP 不符，本次请求已阻止：{guard['reason']}",
+                    "raw": "", "status": 0, "endpoint": "", "latency_ms": 0,
+                    "proxy": guard["proxy"],
+                    "proxy_ip": guard["actual"],
+                    "exit_mode": plan["mode"],
+                    "exit_ip": guard["actual"],
+                    "exit_ip_expected": guard["expected"],
+                    "exit_ip_ok": False,
+                    "pin_reselected": 0,
+                    "attempts": [], "model": "",
+                    "checked_at": int(time.time()),
+                }
+                results.append(item)
+                if on_result:
+                    on_result(row_id, acc, item)
+                continue
+
             res = probe.chat_probe(
-                acc, timeout=self.cfg["timeout"], proxy=plan["proxy"],
+                acc, timeout=self.cfg["timeout"], proxy=guard["proxy"],
                 model=self.cfg.get("chat_model", ""),
                 models=self.cfg.get("chat_models") or None,
                 paths=self.cfg.get("chat_paths") or None,
                 max_attempts=self.cfg.get("chat_max_attempts") or 0)
+            actual_ip = guard["actual"] or plan["exit_ip"]
             item = {
                 "id": row_id,
                 "verdict": res["verdict"],
@@ -1482,9 +1775,14 @@ class Runner:
                 "status": res["status"],
                 "endpoint": res["endpoint"],
                 "latency_ms": res["latency_ms"],
-                "proxy": plan["proxy"],
-                "proxy_ip": plan["exit_ip"],
+                "proxy": guard["proxy"],
+                "proxy_ip": actual_ip,
                 "exit_mode": plan["mode"],
+                "exit_ip": actual_ip,
+                "exit_ip_expected": guard["expected"],
+                "exit_ip_ok": (not guard["expected"]
+                               or actual_ip == guard["expected"]),
+                "pin_reselected": guard["reselected"],
                 "checked_at": int(time.time()),
                 # 400 时逐次尝试的模型/路径/上游原话，给界面做「为什么还 400」
                 "attempts": res.get("attempts") or [],

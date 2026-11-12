@@ -238,6 +238,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/recheck/picker":
             self._recheck_picker()
             return
+        if path == "/api/recheck/exit-ip":
+            self._recheck_exit_ip()
+            return
         if path == "/api/activity/config":
             self._activity_config_get()
             return
@@ -1492,6 +1495,31 @@ class Handler(BaseHTTPRequestHandler):
             "track_labels": store.RECHECK_LABELS,
         })
 
+    def _recheck_exit_ip(self) -> None:
+        """「核对当前出口」：列出每个候选端口现在的公网 IP 与匹配情况。
+
+        默认真探（只有点按钮才调这个接口），`probe=0` 只列地址不发包。
+        `ip` 不传就取配置里已经钉住的那个，方便隔天回来复查有没有漂。
+        """
+        query = parse_qs(urlparse(self.path).query)
+        wanted = (query.get("ip") or [""])[0]
+        probe_now = (query.get("probe") or ["1"])[0] != "0"
+        cfg = recheck.load_config()
+        status = recheck.pin_status(cfg, wanted=wanted, probe_now=probe_now)
+        status = dict(status)
+        # 接口层的 ok 恒为 True（请求成功）；探测「有没有匹配」另给一个键，
+        # 免得前端把「没匹配到」误判成接口失败。
+        status["matched"] = status.pop("ok")
+        self._json(200, {
+            "ok": True,
+            **status,
+            "config": {
+                "pin_exit_ip": cfg.get("pin_exit_ip") or "",
+                "pin_ip_action": cfg.get("pin_ip_action") or recheck.PIN_RESELECT,
+                "verify_proxy": cfg.get("verify_proxy") or "",
+            },
+        })
+
     def _recheck_picker(self) -> None:
         """「把账号加进名单」下拉的数据源。
 
@@ -1577,6 +1605,7 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True,
             "written": written,
             "summary": recheck.summarize(results),
+            "pin": runner.pin_report,
             "results": [
                 {
                     "id": item["id"],
@@ -1587,6 +1616,10 @@ class Handler(BaseHTTPRequestHandler):
                     "latency_ms": item["latency_ms"],
                     "proxy": item["proxy"],
                     "proxy_ip": item.get("proxy_ip", ""),
+                    "exit_ip": item.get("exit_ip", ""),
+                    "exit_ip_expected": item.get("exit_ip_expected", ""),
+                    "exit_ip_ok": item.get("exit_ip_ok", True),
+                    "pin_reselected": item.get("pin_reselected", 0),
                     "exit_mode": item.get("exit_mode", ""),
                     "skipped": item.get("skipped", False),
                     "attempts": item.get("attempts") or [],
@@ -1683,6 +1716,23 @@ class Handler(BaseHTTPRequestHandler):
         if mode not in recheck.EXIT_MODES:
             raise ValueError(f"未知的出口模式：{mode}")
 
+        # 按出口 IP 分配：先真探一遍端口表，只认当前出口 IP 等于目标值的
+        # 那些端口。端口是本地编号，节点换线后同一个端口背后可能已经是
+        # 另一条线，光按号码分等于没钉住。
+        pinned_ip = recheck.normalize_ip(payload.get("ip"))
+        status = None
+        pin_ports: list[int] = []
+        if pinned_ip:
+            status = recheck.pin_status(cfg, wanted=pinned_ip, probe_now=True)
+            if status["fixed_covers"] and not status["fixed_matched"]:
+                raise ValueError(status["reason"])
+            if not status["fixed_matched"] and not status["matched_ports"]:
+                raise ValueError(f"没有端口的出口 IP 等于 {pinned_ip}：{status['reason']}")
+            if not status["fixed_matched"]:
+                pin_ports = list(status["matched_ports"])
+                # 多个匹配端口也不能逐号随机：那会让其中几行掉到别的线上。
+                mode = recheck.EXIT_SAME
+
         raw_ports = payload.get("ports")
         if raw_ports is None:
             picked = list(cfg.get("exit_ports") or [])
@@ -1709,20 +1759,39 @@ class Handler(BaseHTTPRequestHandler):
         busy = store.exit_ports_in_use("normal")
         all_ports = recheck.free_ports(
             (n.get("port") or 0 for n in (disc.get("nodes") or [])), busy)
-        picked = recheck.free_ports(picked, busy)
+        if pin_ports:
+            # 匹配端口里优先挑正常区没占用的；全被占用时仍用它——IP 才是
+            # 这一档要控住的变量，退回 all_ports 会把号分到错误出口上。
+            all_ports = recheck.free_ports(pin_ports, busy) or pin_ports
+            picked = [all_ports[0]]
+        else:
+            picked = recheck.free_ports(picked, busy)
         plan = recheck.assign_ports(mode, picked, all_ports, ids)
         if not plan:
             raise ValueError("没有可用端口：先点「自动检测」确认 mihomo 端口能列出来，"
                              "或检查端口是不是都被正常区占用了")
 
         changed = store.set_exit_map(plan)
-        # 勾选状态也存下来：下次打开页面要能看到上次点的是哪几个
-        cfg = recheck.save_config({"exit_mode": mode, "exit_ports": picked})
+        # 勾选状态也存下来：下次打开页面要能看到上次点的是哪几个。
+        # 按 IP 分配时目标 IP 一起落盘，之后每轮复检都会核对它有没有漂。
+        patch = {"exit_mode": mode, "exit_ports": picked}
+        if pinned_ip:
+            patch["pin_exit_ip"] = pinned_ip
+        action = str(payload.get("pin_ip_action") or "").strip().lower()
+        if action in recheck.PIN_ACTIONS:
+            patch["pin_ip_action"] = action
+        cfg = recheck.save_config(patch)
         self._json(200, {
             "ok": True,
             "mode": mode,
             "ports": cfg.get("exit_ports") or [],
             "assigned": changed,
+            "pin": {
+                "wanted": pinned_ip,
+                "matched_ports": (status or {}).get("matched_ports") or [],
+                "fixed_ok": bool(status and status["fixed_matched"]),
+                "reason": (status or {}).get("reason") or "",
+            },
             "rows": store.list_accounts(track=str(payload.get("track") or "banned")),
             "stats": store.recheck_stats(),
         })
@@ -1768,6 +1837,23 @@ class Handler(BaseHTTPRequestHandler):
         # plan_port 会把固定验证代理一起算进来：诊断和真复检必须走同一条线，
         # 否则「诊断通了、复检 400」这种对不上的结果会反复出现。
         proxy = recheck.plan_port(cfg, port)["proxy"]
+        pin = recheck.pin_check_url(cfg, proxy)
+        pin_note = ""
+        pin_port = 0
+        if pin["pinned"] and not pin["ok"]:
+            # 诊断不写库，但也不能因为「只是排查」就从一个没钉住的 IP 敲门。
+            # 允许重选的档位临时换到匹配端口，并在响应里提示用户写回名单。
+            if (cfg.get("pin_ip_action") == recheck.PIN_RESELECT
+                    and not str(cfg.get("verify_proxy") or "").strip()):
+                scan = recheck.pin_reselect(cfg, pin["expected"])
+                if not scan["port"]:
+                    raise ValueError("单号诊断被固定出口 IP 拦下：" + scan["reason"])
+                pin_port = int(scan["port"])
+                proxy = recheck.port_proxy(cfg, pin_port)
+                pin_note = (f"出口 IP 漂了，本次诊断临时改走端口 {pin_port}"
+                            f"（出口 {pin['expected']}）；点「按这个 IP 分配出口」写回名单")
+            else:
+                raise ValueError("单号诊断被固定出口 IP 拦下：" + pin["reason"])
         if proxy:
             acc.proxy = proxy
         res = probe.chat_probe(
@@ -1784,7 +1870,14 @@ class Handler(BaseHTTPRequestHandler):
                 "chat_models": cfg.get("chat_models", ""),
                 "chat_paths": cfg.get("chat_paths", ""),
                 "chat_max_attempts": cfg.get("chat_max_attempts", 0),
-                "exit_port": port,
+                "exit_port": pin_port or port,
+                "proxy": proxy,
+            },
+            "pin": {
+                "expected": pin["expected"],
+                "actual": pin["actual"],
+                "ok": pin["ok"],
+                "note": pin_note,
             },
             "result": res,
         })
@@ -1982,7 +2075,10 @@ def _auto_recheck_once() -> None:
         if not rows:
             return
         pairs = store.load_for_probe(ids=[r["id"] for r in rows])
-        results = recheck.Runner(cfg).run(pairs)
+        # 手动复检传了 port_map，自动复检以前没传，结果所有号都按 port=0
+        # 走直连 / 固定代理，名单里配的出口在定时任务里等于没生效。
+        port_map = store.exit_ports_of([row_id for row_id, _ in pairs])
+        results = recheck.Runner(cfg).run(pairs, ports=port_map)
         written = store.update_recheck(results)
         stats = recheck.summarize(results)
         print(f"[auto-recheck] {today} 复检 {written} 个，"

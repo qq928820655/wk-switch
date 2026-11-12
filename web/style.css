@@ -2272,3 +2272,50 @@ div[id^="view-"].hidden { display: none !important; }
 .backup-scope.bad { color: var(--bad); border-color: #f2c9c9; background: #fff7f7; }
 /* 范围变了之后旧下载链接不能再看起来像最新结果 */
 #backup-downloads.stale { opacity: .5; }
+
+/* ---------- 固定出口 IP ----------
+   和「单一出口 / 随机出口」并列的第三块，但不是第三档模式：它是叠加约束，
+   两档都生效，所以用浅色内框而不是另一个分段按钮。 */
+.rc-pin-box {
+  margin-top: 14px;
+  padding: 14px 16px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 11px;
+  background: #fbfcff;
+}
+.rc-pin-box .card-head { margin-bottom: 8px; }
+.rc-pin-box h3 { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rc-pin-box .rc-grid { padding: 2px 0 8px; }
+.rc-pin-box .field input,
+.rc-pin-box .field select {
+  width: 100%;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+}
+.rc-pin-box .field input:focus,
+.rc-pin-box .field select:focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, .1);
+}
+.rc-pin-box #rc-pin-ip {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.rc-pin-box .export-bar { margin-top: 4px; }
+.rc-pin-box #rc-pin-hint { flex: 1 1 240px; }
+
+@media (max-width: 720px) {
+  .rc-pin-box { padding: 12px; }
+  .rc-pin-box .card-head { display: block; }
+  .rc-pin-box .card-head .hint { display: block; margin-top: 4px; }
+  .rc-pin-box .rc-grid { grid-template-columns: 1fr; gap: 10px; }
+  /* 窄屏三个按钮各占一行：两列并排时「按这个 IP 分配出口」会被折成两行，
+     看着像文字被截断 */
+  .rc-pin-box .export-bar .btn { flex: 1 1 100%; }
+  .rc-pin-box #rc-pin-hint { flex-basis: 100%; }
+}

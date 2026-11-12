@@ -195,5 +195,52 @@ class LoginExitPickLayoutTest(unittest.TestCase):
                       "窄屏并排会把端口名挤掉")
 
 
+class PinIpLayoutTest(unittest.TestCase):
+    """固定出口 IP：手填 + 检测下拉 + 策略 + 三个动作，少一个就退化成按端口。"""
+
+    def test_exit_card_has_pin_controls(self):
+        html = read(INDEX)
+        for needle in ('id="rc-pin-ip"', 'id="rc-pin-ip-pick"',
+                       'id="rc-pin-action"', 'id="btn-rc-pin-check"',
+                       'id="btn-rc-pin-assign"', 'id="btn-rc-pin-clear"',
+                       'id="rc-pin-hint"', 'value="reselect"', 'value="block"'):
+            self.assertIn(needle, html, f"复检出口卡少了 {needle}")
+
+    def test_app_wires_pin_endpoints_and_result_line(self):
+        app = read(APP)
+        for needle in ("'/api/recheck/exit-ip?'", "function renderPinIpOptions(",
+                       "async function checkPinIp()", "async function assignPinIp()",
+                       "async function clearPinIp()", "pin_exit_ip:",
+                       "pin_ip_action:", "data.matched_ports",
+                       "fixed_ok", "r.exit_ip_ok === false", "pin.reselected",
+                       "const blocked = (data.pin || {}).blocked || 0;",
+                       "出口 IP 不符 / 其余未到间隔",
+                       "$('#btn-rc-pin-assign').addEventListener('click'"):
+            self.assertIn(needle, app, f"前端少接了 {needle}")
+        i = app.index("async function assignPinIp()")
+        self.assertIn("ip,", app[i:i + 500], "按 IP 分配没把目标 IP 传给后端")
+        self.assertIn("renderPinIpOptions(recheckState.nodes);", app,
+                      "检测完节点表没刷新出口 IP 下拉")
+
+    def test_server_wires_pin_route_and_report(self):
+        srv = read(SERVER)
+        for needle in ('if path == "/api/recheck/exit-ip":',
+                       "def _recheck_exit_ip(self)",
+                       'status["matched"] = status.pop("ok")',
+                       '"pin": runner.pin_report',
+                       '"pin_exit_ip"] = pinned_ip',
+                       "port_map = store.exit_ports_of("):
+            self.assertIn(needle, srv, f"后端少了 {needle}")
+
+    def test_css_keeps_pin_box_readable_on_mobile(self):
+        css = read(CSS)
+        self.assertIn(".rc-pin-box {", css)
+        self.assertIn(".rc-pin-box .rc-grid { grid-template-columns: 1fr;", css,
+                      "窄屏两列会把 IP 输入框挤到看不见")
+        self.assertIn(".rc-pin-box .field select {", css)
+        self.assertIn(".rc-pin-box .export-bar .btn { flex: 1 1 100%; }", css,
+                      "窄屏按钮并排会把文案折成两行")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

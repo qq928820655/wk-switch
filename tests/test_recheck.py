@@ -1805,5 +1805,292 @@ class OfficialChatShapeTests(unittest.TestCase):
                          "http://127.0.0.1:7891")
 
 
+class PinIpTests(unittest.TestCase):
+    """固定出口 IP：配置、候选探测、每号请求前的漂移闸、接口联动。
+
+    核心口径：端口只是本机编号，节点换线后同一个端口背后的公网 IP 会变。
+    钉了 IP 就必须**每号发请求前**核对真实出口，探不到也按不符处理，
+    绝不能带着疑问敲门。
+    """
+
+    def _cfg(self, **kw):
+        cfg = json.loads(json.dumps(recheck.DEFAULTS))
+        cfg["enabled"] = True
+        cfg["mihomo"]["host"] = "127.0.0.1"
+        cfg["mihomo"]["ports"] = "17901-17903"
+        # _prepare 里不再去探节点名 / 出口 IP，测试只盯 IP 闸本身
+        cfg["mihomo"]["enabled"] = False
+        cfg.update(kw)
+        return cfg
+
+    @staticmethod
+    def _res():
+        return {"verdict": probe.RECHECK_REVIVED, "detail": "通了", "raw": "",
+                "status": 200, "endpoint": "u", "latency_ms": 1,
+                "attempts": [], "model": ""}
+
+    @staticmethod
+    def _exit(url, ip):
+        return {"url": url, "ok": bool(ip), "exit_ip": ip,
+                "latency_ms": 1, "error": "" if ip else "timeout"}
+
+    def test_normalize_ip(self):
+        self.assertEqual(recheck.normalize_ip(" 1.2.3.4 "), "1.2.3.4")
+        self.assertEqual(recheck.normalize_ip("2001:0db8::1"), "2001:db8::1")
+        for bad in ("", "abc", "1.2.3.4:8080", "001.2.3.4", "999.1.1.1",
+                    "example.com", None):
+            self.assertEqual(recheck.normalize_ip(bad), "", f"{bad!r} 不该算 IP")
+
+    def test_config_coerces_pin_fields(self):
+        cfg = recheck._coerce(self._cfg(pin_exit_ip="not-an-ip",
+                                        pin_ip_action="whatever"))
+        self.assertEqual(cfg["pin_exit_ip"], "")
+        self.assertEqual(cfg["pin_ip_action"], recheck.PIN_RESELECT)
+        cfg = recheck._coerce(self._cfg(pin_exit_ip="8.8.8.8",
+                                        pin_ip_action="block"))
+        self.assertEqual(cfg["pin_exit_ip"], "8.8.8.8")
+        self.assertEqual(cfg["pin_ip_action"], "block")
+
+    def test_config_save_and_reload_pin(self):
+        with tempfile.TemporaryDirectory(prefix="wk-pin-") as tmp:
+            with mock.patch.object(recheck, "CONFIG_PATH",
+                                   os.path.join(tmp, "recheck.json")):
+                recheck.save_config({"pin_exit_ip": "8.8.8.8",
+                                     "pin_ip_action": "block"})
+                cfg = recheck.load_config()
+        self.assertEqual(cfg["pin_exit_ip"], "8.8.8.8")
+        self.assertEqual(cfg["pin_ip_action"], "block")
+
+    def test_candidates_include_fixed_and_ports(self):
+        cfg = self._cfg(verify_proxy="http://127.0.0.1:7891")
+        rows = recheck.pin_candidates(cfg)
+        self.assertEqual(rows[0], {"port": 0, "url": "http://127.0.0.1:7891",
+                                   "kind": "fixed"})
+        self.assertEqual([r["port"] for r in rows[1:]], [17901, 17902, 17903])
+
+    def test_host_with_scheme_matches_plan_port(self):
+        """host 写成 http://host 时，钉 IP 探的地址必须和真请求的地址一样。"""
+        cfg = self._cfg()
+        cfg["mihomo"]["host"] = "http://127.0.0.1"
+        url = recheck.plan_port(cfg, 17901)["proxy"]
+        self.assertEqual(url, "http://127.0.0.1:17901")
+        self.assertIn(url, [r["url"] for r in recheck.pin_candidates(cfg)])
+
+    def test_pin_status_picks_matching_ports(self):
+        cfg = self._cfg()
+        with mock.patch.object(recheck, "probe_urls", side_effect=lambda urls, *_a, **_k: [
+                self._exit(u, "1.2.3.4" if u.endswith(("17902", "17903")) else "9.9.9.9")
+                for u in urls]):
+            status = recheck.pin_status(cfg, wanted="1.2.3.4", probe_now=True)
+        self.assertEqual(status["matched_ports"], [17902, 17903])
+        self.assertEqual(status["best_port"], 17902)
+        self.assertTrue(status["ok"])
+        self.assertFalse(status["fixed_covers"])
+
+    def test_pin_status_fixed_proxy_covers_ports(self):
+        cfg = self._cfg(verify_proxy="http://127.0.0.1:7891")
+        with mock.patch.object(recheck, "probe_urls", side_effect=lambda urls, *_a, **_k: [
+                self._exit(u, "9.9.9.9") for u in urls]):
+            status = recheck.pin_status(cfg, wanted="1.2.3.4", probe_now=True)
+        self.assertTrue(status["fixed_covers"])
+        self.assertFalse(status["fixed_matched"])
+        self.assertEqual(status["best_port"], 0)
+        self.assertIn("换端口无效", status["reason"])
+
+    def test_pin_status_fixed_proxy_matches(self):
+        cfg = self._cfg(verify_proxy="http://127.0.0.1:7891")
+        with mock.patch.object(recheck, "probe_urls", side_effect=lambda urls, *_a, **_k: [
+                self._exit(u, "1.2.3.4" if u == "http://127.0.0.1:7891" else "9.9.9.9")
+                for u in urls]):
+            status = recheck.pin_status(cfg, wanted="1.2.3.4", probe_now=True)
+        self.assertTrue(status["fixed_ok"])
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["best_port"], 0)
+
+    def test_pin_check_url_caches_and_fails_closed(self):
+        cfg = self._cfg(pin_exit_ip="1.2.3.4")
+        cache: dict = {}
+        with mock.patch.object(recheck, "probe_exit",
+                               return_value=self._exit("u", "")) as called:
+            one = recheck.pin_check_url(cfg, "u", cache)
+            two = recheck.pin_check_url(cfg, "u", cache)
+        self.assertFalse(one["ok"])
+        self.assertFalse(two["ok"])
+        self.assertEqual(called.call_count, 1, "同一条线一轮只该探一次")
+        with mock.patch.object(recheck, "probe_exit",
+                               return_value=self._exit("u", "1.2.3.4")):
+            self.assertTrue(recheck.pin_check_url(cfg, "u", {})["ok"])
+
+    def test_runner_allows_matching_ip(self):
+        cfg = self._cfg(pin_exit_ip="1.2.3.4")
+        with mock.patch.object(recheck, "_fetch_listeners", return_value=({}, "")), \
+             mock.patch.object(recheck, "probe_exit",
+                               return_value=self._exit("u", "1.2.3.4")), \
+             mock.patch.object(recheck.probe, "chat_probe",
+                               return_value=self._res()) as chat:
+            runner = recheck.Runner(cfg)
+            out = runner.run([(1, acc())], force=True, ports={1: 17901})
+        self.assertEqual(chat.call_args.kwargs["proxy"],
+                         "http://127.0.0.1:17901")
+        self.assertTrue(out[0]["exit_ip_ok"])
+        self.assertEqual(out[0]["exit_ip"], "1.2.3.4")
+        self.assertEqual(runner.pin_report["blocked"], 0)
+
+    def test_runner_reselects_drifted_port(self):
+        cfg = self._cfg(pin_exit_ip="1.2.3.4")
+        fake_exit = lambda url, *_a, **_k: self._exit(
+            url, "1.2.3.4" if url.endswith("17902") else "9.9.9.9")
+        with mock.patch.object(recheck, "_fetch_listeners", return_value=({}, "")), \
+             mock.patch.object(recheck, "probe_exit", side_effect=fake_exit), \
+             mock.patch.object(recheck, "probe_urls",
+                               side_effect=lambda urls, *_a, **_k: [
+                                   fake_exit(u) for u in urls]), \
+             mock.patch.object(recheck.store, "exit_ports_in_use", return_value=[]), \
+             mock.patch.object(recheck.store, "set_exit_map", return_value=1) as setmap, \
+             mock.patch.object(recheck.probe, "chat_probe",
+                               return_value=self._res()) as chat:
+            runner = recheck.Runner(cfg)
+            out = runner.run([(1, acc())], force=True, ports={1: 17901})
+        self.assertEqual(chat.call_args.kwargs["proxy"],
+                         "http://127.0.0.1:17902")
+        self.assertEqual(setmap.call_args.args[0], [(1, 17902)])
+        self.assertEqual(out[0]["pin_reselected"], 17902)
+        self.assertTrue(out[0]["exit_ip_ok"])
+        self.assertEqual(runner.pin_report["reselected"], 1)
+
+    def test_runner_block_does_not_send_request(self):
+        cfg = self._cfg(pin_exit_ip="1.2.3.4", pin_ip_action="block")
+        with mock.patch.object(recheck, "_fetch_listeners", return_value=({}, "")), \
+             mock.patch.object(recheck, "probe_exit",
+                               return_value=self._exit("u", "9.9.9.9")), \
+             mock.patch.object(recheck.probe, "chat_probe",
+                               return_value=self._res()) as chat:
+            runner = recheck.Runner(cfg)
+            out = runner.run([(1, acc())], force=True, ports={1: 17901})
+        chat.assert_not_called()
+        self.assertTrue(out[0]["skipped"])
+        self.assertFalse(out[0]["exit_ip_ok"])
+        self.assertIn("阻止", out[0]["detail"])
+        self.assertEqual(runner.pin_report["blocked"], 1)
+
+    def test_runner_fixed_proxy_never_fakes_reselect(self):
+        cfg = self._cfg(pin_exit_ip="1.2.3.4",
+                        verify_proxy="http://127.0.0.1:7891")
+        with mock.patch.object(recheck, "_fetch_listeners", return_value=({}, "")), \
+             mock.patch.object(recheck, "probe_exit",
+                               return_value=self._exit("u", "9.9.9.9")), \
+             mock.patch.object(recheck, "pin_reselect") as scan, \
+             mock.patch.object(recheck.store, "set_exit_map") as setmap, \
+             mock.patch.object(recheck.probe, "chat_probe",
+                               return_value=self._res()) as chat:
+            out = recheck.Runner(cfg).run([(1, acc())], force=True,
+                                         ports={1: 17901})
+        scan.assert_not_called()
+        setmap.assert_not_called()
+        chat.assert_not_called()
+        self.assertTrue(out[0]["skipped"])
+        self.assertIn("固定验证代理", out[0]["detail"])
+
+    def test_runner_without_pin_never_probes_ip(self):
+        cfg = self._cfg()
+        with mock.patch.object(recheck, "_fetch_listeners", return_value=({}, "")), \
+             mock.patch.object(recheck, "probe_exit") as called, \
+             mock.patch.object(recheck.probe, "chat_probe",
+                               return_value=self._res()):
+            out = recheck.Runner(cfg).run([(1, acc())], force=True,
+                                         ports={1: 17901})
+        called.assert_not_called()
+        self.assertTrue(out[0]["exit_ip_ok"])
+        self.assertEqual(out[0]["exit_ip_expected"], "")
+
+    def test_exit_ip_endpoint_renames_match_flag(self):
+        import server
+
+        class Fake:
+            path = "/api/recheck/exit-ip?ip=1.2.3.4&probe=1"
+
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        status = {"wanted": "1.2.3.4", "action": "reselect", "probed": True,
+                  "candidates": [], "matched_ports": [17902], "best_port": 17902,
+                  "fixed_covers": False, "fixed_matched": False,
+                  "fixed_ok": False, "ok": True, "reason": "匹配"}
+        fake = Fake()
+        with mock.patch.object(server.recheck, "load_config", return_value=self._cfg()), \
+             mock.patch.object(server.recheck, "pin_status", return_value=status):
+            server.Handler._recheck_exit_ip(fake)
+        self.assertTrue(fake.out[1]["ok"], "接口成功不能被探测结果覆盖")
+        self.assertTrue(fake.out[1]["matched"])
+        self.assertEqual(fake.out[1]["matched_ports"], [17902])
+
+    def test_assign_by_ip_writes_same_port_to_every_row(self):
+        import server
+
+        class Fake:
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        status = {"wanted": "1.2.3.4", "action": "reselect", "probed": True,
+                  "candidates": [], "matched_ports": [17902, 17903],
+                  "best_port": 0, "fixed_covers": False, "fixed_matched": False,
+                  "fixed_ok": False, "ok": True, "reason": "匹配"}
+        fake = Fake()
+        with mock.patch.object(server.recheck, "load_config", return_value=self._cfg()), \
+             mock.patch.object(server.recheck, "pin_status", return_value=status), \
+             mock.patch.object(server.recheck, "discover_nodes",
+                               return_value={"nodes": [{"port": 17901}]}), \
+             mock.patch.object(server.store, "recheck_ids", return_value=[1, 2]), \
+             mock.patch.object(server.store, "exit_ports_in_use", return_value=[]), \
+             mock.patch.object(server.store, "set_exit_map", return_value=2) as setmap, \
+             mock.patch.object(server.recheck, "save_config",
+                               side_effect=lambda patch: {**self._cfg(), **patch}) as save, \
+             mock.patch.object(server.store, "list_accounts", return_value=[]), \
+             mock.patch.object(server.store, "recheck_stats", return_value={}):
+            server.Handler._recheck_assign(fake, {"ip": "1.2.3.4"})
+        self.assertEqual(setmap.call_args.args[0], [(1, 17902), (2, 17902)])
+        self.assertEqual(save.call_args.args[0]["pin_exit_ip"], "1.2.3.4")
+        self.assertEqual(save.call_args.args[0]["exit_mode"], recheck.EXIT_SAME)
+        self.assertEqual(fake.out[1]["mode"], "same")
+
+    def test_assign_by_ip_without_match_fails(self):
+        import server
+
+        class Fake:
+            def _json(self, status, data):
+                self.out = (status, data)
+
+        status = {"wanted": "1.2.3.4", "action": "reselect", "probed": True,
+                  "candidates": [], "matched_ports": [], "best_port": 0,
+                  "fixed_covers": False, "fixed_matched": False,
+                  "fixed_ok": False, "ok": False, "reason": "没有端口匹配"}
+        with mock.patch.object(server.recheck, "load_config", return_value=self._cfg()), \
+             mock.patch.object(server.recheck, "pin_status", return_value=status):
+            with self.assertRaises(ValueError):
+                server.Handler._recheck_assign(Fake(), {"ip": "1.2.3.4"})
+
+    def test_auto_recheck_passes_port_map(self):
+        """自动复检以前不传 ports，名单里配的出口在定时任务里等于没生效。"""
+        import datetime
+        import server
+
+        cfg = self._cfg(auto=True, auto_hour=3)
+        with mock.patch.object(server, "_auto_state", {"last_day": ""}), \
+             mock.patch.object(server.clock, "dt",
+                               return_value=datetime.datetime(2026, 11, 12, 4, 0)), \
+             mock.patch.object(server.recheck, "load_config", return_value=cfg), \
+             mock.patch.object(server.store, "list_accounts",
+                               return_value=[{"id": 1}]), \
+             mock.patch.object(server.store, "load_for_probe",
+                               return_value=[(1, acc())]), \
+             mock.patch.object(server.store, "exit_ports_of",
+                               return_value={1: 17901}), \
+             mock.patch.object(server.store, "update_recheck", return_value=0), \
+             mock.patch.object(server.recheck.Runner, "run",
+                               return_value=[]) as run:
+            server._auto_recheck_once()
+        self.assertEqual(run.call_args.kwargs["ports"], {1: 17901})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

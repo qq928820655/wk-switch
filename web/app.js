@@ -2179,6 +2179,9 @@ const recheckState = {
   //: 池子里的全部节点（含没分到端口的），卡片上的「改」用它列候选。
   //: {ok, nodes: [{name, port, delay_ms, pinned, kind}], error}
   pool: null,
+  //: 累计检测到的出口 IP → 端口列表。保存设置会用未探测的节点表重绘一次，
+  //: 不能把之前测出来的 IP 从下拉里冲掉。
+  pinIps: new Map(),
 };
 
 async function loadRecheck() {
@@ -2221,6 +2224,10 @@ function fillRecheckForm(cfg, disc) {
   $('#rc-timeout').value = Math.round(cfg.timeout || 25);
   $('#rc-auto-hour').value = cfg.auto_hour ?? 3;
   $('#rc-verify-proxy').value = cfg.verify_proxy || '';
+  // 固定出口 IP：钉的是公网 IP，不是端口。非法值后端会清成空串，
+  // 保存时把这件事说给用户，别让他以为已经钉上了。
+  $('#rc-pin-ip').value = cfg.pin_exit_ip || '';
+  $('#rc-pin-action').value = cfg.pin_ip_action === 'block' ? 'block' : 'reselect';
   $('#rc-model').value = cfg.chat_model || 'deepseek-v4.1-flash';
   $('#rc-models').value = cfg.chat_models || '';
   $('#rc-paths').value = cfg.chat_paths || '';
@@ -2264,9 +2271,133 @@ function currentExitMode() {
   return on ? on.value : 'random';
 }
 
+/* ---------- 固定出口 IP ----------
+   端口是本机 listener 编号，节点重连 / 订阅更新后背后的公网出口会变。
+   这里让用户按 IP 钉：分配时只挑当前出口 IP 等于目标值的端口，之后每轮
+   复检发请求前再核一次，漂了按策略换回匹配端口或停手。 */
+
+function pinIpValue() {
+  const el = $('#rc-pin-ip');
+  return el ? el.value.trim() : '';
+}
+
+function pinHint(text, bad) {
+  const el = $('#rc-pin-hint');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('bad', !!bad);
+}
+
+/** 检测完节点表后把出口 IP 去重列进下拉，同一个 IP 挂多个端口就一起标上。 */
+function renderPinIpOptions(nodes) {
+  const sel = $('#rc-pin-ip-pick');
+  if (!sel) return;
+  // 只累加 IP，不重建表：保存设置 / 切档会用「未探测」的节点表重绘，
+  // 那批节点没有 exit_ip，重建会把已经测到的 IP 全冲掉。
+  const groups = recheckState.pinIps;
+  (nodes || []).forEach((n) => {
+    const ip = String(n.exit_ip || '').trim();
+    if (!ip) return;
+    if (!groups.has(ip)) groups.set(ip, []);
+    if (n.port && !groups.get(ip).includes(Number(n.port))) {
+      groups.get(ip).push(Number(n.port));
+    }
+  });
+  const current = pinIpValue();
+  let html = groups.size
+    ? '<option value="">从检测到的出口 IP 里选…</option>'
+    : '<option value="">点「自动检测」后可从出口 IP 里选</option>';
+  groups.forEach((ports, ip) => {
+    const tail = ports.length
+      ? ` · 端口 ${ports.slice(0, 3).join(' / ')}${ports.length > 3 ? '…' : ''}`
+      : '';
+    html += `<option value="${esc(ip)}">${esc(ip + tail)}</option>`;
+  });
+  sel.innerHTML = html;
+  if (current && groups.has(current)) sel.value = current;
+}
+
+async function checkPinIp() {
+  const ip = pinIpValue();
+  if (!ip) { pinHint('先填目标出口 IP，或从下拉里选一个', true); return; }
+  const btn = $('#btn-rc-pin-check');
+  btn.disabled = true;
+  btn.textContent = '核对中…';
+  try {
+    const data = await apiGet('/api/recheck/exit-ip?' + new URLSearchParams({ ip, probe: '1' }));
+    if (!data.wanted) {
+      pinHint('IP 格式不对：只收 IPv4 / IPv6 字面量，例如 1.2.3.4', true);
+      return;
+    }
+    const ports = data.matched_ports || [];
+    let line;
+    if (data.fixed_ok) line = `固定验证代理的出口就是 ${ip}，所有行天然钉住`;
+    else if (data.fixed_covers) line = data.reason;
+    else if (ports.length) line = `匹配 ${ports.length} 个端口：${ports.slice(0, 4).join(' / ')}`
+      + `${ports.length > 4 ? '…' : ''}；分配后全部走 ${ports[0]}`;
+    else line = data.reason || '没有端口匹配这个 IP';
+    pinHint(line, !data.matched);
+  } catch (err) {
+    pinHint('核对失败：' + err.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '核对当前出口';
+  }
+}
+
+async function assignPinIp() {
+  const ip = pinIpValue();
+  if (!ip) { pinHint('先填目标出口 IP，或从下拉里选一个', true); return; }
+  const btn = $('#btn-rc-pin-assign');
+  btn.disabled = true;
+  btn.textContent = '探测并分配中…';
+  try {
+    const data = await api('/api/recheck/assign', {
+      ip,
+      track: recheckState.track,
+      pin_ip_action: $('#rc-pin-action').value,
+    });
+    const pin = data.pin || {};
+    recheckState.picked = new Set((data.ports || []).map(Number).filter(Boolean));
+    recheckState.rows = data.rows || [];
+    renderNodes(recheckState.nodes, recheckState.probed);
+    renderRecheckTable();
+    renderTrackCounts(data.stats);
+    const tail = pin.fixed_ok
+      ? '固定验证代理本身就是这个出口，端口保持原样'
+      : `名单所有行改走端口 ${(data.ports || []).join(' / ') || '—'}`;
+    pinHint(`已钉住 ${ip}：${tail}；之后每轮复检发请求前都会核对出口 IP`, false);
+    toast('已按出口 IP 分配');
+  } catch (err) {
+    pinHint('分配失败：' + err.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '按这个 IP 分配出口';
+  }
+}
+
+async function clearPinIp() {
+  const btn = $('#btn-rc-pin-clear');
+  btn.disabled = true;
+  try {
+    const data = await api('/api/recheck/config', { config: { pin_exit_ip: '' } });
+    $('#rc-pin-ip').value = '';
+    renderPinIpOptions(recheckState.nodes);
+    if (data.config) recheckState.cfg = data.config;
+    pinHint('已取消固定出口 IP：复检恢复按端口走，不再核对出口 IP', false);
+    toast('已取消固定出口 IP');
+  } catch (err) {
+    pinHint('取消失败：' + err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderNodes(nodes, probed, pool) {
   recheckState.nodes = nodes || [];
   recheckState.probed = !!probed;
+  // 节点表一变，出口 IP 下拉也跟着变；检测完立刻能选到刚测出来的 IP。
+  renderPinIpOptions(recheckState.nodes);
   // pool 传 undefined 表示「这次没带」，保留上一次的候选表——重渲染卡片
   // 不该把已经拿到的节点列表清空。
   if (pool !== undefined) recheckState.pool = pool || null;
@@ -2653,6 +2784,10 @@ async function saveRecheckCfg() {
     auto_hour: Number($('#rc-auto-hour').value) || 0,
     // 固定验证代理：留空 = 按每行 exit_port 走，填了覆盖全部行
     verify_proxy: $('#rc-verify-proxy').value.trim(),
+    // 固定出口 IP：留空 = 不钉 IP。策略跟着一起存，不然点了「按 IP 分配」
+    // 之后再去保存设置会把 block 覆写回默认值。
+    pin_exit_ip: $('#rc-pin-ip').value.trim(),
+    pin_ip_action: $('#rc-pin-action').value,
     // 裸模型名。留空时后端回默认值，不在这里硬编码第二份
     chat_model: $('#rc-model').value.trim(),
     // 留空 = 后端用内置链（含国际版 -sg 别名），不在这里复制一份默认值
@@ -2668,12 +2803,17 @@ async function saveRecheckCfg() {
       pool_token: $('#rc-pool-token').value.trim(),
     },
   };
+  const askedPin = $('#rc-pin-ip').value.trim();
   const data = await api('/api/recheck/config', { config: cfg });
   recheckState.cfg = data.config;
   fillRecheckForm(data.config, data.nodes);
   renderTrackCounts(data.stats);
   $('#rc-save-hint').textContent = `已保存 · ${bjTime(Date.now() / 1000)}`;
-  toast('复检设置已保存');
+  if (askedPin && !data.config.pin_exit_ip) {
+    toast('目标出口 IP 格式不对，已忽略（只收 IPv4 / IPv6 字面量）', true);
+  } else {
+    toast('复检设置已保存');
+  }
 }
 
 async function detectNodes() {
@@ -2807,7 +2947,15 @@ async function runRecheck(force, ids) {
       `凭据失效 ${s.auth || 0}`,
       `未确认 ${s.unknown || 0}`,
     ];
-    if (s.skipped) bits.push(`跳过 ${s.skipped}（未到间隔）`);
+    if (s.skipped) {
+      // 跳过有两种原因：最小间隔没到、出口 IP 不符被闸挡下。全写成
+      // 「未到间隔」会让人以为等六小时就好，实际是节点换线了。
+      const blocked = (data.pin || {}).blocked || 0;
+      const why = !blocked ? '未到间隔'
+        : blocked >= s.skipped ? '出口 IP 不符'
+        : `${blocked} 个出口 IP 不符 / 其余未到间隔`;
+      bits.push(`跳过 ${s.skipped}（${why}）`);
+    }
     // 出口 IP 一起报：判断「封的是号还是 IP」全靠这一行，翻进去看列表是看不出来的
     const ips = [...new Set((data.results || []).map((r) => r.proxy_ip).filter(Boolean))];
     let line = `本轮 ${data.written} 个：` + bits.join(' · ');
@@ -2818,8 +2966,22 @@ async function runRecheck(force, ids) {
     // 固定验证代理也印出来：核对「这一趟是不是真从 7891 出去的」不用翻日志
     const prox = [...new Set((data.results || []).map((r) => r.proxy).filter(Boolean))];
     if (prox.length) line += ` ｜ 代理 ${prox.slice(0, 2).join(' / ')}`;
+    // 钉住 IP 后，拦下 / 自动换端口都必须在结果区明说：只写「本轮 0 个」
+    // 用户会以为复检没跑，实际是出口漂了被闸挡住。
+    const pin = data.pin || {};
+    if (pin.expected) {
+      line += ` ｜ 固定 IP ${pin.expected}：`
+        + (pin.blocked ? `拦下 ${pin.blocked} 个` : '全部匹配');
+      if (pin.reselected) {
+        line += ` · 自动换回端口 ${(pin.reselected_ports || []).join(' / ')}`
+          + `（${pin.reselected} 个）`;
+      }
+    }
+    const refused = (data.results || []).filter((r) => r.exit_ip_ok === false);
+    if (refused.length) line += ` ｜ ${refused[0].detail}`;
     out.textContent = line;
     if (!s.revived && (s.banned || s.unknown)) out.classList.add('bad');
+    if (pin.blocked) out.classList.add('bad');
     await loadRecheckRows();
   } catch (err) {
     out.classList.add('bad');
@@ -3075,6 +3237,25 @@ function bind() {
   });
   $('#btn-rc-detect').addEventListener('click', () => {
     detectNodes().catch((err) => toast(err.message, true));
+  });
+  // 固定出口 IP：下拉选中的 IP 直接填进输入框，手填时下拉回到占位，
+  // 两边不会互相覆盖。
+  $('#rc-pin-ip-pick').addEventListener('change', (e) => {
+    if (e.target.value) $('#rc-pin-ip').value = e.target.value;
+  });
+  $('#rc-pin-ip').addEventListener('input', () => {
+    const sel = $('#rc-pin-ip-pick');
+    const value = pinIpValue();
+    if (sel && ![...sel.options].some((o) => o.value === value)) sel.value = '';
+  });
+  $('#btn-rc-pin-check').addEventListener('click', () => {
+    checkPinIp().catch((err) => pinHint(err.message, true));
+  });
+  $('#btn-rc-pin-assign').addEventListener('click', () => {
+    assignPinIp().catch((err) => pinHint(err.message, true));
+  });
+  $('#btn-rc-pin-clear').addEventListener('click', () => {
+    clearPinIp().catch((err) => pinHint(err.message, true));
   });
   $('#btn-rc-run').addEventListener('click', () => {
     runRecheck(false).catch((err) => toast(err.message, true));

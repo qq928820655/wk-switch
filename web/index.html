@@ -729,6 +729,36 @@
         点了几条就只在这几条里随机。同一张卡片再点一次取消。
       </p>
     </div>
+
+    <div class="rc-pin-box">
+      <div class="card-head">
+        <h3>固定出口 IP</h3>
+        <span class="hint">端口只是本机编号，节点换线后出口 IP 会漂；这里按公网 IP 钉住，每个号发请求前先核对</span>
+      </div>
+      <div class="rc-grid">
+        <label class="field">
+          <span>目标出口 IP</span>
+          <input type="text" id="rc-pin-ip" spellcheck="false" autocomplete="off"
+                 placeholder="1.2.3.4">
+          <select id="rc-pin-ip-pick" aria-label="从检测到的出口 IP 里选一个">
+            <option value="">点「自动检测」后可从出口 IP 里选</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>IP 漂了以后</span>
+          <select id="rc-pin-action">
+            <option value="reselect">自动换回匹配端口</option>
+            <option value="block">停手，不发出请求</option>
+          </select>
+        </label>
+      </div>
+      <div class="export-bar">
+        <button class="btn" id="btn-rc-pin-check">核对当前出口</button>
+        <button class="btn primary" id="btn-rc-pin-assign">按这个 IP 分配出口</button>
+        <button class="btn ghost" id="btn-rc-pin-clear">取消固定</button>
+        <span class="hint" id="rc-pin-hint">留空 = 不钉 IP，仍按端口分配</span>
+      </div>
+    </div>
   </section>
 
   <section class="card">
