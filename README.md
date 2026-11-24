@@ -26,7 +26,7 @@
 - **封号复检**：被上游风控拦掉的账号单独进「封号复检」标签页，定时发一次最小对话探活；出口按**每个账号一个 mihomo 端口**分配（单一出口单选、随机出口多选，名单里每行还能单独改，改完就是自定义），也能**按公网出口 IP 钉住**（逐个探端口挑当前出口匹配的那条线，之后每号发请求前复核，漂了自动换回匹配端口或停手不出网，端口换节点 / 重连也骗不过），支持端口自动检测（显示节点名 / 类型 / 延迟，不只是一串 IP），每个端口还能单独换成别的节点
 - **国际版每日活跃真跑**：不只是开关。每日到点自动跑，网页端 agent 会话（建会话 → 接沙箱 → ACP `session/prompt` → 轮询到 `completed` → `stop`）加一条桌面对话兜底，逐账号走自己的 `exit_port`，一次尝试一行落 `activity` 表。「每日活跃」页能看今日汇总、每个号的今日状态、历史记录（按今天 / 1 天 / 7 天 / 30 天 / 全部筛），也能手动跑「今天还没成功的 / 全部国际版号 / 勾选的几个」。会话有 10 条硬上限，撞上了自动 `prune` 旧会话再重试，不会跑到第十天开始集体失败。详见下文
 - **每个账号一个活跃开关**：「每日活跃」页的账号卡里逐行一个开关，点一下就落库，勾选后还能批量「开活跃 / 关活跃」。这个值就是 hub 账户文件里的 `tasksEnabled`（默认开，`wb_accounts.py:2264 task_active()` / `wb_scheduler.py:561` 据此决定要不要跑每日活跃对话）：导出 hub 文档或账户目录时随文件走，从 hub 导入时读回来，来回只有一份状态。**开关只在这一处**——账户库那张表不再重复这一列，同一个开关摆在两个标签页，改完还得回头确认哪边是准的，没有意义。风控账号不参与：开关位置直接显示「风控不参与」，跑批也跳过它，解封后自动恢复。国内版没有这项任务，账号卡里不会出现
-- **国际版等级任务**：成长中心那五项（完成一次对话 / 完成技能安装 / 召唤一次专家 / 使用一次模板 / 链接微信）在本程序里跑完并领奖，不是只显示进度。**先做真实动作，再回读服务端状态**，没回读到 `completed` 一个奖励都不领（领奖接口对没完成的任务也回 200）；`wechat_linked` 只检测、提示去官方客户端绑定，绝不伪造事件冒领。逐账号 5 个格子显示 未下发 / 未接 / 进行中 / 可领 / 已领 / 未解锁 / 需客户端，账号级「任务」开关与每日活跃分开，风控号不跑，出口与每日活跃同一套
+- **国际版等级任务**：成长中心那四项（完成一次对话 / 完成技能安装 / 召唤一次专家 / 使用一次模板）在本程序里跑完并领奖，不是只显示进度。**先做真实动作，再回读服务端状态**，没回读到 `completed` 一个奖励都不领（领奖接口对没完成的任务也回 200）。「链接微信」不做：那一步只能在官方客户端点绑定，列表里即使下发也不显示、不跑、不计入统计。逐账号 4 个格子显示 未下发 / 未接 / 进行中 / 可领 / 已领 / 未解锁，账号级「任务」开关与每日活跃分开，风控号不跑，出口与每日活跃同一套
 - **导出按每个账户自己的出口走**：账户库「从账户库导出」卡片里的「按账户出口写 proxy」默认开着，导出时把 DB 里每行 `exit_port` 翻成该账户的 `proxy`（`http://<主机>:<端口>`），同时**清掉 `proxySlot`** —— hub 的 `wb_accounts.py:4614 apply_proxy_slots()` 会拿槽 id 去 `settings.json` 的 `proxy_slots` 查 URL 覆盖静态 `proxy`，槽不清的话本工具配的端口会被无声丢掉。清掉后 `wb_accounts.py:2889` 的每日活跃桌面腿和 `:2619` 的网页腿都用 `self.proxy`，于是每个号跑各自的节点，不是全批一个出口。`exit_port=0` 且没绑精确代理时写成直连。若这一行在官网登录时绑过精确代理（`exit_proxy`），导出的 `proxy` 用那个原串、优先级高于 `exit_port`，「仅补空」也不会跳过它。策略「覆盖」一律改写，「仅补空」保留账户原有的 hub 槽绑定；范围可限「仅国际版」；主机留空沿用 `config/recheck.json` 的 `mihomo.host`（默认 `cli-proxy-mihomo`，是 docker 网络服务名，hub 不在同一网络时填宿主机 IP 或可达域名）。设置随每次导出写进 `config/exitproxy.json`，接口 `GET/POST /api/store/exit-proxy/config`。改完要重新导出并导进 hub 才生效，`hub_document` / `hub_dir_zip` 两个格式都带
 - **验证模型可配、400 自动绕开**：复检与账户验证默认送 `deepseek-v4.1-flash`；国际版上游只认 `deepseek-v4.1-flash-sg`，裸名被拒时自动按候选模型 / 请求体 / 路径往下试（最多 8 次），勾选一个号点「诊断 400」能看到每次尝试的状态码和上游原话，且不写库
 - **访问口令**：登录页口令换会话 cookie，默认 `qq928820655`（改 `config/auth.json`）
@@ -605,7 +605,7 @@ POST /console/as/conversations/          # body 带 prompt / model / conversatio
 
 ## 国际版等级任务
 
-「等级任务」标签页跑的是 `www.workbuddy.ai` 成长中心那五项。它们和每日活跃不是一回事：每日活跃是「今天有一次跑完的会话」，一天一次；等级任务是一份清单，每项有自己的判据，跑完就不再跑。
+「等级任务」标签页跑的是 `www.workbuddy.ai` 成长中心那四项。它们和每日活跃不是一回事：每日活跃是「今天有一次跑完的会话」，一天一次；等级任务是一份清单，每项有自己的判据，跑完就不再跑。
 
 | 任务码 | 界面短名 | 判据 | 本程序怎么做 |
 |---|---|---|---|
@@ -613,7 +613,8 @@ POST /console/as/conversations/          # body 带 prompt / model / conversatio
 | `skill_installed` | 技能 | 完成技能安装 | 技能市场选一个 → 调安装接口 → 回读已装插件 → 对话 → 报 `skill_info` 事件组 |
 | `expert_summoned` | 专家 | 召唤一次专家 | 专家市场取一个（任务行带 `expertId` 就按它找）→ 对话带专家 `_meta` → 报专家事件组 |
 | `template_used` | 模板 | 使用一次模板 | 场景表取一个模板 → 对话 → 报模板四连事件 |
-| `wechat_linked` | 微信 | 绑定微信 | **只检测**。服务端已达标就提示去官方客户端确认，不伪造、不冒领 |
+
+**`wechat_linked` 不做**：绑定微信只能在官方客户端点，服务端要的是微信侧的绑定结果，本程序拿不到也不该伪造。它已从 `CODES` 里摘掉，`fetch_tasks` 按 `code not in CODES` 直接丢弃，所以列表接口下发这一行也不会出现在界面上、不进统计、不参与「做完了没」的判断。
 
 ### 为什么不是「发完请求就算完成」
 
@@ -657,7 +658,7 @@ POST /console/as/conversations/          # body 带 prompt / model / conversatio
 | 不在风控区 | `recheck_state != "banned"` | 不出现，卡片显示「风控不参与」 |
 | 四项还没全领 | `level_task` 快照里 `first_chat / skill_installed / expert_summoned / template_used` 不全是 claimed | 不出现在「跑未完成」列表 |
 
-`wechat_linked` 不计入「做完」判断：它永远领不了，算进去会让这个号每天都被捞出来重跑。五项都已领的号在「全部重跑」里仍可手动跑，只是不会自己冒出来。
+四项全部已领的号不会出现在「跑未完成」列表里；「全部重跑」里仍可手动跑，只是不会自己冒出来。
 
 「任务」开关和每日活跃的「活跃」开关**是两个键**（`level_tasks_enabled` / `tasks_enabled`）：想停掉天天跑的活跃，不该连带把还没领的等级任务也停掉。
 
@@ -690,7 +691,7 @@ POST /console/as/conversations/          # body 带 prompt / model / conversatio
 | `install_skill` | `true` | 「完成技能安装」真的装一个市场技能；关掉只检测，不动账号插件 |
 | `daily_at` | `09:10` | 自动运行的起始时刻（北京时间） |
 | `interval_minutes` | `180` | 过了起始时刻后，隔多久补跑还没做完的号 |
-| `concurrency` | `1` | 同时跑几个号。每个号内部是串行的（五项共用一条会话链路） |
+| `concurrency` | `1` | 同时跑几个号。每个号内部是串行的（四项共用一条会话链路） |
 | `timeout` | `120` | 单次网页对话等待上限（秒） |
 | `models` | 空 | 网页对话模型链，逗号分隔；空 = `deepseek-v4.1-flash, hy3, hy4-preview, hy4-preview-f` |
 | `prompt_chat` | `Hello, please reply OK.` | 「完成一次对话」送进去的话 |
@@ -699,9 +700,9 @@ POST /console/as/conversations/          # body 带 prompt / model / conversatio
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| `GET` | `/api/level/config` | 配置 + 汇总 + 运行态 + 五个任务的定义 |
+| `GET` | `/api/level/config` | 配置 + 汇总 + 运行态 + 四个任务的定义 |
 | `POST` | `/api/level/config` | 改配置（只认上表里的键） |
-| `GET` | `/api/level/accounts` | 国际版账号 + 五项快照 + 开关 / 风控 / 最近一次结果 |
+| `GET` | `/api/level/accounts` | 国际版账号 + 四项快照 + 开关 / 风控 / 最近一次结果 |
 | `GET` | `/api/level/list?range=7d&result=` | 运行记录，`range` 取 `today/1d/7d/30d/all` |
 | `GET` | `/api/level/state` | 只查运行态，用于轮询 |
 | `POST` | `/api/level/run` | 手动触发，`scope=pending\|all\|selected`，`selected` 时用 `ids` |
@@ -915,7 +916,7 @@ wk/
   store.py           本地账户库（SQLite）、备份还原
   probe.py           只读探针：计费查询 + 对话探活
   activity.py        每日活跃：网页端 ACP 会话 + 桌面对话、落库、调度
-  leveltask.py       国际版等级任务：三源任务列表、五项动作、领奖回读、落库
+  leveltask.py       国际版等级任务：三源任务列表、四项动作、领奖回读、落库
   weblogin.py       官方 OAuth 设备流登录、拉资料、写账户库
   recheck.py         封号复检：名单流转、mihomo 节点发现
   clock.py           时间源：北京时间（UTC+8），全站唯一出口

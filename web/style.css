@@ -2351,7 +2351,8 @@ div[id^="view-"].hidden { display: none !important; }
    匿名单元格，宽度塌成内容宽（实测 600px 的列里只铺了 260px）。撑开的是
    里面这层 div。 */
 .lv-wrap { display: flex; flex-direction: column; gap: 3px; width: 100%; }
-.lv-chips { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; width: 100%; }
+/* 四个任务等宽一行（微信那条不做，格子数是 4 不是 5）。 */
+.lv-chips { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; width: 100%; }
 .lv-chip {
   display: flex; flex-direction: column; align-items: center; gap: 0;
   padding: 1px 2px; border-radius: 6px;

@@ -72,6 +72,15 @@ REPORT_PATH = "/v2/report"
 
 WEB_CONVERSATIONS_PATH = "/console/webchat/conversations"
 WEB_CHAT_PATH = "/console/chat/completions"
+
+#: `/console/chat/completions` 的硬要求：messages[0] 必须是 role=system。
+#: 只发一条 user 会被上游 400 拒绝，错误码 11128
+#: 「first message is not system prompt」—— 正文是空的，光看状态码看不出原因。
+SYSTEM_PROMPT = "You are a helpful assistant."
+
+#: 请求体被上游格式校验拒绝时回的码。重试其它模型没用（不是模型的问题），
+#: 应该立刻停手并把原因写清楚，别拿同一句错误刷五遍。
+CODE_BAD_REQUEST = 11128
 SCENES_PATH = "/v2/as/support/scenes?locale=en"
 EXPERT_LIST_PATH = "/v2/operation-platform/market/expert/list"
 SKILL_LIST_PATH = "/v2/operation-platform/market/skill/list"
@@ -79,13 +88,15 @@ PLUGINS_INSTALLED_PATH = "/console/as/user/plugins/installed"
 PLUGINS_INSTALL_PATH = "/console/as/user/plugins/install"
 MARKET_SOURCES_PATH = "/console/as/marketplace/sources"
 
-#: 五个任务，顺序就是界面上的顺序（和成长中心一致）。
+#: 四个任务，顺序就是界面上的顺序（和成长中心一致）。
+#: 「链接微信」不在这里：那一步只能在官方客户端点绑定，服务端拿不到本程序的
+#: 动作凭证，脚本做不了也不该假装做了。列表接口即使下发这一行，`fetch_tasks`
+#: 也会按 `code not in CODES` 丢掉，界面和统计都不再出现。
 CODES: tuple[str, ...] = (
     "first_chat",
     "skill_installed",
     "expert_summoned",
     "template_used",
-    "wechat_linked",
 )
 
 LABELS: dict[str, str] = {
@@ -105,7 +116,8 @@ SHORT: dict[str, str] = {
     "wechat_linked": "微信",
 }
 
-#: 只能在官方客户端完成的。脚本不伪造、不冒领。
+#: 只能在官方客户端完成的。流程里遇到就跳过，不伪造、不冒领。
+#: 已经从 CODES 摘掉，这里留着是为了老快照里的行还能被认出来。
 CLIENT_ONLY = {"wechat_linked"}
 
 #: 需要自动跑完的任务数（不含客户端项）。「这个号做完了没」按它算。
@@ -288,6 +300,16 @@ def _snippet(text: str, limit: int = 140) -> str:
     if "<html" in raw.lower():
         raw = "上游返回 HTML 错误页"
     return " ".join(raw.split())[:limit]
+
+
+def _body_code(text: str) -> Any:
+    """从非 2xx 的响应体里取业务码。取不到返回 None。
+
+    只有 4xx 分支用得上：要区分「格式被拒（11128，换个模型也没用）」和
+    「这个模型不可用（继续试下一个）」，靠的就是这个码。
+    """
+    payload = _parse(text)
+    return payload.get("code") if isinstance(payload, dict) else None
 
 
 def is_restricted(status: int, payload: dict[str, Any]) -> bool:
@@ -672,7 +694,8 @@ def _stream_chat(acc: Account, proxy: str, body: dict[str, Any],
     except urllib.error.HTTPError as exc:
         text = _read_body(exc)
         return {"status": int(exc.code or 0), "finished": False, "text": "",
-                "message_id": "", "error": "HTTP %s %s" % (exc.code, _snippet(text))}
+                "message_id": "", "code": _body_code(text),
+                "error": "HTTP %s %s" % (exc.code, _snippet(text))}
     except Exception as exc:  # noqa: BLE001
         return {"status": 0, "finished": False, "text": "", "message_id": "",
                 "error": "%s: %s" % (type(exc).__name__, exc)}
@@ -733,7 +756,12 @@ def web_conversation(acc: Account, proxy: str, prompt: str, cfg: dict[str, Any],
     last = ""
     for model in _models(cfg):
         body: dict[str, Any] = {
-            "messages": [{"role": "user", "content": prompt}],
+            # 首条必须是 system：上游对这个校验很硬（11128），只发 user 直接 400。
+            # system 内容本身不参与任务判定，任务只认 /v2/report 上报的事件。
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
             "model": model,
             "stream": True,
             "conversationId": cid,
@@ -749,6 +777,12 @@ def web_conversation(acc: Account, proxy: str, prompt: str, cfg: dict[str, Any],
         if is_restricted(int(res.get("status") or 0), {"msg": last}):
             return {"ok": False, "note": "账号受限（11140）", "conversation": cid,
                     "message_id": "", "model": model}
+        # 格式被拒跟模型无关：再换四个模型也是同一句 400，白跑还多四条日志。
+        if str(res.get("code") or "") == str(CODE_BAD_REQUEST):
+            return {"ok": False, "conversation": cid, "message_id": "",
+                    "model": model,
+                    "note": "请求格式被拒（%s）：首条消息必须是 system prompt"
+                            % CODE_BAD_REQUEST}
     return {"ok": False, "note": last or "模型链全部未完成", "conversation": cid,
             "message_id": "", "model": ""}
 
@@ -1080,6 +1114,22 @@ def _snapshot(code: str, row: dict[str, Any] | None, note: str = "") -> dict[str
     }
 
 
+def _list_fail_note(errors: list[str]) -> str:
+    """列表一条都没读到时，四个格子该写什么。
+
+    401/403 是凭据问题（重登能解决），429 是限流（等一会），其余按「没下发」。
+    这里不猜具体原因，只把「不是活动没开」这个事实摆出来。
+    """
+    blob = " ".join(errors or [])
+    if "401" in blob:
+        return "凭据失效（401），需重登"
+    if "403" in blob:
+        return "请求被拒（403）"
+    if "429" in blob:
+        return "触发限流（429），稍后再跑"
+    return "未下发"
+
+
 def run_one(row_id: int, acc: Account, exit_port: int = 0,
             cfg: dict[str, Any] | None = None, trigger: str = "manual"
             ) -> dict[str, Any]:
@@ -1107,7 +1157,10 @@ def run_one(row_id: int, acc: Account, exit_port: int = 0,
     rows, errors = fetch_tasks(acc, proxy)
     if not rows:
         out["detail"] = "任务列表为空：%s" % ("；".join(errors) if errors else "服务端未下发")
-        out["tasks"] = [_snapshot(code, None, "未下发") for code in CODES]
+        # 「读不到列表」和「服务端确实没下发」是两件事。前者是凭据/网络问题，
+        # 四个格子全写成「未下发」等于让人以为是活动没开，白找半天。
+        note = _list_fail_note(errors)
+        out["tasks"] = [_snapshot(code, None, note) for code in CODES]
         return out
 
     snapshots: dict[str, dict[str, Any]] = {}
@@ -1200,8 +1253,7 @@ def run_one(row_id: int, acc: Account, exit_port: int = 0,
     if failures:
         out["detail"] = "；".join(failures)[:400]
     else:
-        out["detail"] = "已领 %d 个%s" % (
-            out["done"], "（微信需客户端）" if "wechat_linked" in rows else "")
+        out["detail"] = "已领 %d 个" % out["done"]
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     if errors:
         out["detail"] = (out["detail"] + "｜列表告警：" + "；".join(errors))[:400]

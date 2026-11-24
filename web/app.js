@@ -4100,7 +4100,7 @@ async function loadLevel() {
   lvState.codes = data.codes || [];
   lvFillForm(data.config);
   $('#lv-hint').textContent =
-    '五格依次是 对话 / 技能 / 专家 / 模板 / 微信：绿=已领，蓝=可领，黄=需客户端，虚线=服务端未下发。'
+    '四格依次是 对话 / 技能 / 专家 / 模板：绿=已领，蓝=可领，黄=待上游确认，虚线=服务端未下发。'
     + '动作做完要等上游回读成 completed 才领奖，没确认一律不冒领。';
   renderLvStats(data.summary);
   await Promise.all([loadLvAccounts(), loadLvLog()]);
@@ -4142,7 +4142,7 @@ function renderLvStats(summary) {
       <h3>累计已领 <b>${summary.total_claimed || 0}</b></h3>
       <div class="mini-row">
         <span class="stat-mini"><i style="background:#4f46e5"></i>今日新领 ${summary.today_claimed || 0}</span>
-        <span class="stat-mini" title="对话 / 技能 / 专家 / 模板四项都领过；微信那条只能在官方客户端绑定"><i style="background:#0ea5e9"></i>四项跑完 ${summary.done_accounts || 0} 个号</span>
+        <span class="stat-mini" title="对话 / 技能 / 专家 / 模板四项都领过"><i style="background:#0ea5e9"></i>四项跑完 ${summary.done_accounts || 0} 个号</span>
       </div>
     </div>`;
 }
@@ -4294,7 +4294,7 @@ function renderLvAccounts() {
       <td class="mono" title="${esc(r.last_detail || '')}">${esc(r.last_at_text || '—')}</td>
       <td class="row-actions">${r.risk
     ? '<button class="link" disabled title="风控号不跑等级任务，移出风控后才能跑">跑一次</button>'
-    : '<button class="link" data-act="lv-run-one" title="立刻跑这个号的五项任务（已领的会跳过）">跑一次</button>'}</td>
+    : '<button class="link" data-act="lv-run-one" title="立刻跑这个号的四项任务（已领的会跳过）">跑一次</button>'}</td>
     </tr>`;
   }).join('');
   const sel = lvState.selected.size;

@@ -39,6 +39,12 @@ class FakeNet:
         self.after_report = "completed"
         self.installed = False
         self.stream_ok = True
+        #: 每次 stream 收到的 body，用来断言 messages 结构（首条必须 system）
+        self.bodies: list[dict] = []
+        #: True 时上游按「首条不是 system」拒绝，回 400/11128
+        self.stream_bad_request = False
+        #: True 时任务列表三个口径全回 401（凭据失效）
+        self.tasks_denied = False
 
     # -- 分派 ------------------------------------------------------
     def http(self, acc, proxy, method, path, body=None, timeout=25.0, headers=None):
@@ -92,6 +98,11 @@ class FakeNet:
         return self._ok({})
 
     def stream(self, acc, proxy, body, timeout=90.0):
+        self.bodies.append(body)
+        if self.stream_bad_request:
+            return {"status": 400, "finished": False, "text": "", "message_id": "",
+                    "code": leveltask.CODE_BAD_REQUEST,
+                    "error": 'HTTP 400 {"code":11128,"msg":"first message is not system prompt"}'}
         if not self.stream_ok:
             return {"status": 500, "finished": False, "text": "", "message_id": "",
                     "error": "HTTP 500"}
@@ -114,6 +125,9 @@ class FakeNet:
         return row
 
     def _tasks(self, path, headers):
+        if self.tasks_denied:
+            return {"status": 401, "payload": {},
+                    "text": "<html><center>401</center></html>"}
         if path == "/activity/growth/tasks":
             source = "level"
         elif headers.get("X-Client-Platform") == "miniprogram":
@@ -228,14 +242,15 @@ class RunOneTests(LevelBase):
         snap = {t["code"]: t for t in res["tasks"]}
         self.assertTrue(snap["first_chat"]["claimed"])
 
-    def test_wechat_is_never_claimed_or_reported(self) -> None:
+    def test_wechat_row_from_server_is_ignored(self) -> None:
+        """服务端还会下发 wechat_linked，但这一项不在 CODES 里，整条链路不碰它。"""
         self.net.add("wechat_linked", "completed")
         res = leveltask.run_one(1, self.acc(), cfg=self.cfg())
         self.assertEqual(self.net.claims, [])
         self.assertEqual(self.net.reports, [])
         snap = {t["code"]: t for t in res["tasks"]}
-        self.assertFalse(snap["wechat_linked"]["claimed"])
-        self.assertIn("客户端", snap["wechat_linked"]["note"])
+        self.assertNotIn("wechat_linked", snap)
+        self.assertEqual(len(snap), 4)
 
     def test_already_claimed_rows_are_skipped(self) -> None:
         self.net.add("first_chat", "claimed")
@@ -311,6 +326,55 @@ class RunOneTests(LevelBase):
         self.assertFalse(res["ok"])
         self.assertIn("任务列表为空", res["detail"])
         self.assertEqual(len(res["tasks"]), len(leveltask.CODES))
+
+
+class ListFailTests(LevelBase):
+    """列表读不到时，格子要写清是凭据问题，不能一律写「未下发」。"""
+
+    def test_401_marks_credentials_not_missing(self) -> None:
+        self.net.tasks_denied = True
+        res = leveltask.run_one(1, self.acc(), cfg=self.cfg())
+        notes = [t["note"] for t in res["tasks"]]
+        self.assertEqual(len(notes), len(leveltask.CODES))
+        self.assertTrue(all("401" in n for n in notes), notes)
+        self.assertNotIn("未下发", notes)
+
+    def test_empty_list_still_says_not_issued(self) -> None:
+        res = leveltask.run_one(1, self.acc(), cfg=self.cfg())
+        self.assertEqual({t["note"] for t in res["tasks"]}, {"未下发"})
+
+    def test_wechat_task_is_gone(self) -> None:
+        self.assertNotIn("wechat_linked", leveltask.CODES)
+        self.assertEqual(len(leveltask.CODES), 4)
+
+
+class ConversationTests(LevelBase):
+    """网页对话的请求体：首条必须是 system（上游 11128 拦的就是这一条）。"""
+
+    def test_first_message_is_system_prompt(self) -> None:
+        res = leveltask.web_conversation(self.acc(), "", "hi", self.cfg())
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(self.net.bodies), 1)
+        msgs = self.net.bodies[0]["messages"]
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertEqual(msgs[0]["content"], leveltask.SYSTEM_PROMPT)
+        self.assertEqual(msgs[1]["role"], "user")
+        self.assertEqual(msgs[1]["content"], "hi")
+
+    def test_bad_request_stops_after_first_model(self) -> None:
+        """11128 跟模型无关：不能拿同一句错误把五个模型全试一遍。"""
+        self.net.stream_bad_request = True
+        cfg = self.cfg(models="a,b,c,d,e")
+        res = leveltask.web_conversation(self.acc(), "", "hi", cfg)
+        self.assertFalse(res["ok"])
+        self.assertEqual(len(self.net.bodies), 1)
+        self.assertIn("system prompt", res["note"])
+        self.assertIn(str(leveltask.CODE_BAD_REQUEST), res["note"])
+
+    def test_body_code_reads_non_2xx_payload(self) -> None:
+        self.assertEqual(leveltask._body_code('{"code":11128,"msg":"x"}'), 11128)
+        self.assertIsNone(leveltask._body_code("<html>500</html>"))
+        self.assertIsNone(leveltask._body_code(""))
 
 
 class StoreTests(LevelBase):
