@@ -3081,6 +3081,7 @@ function switchView(view) {
   $('#view-convert').classList.toggle('hidden', view !== 'convert');
   $('#view-store').classList.toggle('hidden', view !== 'store');
   $('#view-activity').classList.toggle('hidden', view !== 'activity');
+  $('#view-level').classList.toggle('hidden', view !== 'level');
   $('#view-recheck').classList.toggle('hidden', view !== 'recheck');
   $('#view-update').classList.toggle('hidden', view !== 'update');
   if (view === 'store') {
@@ -3089,6 +3090,9 @@ function switchView(view) {
   }
   if (view === 'activity') {
     loadActivity().catch((err) => toast(err.message, true));
+  }
+  if (view === 'level') {
+    loadLevel().catch((err) => toast(err.message, true));
   }
   if (view === 'recheck') {
     loadRecheck().catch((err) => toast(err.message, true));
@@ -4047,8 +4051,450 @@ function bindActivity() {
   });
 }
 
+/* ---------- 等级任务 ---------- */
+
+const lvState = {
+  cfg: null,
+  rows: [],
+  codes: [],
+  selected: new Set(),
+  pollTimer: null,
+  q: '',
+  zone: '',
+};
+
+let lvLoadSeq = 0;
+
+function lvMeta(code) {
+  return lvState.codes.find((c) => c.code === code)
+    || { code, label: code, short: code, client_only: false };
+}
+
+function lvFillForm(cfg) {
+  lvState.cfg = cfg;
+  $('#lv-enabled').checked = cfg.enabled !== false;
+  $('#lv-install').checked = cfg.install_skill !== false;
+  $('#lv-daily-at').value = cfg.daily_at || '09:10';
+  $('#lv-interval').value = cfg.interval_minutes || 180;
+  $('#lv-concurrency').value = cfg.concurrency || 1;
+  $('#lv-timeout').value = cfg.timeout || 120;
+  $('#lv-models').value = cfg.models || '';
+  $('#lv-prompt').value = cfg.prompt_chat || 'Hello, please reply OK.';
+}
+
+function lvFormRead() {
+  return {
+    enabled: $('#lv-enabled').checked,
+    install_skill: $('#lv-install').checked,
+    daily_at: $('#lv-daily-at').value || '09:10',
+    interval_minutes: Number($('#lv-interval').value) || 180,
+    concurrency: Number($('#lv-concurrency').value) || 1,
+    timeout: Number($('#lv-timeout').value) || 120,
+    models: $('#lv-models').value.trim(),
+    prompt_chat: $('#lv-prompt').value.trim() || 'Hello, please reply OK.',
+  };
+}
+
+async function loadLevel() {
+  const data = await apiGet('/api/level/config');
+  lvState.codes = data.codes || [];
+  lvFillForm(data.config);
+  $('#lv-hint').textContent =
+    '五格依次是 对话 / 技能 / 专家 / 模板 / 微信：绿=已领，蓝=可领，黄=需客户端，虚线=服务端未下发。'
+    + '动作做完要等上游回读成 completed 才领奖，没确认一律不冒领。';
+  renderLvStats(data.summary);
+  await Promise.all([loadLvAccounts(), loadLvLog()]);
+  if (data.state && data.state.running) lvStartPoll();
+}
+
+async function loadLvAccounts() {
+  const seq = ++lvLoadSeq;
+  const data = await apiGet('/api/level/accounts');
+  if (seq !== lvLoadSeq) return;
+  lvState.rows = data.rows || [];
+  lvPruneSelection();
+  renderLvAccounts();
+  renderLvStats(data.summary);
+  lvRenderState(data.state);
+}
+
+async function loadLvLog() {
+  const range = $('#lv-range').value || '7d';
+  const result = $('#lv-result').value || '';
+  const data = await apiGet(
+    `/api/level/list?range=${encodeURIComponent(range)}&result=${encodeURIComponent(result)}&limit=200`);
+  renderLvLog(data.rows || []);
+  renderLvStats(data.summary);
+}
+
+function renderLvStats(summary) {
+  if (!summary) return;
+  const failed = Math.max(0, (summary.today_accounts || 0) - (summary.today_ok || 0));
+  $('#lv-stats').innerHTML = `
+    <div class="stat-box">
+      <h3>今日运行 <b>${summary.today_accounts || 0}</b></h3>
+      <div class="mini-row">
+        <span class="stat-mini"><i style="background:#16a34a"></i>成功 ${summary.today_ok || 0}</span>
+        <span class="stat-mini"><i style="background:#dc2626"></i>失败 ${failed}</span>
+      </div>
+    </div>
+    <div class="stat-box">
+      <h3>累计已领 <b>${summary.total_claimed || 0}</b></h3>
+      <div class="mini-row">
+        <span class="stat-mini"><i style="background:#4f46e5"></i>今日新领 ${summary.today_claimed || 0}</span>
+        <span class="stat-mini" title="对话 / 技能 / 专家 / 模板四项都领过；微信那条只能在官方客户端绑定"><i style="background:#0ea5e9"></i>四项跑完 ${summary.done_accounts || 0} 个号</span>
+      </div>
+    </div>`;
+}
+
+function lvRenderState(st) {
+  if (!st) return;
+  if (st.running) {
+    $('#lv-state').textContent =
+      `运行中 ${st.done}/${st.total}（成功 ${st.ok} · 失败 ${st.failed} · 新领 ${st.claimed}）`;
+    return;
+  }
+  if (st.finished_at) {
+    $('#lv-state').textContent =
+      `上批 ${st.total} 个：成功 ${st.ok} · 失败 ${st.failed} · 跳过 ${st.skipped} · 新领 ${st.claimed}`;
+    return;
+  }
+  $('#lv-state').textContent = '未运行';
+}
+
+/** 一格任务：颜色就是结论，副标题是动作。
+ *  未下发 / 未接 / 进行中 / 可领 / 已领 / 未解锁 / 客户端，七种一眼能分开。 */
+function lvChip(code, task) {
+  const meta = lvMeta(code);
+  const t = task || {};
+  const status = String(t.status || '');
+  const note = String(t.note || '');
+  let cls = 'todo';
+  let text = '未做';
+  if (!status) {
+    cls = 'absent';
+    text = '未下发';
+  } else if (t.claimed) {
+    cls = 'ok';
+    text = '已领';
+  } else if (meta.client_only || code === 'wechat_linked') {
+    cls = 'client';
+    text = status === 'completed' ? '待绑定' : '客户端';
+  } else if (t.locked) {
+    cls = 'lock';
+    text = '未解锁';
+  } else if (status === 'completed') {
+    cls = 'ready';
+    text = '可领';
+  } else if (status === 'accepted' || status === 'in_progress' || status === 'already_accepted') {
+    cls = 'doing';
+    text = '进行中';
+  } else {
+    cls = 'todo';
+    text = '未接';
+  }
+  const tip = `${meta.label}：${note || status || '未下发'}`;
+  return `<span class="lv-chip ${cls}" title="${esc(tip)}"><b>${esc(meta.short || code)}</b><i>${text}</i></span>`;
+}
+
+function lvExitText(port, exitProxy) {
+  if (port) return String(port);
+  return String(exitProxy || '').trim() ? '自定义代理' : '直连';
+}
+
+function lvMatch(r, q) {
+  if (!q) return true;
+  const taskWords = lvState.codes.map((c) => {
+    const t = (r.tasks || {})[c.code] || {};
+    const state = t.claimed ? '已领 已完成'
+      : t.locked ? '未解锁'
+        : String(t.status || '') === 'completed' ? '可领'
+          : String(t.status || '') === 'accepted' ? '进行中' : '未接 未做';
+    return `${c.label} ${c.short} ${state} ${t.note || ''}`;
+  }).join(' ');
+  const words = [
+    r.name || '', r.uid || '', r.email || '',
+    r.exit_port ? String(r.exit_port) : (String(r.exit_proxy || '').trim() ? '自定义代理 自定义 出口代理' : '直连'),
+    r.risk ? '风控 风控账户' : '正常 正常账户',
+    r.risk ? '' : (r.level_tasks === false ? '关闭 关 不参与' : '参与 开'),
+    r.done ? '四项跑完 完成 已领完' : `${r.claimed || 0}/${r.total || 4}`,
+    taskWords,
+  ].join(' ').toLowerCase();
+  return q.split(/\s+/).every((word) => word && words.includes(word));
+}
+
+function lvVisibleRows() {
+  const q = lvState.q.trim().toLowerCase();
+  return lvState.rows.filter((r) => {
+    if (lvState.zone === 'risk' && !r.risk) return false;
+    if (lvState.zone === 'normal' && r.risk) return false;
+    return lvMatch(r, q);
+  });
+}
+
+function lvZoneCounts() {
+  const risky = lvState.rows.filter((r) => r.risk).length;
+  return { all: lvState.rows.length, normal: lvState.rows.length - risky, risk: risky };
+}
+
+function lvPruneSelection() {
+  const visible = new Set(lvVisibleRows().map((r) => r.id));
+  lvState.selected = new Set([...lvState.selected].filter((id) => visible.has(id)));
+}
+
+function lvActiveCell(r) {
+  if (r.risk) {
+    return '<span class="da-off-reason" title="风控账号不跑等级任务；移出风控后自动恢复">'
+      + '<span class="da-reason-full">风控不参与</span>'
+      + '<span class="da-reason-short">风控</span></span>';
+  }
+  const on = r.level_tasks !== false;
+  return `<button class="rc-mini ${on ? 'on' : ''}" data-act="lv-toggle" data-on="${on ? 1 : 0}"
+    title="${on ? '点一下关闭：本程序不跑这个号的等级任务' : '点一下开启：本程序会跑这个号的等级任务'}">
+    <span class="rc-mini-box"></span>${on ? '开' : '关'}</button>`;
+}
+
+function lvSyncCheckAll(rows) {
+  const box = $('#lv-check-all');
+  if (!box) return;
+  const picked = rows.filter((r) => lvState.selected.has(r.id)).length;
+  box.checked = rows.length > 0 && picked === rows.length;
+  box.indeterminate = picked > 0 && picked < rows.length;
+}
+
+function renderLvAccounts() {
+  const body = $('#lv-accounts tbody');
+  const counts = lvZoneCounts();
+  $('#lv-zone-all').textContent = counts.all;
+  $('#lv-zone-normal').textContent = counts.normal;
+  $('#lv-zone-risk').textContent = counts.risk;
+
+  const rows = lvVisibleRows();
+  if (!rows.length) {
+    const emptyLib = counts.all === 0;
+    body.innerHTML = '<tr><td colspan="7" class="empty-cell">' + (emptyLib
+      ? '账户库里还没有国际版账号。先在「导入转换」或「官网登录」里加号。'
+      : '没有符合当前搜索 / 分区的账号。切回「全部」或清空搜索词再试。') + '</td></tr>';
+    $('#lv-accounts-hint').textContent = emptyLib
+      ? '' : `共 ${counts.all} 个国际版账号 · 当前显示 0 个`;
+    lvSyncCheckAll(rows);
+    lvSyncBulk();
+    return;
+  }
+  body.innerHTML = rows.map((r) => {
+    const on = lvState.selected.has(r.id);
+    const chips = lvState.codes.map((c) => lvChip(c.code, (r.tasks || {})[c.code])).join('');
+    const prog = `<span class="lv-progress${r.done ? ' done' : ''}" title="四个自动任务已领 ${r.claimed}/${r.total}">${r.claimed}/${r.total}</span>`;
+    return `<tr data-id="${r.id}" data-zone="${r.risk ? 'risk' : 'normal'}" class="${on ? 'sel' : ''}${r.risk ? ' risk-row' : ''}">
+      <td class="col-check"><input type="checkbox" class="lv-check" ${on ? 'checked' : ''}></td>
+      <td title="${esc(r.uid)}${r.email ? ' · ' + esc(r.email) : ''}"><b>${esc(r.name)}</b>${zoneFlag(r)}</td>
+      <td class="da-active">${lvActiveCell(r)}</td>
+      <td class="mono" title="${esc(r.exit_proxy || r.exit_port || '直连')}">${esc(lvExitText(r.exit_port, r.exit_proxy))}</td>
+      <td class="lv-tasks"><div class="lv-wrap"><div class="lv-chips">${chips}</div>${prog}</div></td>
+      <td class="mono" title="${esc(r.last_detail || '')}">${esc(r.last_at_text || '—')}</td>
+      <td class="row-actions">${r.risk
+    ? '<button class="link" disabled title="风控号不跑等级任务，移出风控后才能跑">跑一次</button>'
+    : '<button class="link" data-act="lv-run-one" title="立刻跑这个号的五项任务（已领的会跳过）">跑一次</button>'}</td>
+    </tr>`;
+  }).join('');
+  const sel = lvState.selected.size;
+  const off = lvState.rows.filter((r) => !r.risk && r.level_tasks === false).length;
+  const zoneText = lvState.zone === 'risk' ? '仅风控' : lvState.zone === 'normal' ? '仅正常' : '';
+  $('#lv-accounts-hint').textContent =
+    `共 ${counts.all} 个国际版账号（参与 ${counts.all - counts.risk - off} · 关闭 ${off} · 风控 ${counts.risk}）`
+    + ` · 当前显示 ${rows.length} 个${zoneText ? '（' + zoneText + '）' : ''}`
+    + (lvState.q ? ` · 搜索「${lvState.q}」` : '')
+    + (sel ? ` · 已选 ${sel} 个` : '');
+  lvSyncCheckAll(rows);
+  lvSyncBulk();
+}
+
+function lvSyncBulk() {
+  const usable = [...lvState.selected].filter((id) => {
+    const row = lvState.rows.find((r) => r.id === id);
+    return row && !row.risk;
+  });
+  $('#btn-lv-active-on').disabled = usable.length === 0;
+  $('#btn-lv-active-off').disabled = usable.length === 0;
+}
+
+async function lvSetActive(ids, enabled, sourceBtn) {
+  const usable = ids.filter((id) => {
+    const row = lvState.rows.find((r) => r.id === id);
+    return row && !row.risk;
+  });
+  if (!usable.length) {
+    toast('选中的都是风控账号，不跑等级任务', true);
+    return;
+  }
+  if (sourceBtn) sourceBtn.disabled = true;
+  try {
+    const data = await api('/api/store/level-tasks', { ids: usable, enabled });
+    if (!data.ok) throw new Error(data.error || '设置失败');
+    toast(`已${enabled ? '开启' : '关闭'} ${data.changed} 个账号的等级任务`);
+    await loadLvAccounts();
+  } catch (err) {
+    toast(err.message, true);
+    if (sourceBtn) sourceBtn.disabled = false;
+  }
+}
+
+function renderLvLog(rows) {
+  const body = $('#lv-log tbody');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="7" class="empty-cell">这个区间里还没有等级任务记录。</td></tr>';
+    $('#lv-log-hint').textContent = '';
+    return;
+  }
+  body.innerHTML = rows.map((r) => {
+    const pill = r.skipped ? '<span class="pill mute">跳过</span>'
+      : (r.ok ? '<span class="pill ok">成功</span>' : '<span class="pill bad">失败</span>');
+    const at = String(r.at_text || '');
+    return `<tr>
+      <td class="mono da-at"><span class="at-full">${esc(at)}</span><span class="at-short">${esc(at.slice(5, 16))}</span></td>
+      <td title="${esc(r.uid)}"><b>${esc(r.name)}</b><span class="da-pill-inline">${pill}</span></td>
+      <td class="da-result">${pill}</td>
+      <td class="mono">${r.claimed ? '+' + r.claimed : '—'}</td>
+      <td class="mono" title="${esc(r.proxy || '')}">${esc((r.proxy || '').replace(/^https?:\/\//, '') || '直连')}</td>
+      <td class="mono">${r.elapsed_ms ? (r.elapsed_ms / 1000).toFixed(1) + 's' : '—'}</td>
+      <td class="da-detail" title="${esc(r.detail || '')}">${esc(r.detail || '—')}</td>
+    </tr>`;
+  }).join('');
+  $('#lv-log-hint').textContent = `共 ${rows.length} 条（最新在前）`;
+}
+
+function lvStartPoll() {
+  if (lvState.pollTimer) return;
+  $('#lv-dot').hidden = false;
+  const tick = async () => {
+    try {
+      const data = await apiGet('/api/level/state');
+      lvRenderState(data.state);
+      if (!data.state.running) {
+        clearInterval(lvState.pollTimer);
+        lvState.pollTimer = null;
+        $('#lv-dot').hidden = true;
+        await Promise.all([loadLvAccounts(), loadLvLog()]);
+        toast('本批等级任务跑完了');
+        return;
+      }
+      await loadLvAccounts();
+    } catch (err) {
+      clearInterval(lvState.pollTimer);
+      lvState.pollTimer = null;
+      $('#lv-dot').hidden = true;
+    }
+  };
+  lvState.pollTimer = setInterval(tick, 2000);
+  tick();
+}
+
+async function lvRun(scope, ids) {
+  ['#btn-lv-run-pending', '#btn-lv-run-all'].forEach((k) => { $(k).disabled = true; });
+  try {
+    const payload = { scope };
+    if (ids && ids.length) payload.ids = ids;
+    const data = await api('/api/level/run', payload);
+    if (!data.started) {
+      toast(data.msg || '没有要跑的账号');
+      return;
+    }
+    toast(`已开始跑 ${data.started} 个号`);
+    lvStartPoll();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    ['#btn-lv-run-pending', '#btn-lv-run-all'].forEach((k) => { $(k).disabled = false; });
+  }
+}
+
+async function lvSave() {
+  const btn = $('#btn-lv-save');
+  btn.disabled = true;
+  try {
+    const data = await api('/api/level/config', lvFormRead());
+    lvFillForm(data.config);
+    toast('等级任务设置已保存');
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function bindLevel() {
+  $('#btn-lv-save').addEventListener('click', lvSave);
+  $('#btn-lv-run-pending').addEventListener('click', () => {
+    if (lvState.selected.size) lvRun('selected', [...lvState.selected]);
+    else lvRun('pending');
+  });
+  $('#btn-lv-run-all').addEventListener('click', () => lvRun('all'));
+  $('#btn-lv-refresh').addEventListener('click', () => {
+    loadLevel().catch((err) => toast(err.message, true));
+  });
+  $('#btn-lv-log-refresh').addEventListener('click', () => {
+    loadLvLog().catch((err) => toast(err.message, true));
+  });
+  $('#lv-range').addEventListener('change', () => {
+    loadLvLog().catch((err) => toast(err.message, true));
+  });
+  $('#lv-result').addEventListener('change', () => {
+    loadLvLog().catch((err) => toast(err.message, true));
+  });
+
+  $('#lv-check-all').addEventListener('change', (e) => {
+    lvState.selected = new Set();
+    if (e.target.checked) lvVisibleRows().forEach((r) => lvState.selected.add(r.id));
+    renderLvAccounts();
+  });
+
+  document.querySelectorAll('input[name="lv-zone"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      lvState.zone = el.value;
+      lvPruneSelection();
+      renderLvAccounts();
+    });
+  });
+  $('#lv-account-search').addEventListener('input', (e) => {
+    lvState.q = e.target.value.trim();
+    lvPruneSelection();
+    renderLvAccounts();
+  });
+
+  $('#btn-lv-active-on').addEventListener('click', () =>
+    lvSetActive([...lvState.selected], true));
+  $('#btn-lv-active-off').addEventListener('click', () =>
+    lvSetActive([...lvState.selected], false));
+
+  $('#lv-accounts tbody').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr');
+    if (!tr) return;
+    const id = Number(tr.dataset.id);
+    if (e.target.classList.contains('lv-check')) {
+      if (e.target.checked) lvState.selected.add(id); else lvState.selected.delete(id);
+      renderLvAccounts();
+      return;
+    }
+    const toggle = e.target.closest('button[data-act="lv-toggle"]');
+    if (toggle) {
+      lvSetActive([id], toggle.dataset.on !== '1', toggle);
+      return;
+    }
+    const runOne = e.target.closest('button[data-act="lv-run-one"]');
+    if (runOne) {
+      const row = lvState.rows.find((r) => r.id === id);
+      if (row && row.risk) {
+        toast('风控号不跑等级任务，移出风控后再跑', true);
+        return;
+      }
+      lvRun('selected', [id]);
+    }
+  });
+}
+
 bind();
 bindActivity();
+bindLevel();
 loadProfiles()
   .then(() => loadStoreProfiles())
   .catch(() => toast('格式列表加载失败', true));

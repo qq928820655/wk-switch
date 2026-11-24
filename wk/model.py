@@ -170,6 +170,9 @@ class Account:
     created_at: int = 0
     api_key: bool = False
     tasks_enabled: bool = True
+    #: 国际版等级任务的账户级开关。和 `tasks_enabled`（每日活跃）分开：
+    #: 等级任务跑完就不再跑，天天跑的活跃关掉不该连带停掉还没领的任务。
+    level_tasks_enabled: bool = True
     disabled_models: list[str] = field(default_factory=list)
     auth_raw: Any = None
     profile_raw: Any = None
@@ -321,6 +324,7 @@ def from_row(row: dict, source: str = "") -> Account:
     acc.created_at = normalize_epoch(_first(layers, "created_at"))
     acc.api_key = _as_bool(_first(layers, "api_key"), False)
     acc.tasks_enabled = _as_bool(_first(layers, "tasks_enabled"), True)
+    acc.level_tasks_enabled = _as_bool(_first(layers, "level_tasks_enabled"), True)
     acc.env_line = _stringify(_first(layers, "env_line"))
 
     models = _first(layers, "disabled_models")

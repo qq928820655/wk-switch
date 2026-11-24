@@ -19,8 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from wk import (activity, auth, clock, exitproxy, formats, pipeline, probe,
-                recheck, store, update as updater, version, weblogin)
+from wk import (activity, auth, clock, exitproxy, formats, leveltask, pipeline,
+                probe, recheck, store, update as updater, version, weblogin)
 from wk.model import Account
 
 ROOT = Path(__file__).resolve().parent
@@ -253,6 +253,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/activity/accounts":
             self._activity_accounts()
             return
+        if path == "/api/level/config":
+            self._level_config_get()
+            return
+        if path == "/api/level/accounts":
+            self._level_accounts()
+            return
+        if path == "/api/level/list":
+            self._level_list()
+            return
+        if path == "/api/level/state":
+            self._json(200, {"ok": True, "state": leveltask.state()})
+            return
         if path.startswith("/api/download/"):
             self._download(path[len("/api/download/"):])
             return
@@ -300,6 +312,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._store_exit(payload)
             elif path == "/api/store/daily-active":
                 self._store_daily_active(payload)
+            elif path == "/api/store/level-tasks":
+                self._store_level_tasks(payload)
+            elif path == "/api/level/config":
+                self._level_config_set(payload)
+            elif path == "/api/level/run":
+                self._level_run(payload)
             elif path == "/api/store/exit-proxy/config":
                 self._store_exit_proxy_save(payload)
             elif path == "/api/store/rename":
@@ -1195,6 +1213,105 @@ class Handler(BaseHTTPRequestHandler):
         started = activity.run_batch(pairs, cfg, trigger="manual",
                                      skip_done=skip_done, background=True)
         self._json(200, {"ok": True, **started})
+
+    # ---------------------------------------------------------- 等级任务
+    def _level_config_get(self) -> None:
+        self._json(200, {"ok": True, "config": leveltask.load_config(),
+                         "summary": store.level_summary(),
+                         "state": leveltask.state(),
+                         "codes": [{"code": c, "label": leveltask.LABELS[c],
+                                    "short": leveltask.SHORT[c],
+                                    "client_only": c in leveltask.CLIENT_ONLY}
+                                   for c in leveltask.CODES]})
+
+    def _level_config_set(self, payload: dict) -> None:
+        self._json(200, {"ok": True, "config": leveltask.save_config(payload or {})})
+
+    def _level_list(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        pick = lambda k, d="": (query.get(k) or [d])[0]  # noqa: E731
+        rows = store.level_run_rows(
+            range_key=pick("range", "7d"), result=pick("result", ""),
+            uid=pick("uid", ""),
+            limit=int(pick("limit", "200")) if pick("limit", "200").isdigit() else 200)
+        self._json(200, {"ok": True, "rows": rows,
+                         "summary": store.level_summary()})
+
+    def _level_accounts(self) -> None:
+        """国际版账号 + 五个任务快照 + 是否参与等级任务。"""
+        snaps = store.level_tasks_map()
+        last = store.level_run_last()
+        today = clock.day_start()
+        rows = []
+        for row in store.list_accounts(realm="intl", limit=2000):
+            row_id = int(row["id"])
+            mine = snaps.get(row_id) or {}
+            seen = last.get(row_id) or {}
+            at = int(seen.get("at") or 0)
+            risk = leveltask.is_risk(row)
+            on = row.get("level_tasks") is not False
+            tasks = {code: mine.get(code) or {} for code in leveltask.CODES}
+            auto = [code for code in leveltask.AUTO_CODES]
+            claimed = sum(1 for code in auto if (tasks.get(code) or {}).get("claimed"))
+            rows.append({
+                "id": row_id,
+                "name": row["name"],
+                "realm": row["realm"],
+                "uid": row["uid"],
+                "email": row.get("email") or "",
+                "exit_port": int(row.get("exit_port") or 0),
+                "exit_proxy": str(row.get("exit_proxy") or ""),
+                "level_tasks": on,
+                "risk": risk,
+                "risk_label": row.get("recheck_label") or ("封号中" if risk else ""),
+                "participates": on and not risk,
+                "tasks": tasks,
+                "claimed": claimed,
+                "total": len(auto),
+                "done": bool(auto) and claimed >= len(auto),
+                "last_ok": bool(seen.get("ok")),
+                "last_at": at,
+                "last_at_text": seen.get("at_text") or "",
+                "last_detail": str(seen.get("detail") or "")[:200],
+                "ran_today": bool(at) and at >= today,
+            })
+        # 参与 → 手动关 → 风控；组内保持 updated_at 倒序
+        rows.sort(key=lambda r: 2 if r["risk"] else (0 if r["participates"] else 1))
+        self._json(200, {"ok": True, "rows": rows,
+                         "summary": store.level_summary(),
+                         "state": leveltask.state()})
+
+    def _level_run(self, payload: dict) -> None:
+        if leveltask.busy():
+            raise ValueError("上一批还在跑，等它结束")
+        cfg = leveltask.load_config()
+        scope = str(payload.get("scope") or "pending")
+        if scope == "selected":
+            ids = [int(i) for i in (payload.get("ids") or [])
+                   if str(i).strip().isdigit()]
+            if not ids:
+                raise ValueError("没有选中账号")
+            pairs = store.load_for_export(ids=ids, with_ids=True)
+        elif scope == "all":
+            pairs = leveltask.pairs(only_pending=False)
+        else:
+            pairs = leveltask.pairs(only_pending=True)
+        if not pairs:
+            self._json(200, {"ok": True, "started": 0, "msg": "没有要跑的账号"})
+            return
+        started = leveltask.run_batch(pairs, cfg, trigger="manual", background=True)
+        self._json(200, {"ok": True, **started})
+
+    def _store_level_tasks(self, payload: dict) -> None:
+        ids = [int(i) for i in (payload.get("ids") or [])
+               if str(i).strip().isdigit()]
+        enabled = bool(payload.get("enabled"))
+        if not ids:
+            raise ValueError("没有选中账号")
+        result = store.set_level_tasks(ids, enabled)
+        if not result["changed"]:
+            raise ValueError("选中的账号里没有国际版账户")
+        self._json(200, {"ok": True, "enabled": enabled, **result})
 
     def _store_exit_proxy_config(self) -> None:
         """导出卡片的「按账户出口写 proxy」默认值。单独一个轻量 GET。"""
@@ -2151,6 +2268,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
     httpd = _Server((host, port), Handler)
     start_auto_recheck()
     activity.start_scheduler()
+    leveltask.start_scheduler()
     return httpd
 
 

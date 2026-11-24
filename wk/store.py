@@ -38,7 +38,8 @@ DB_PATH = os.path.join(DATA_DIR, "accounts.db")
 #: 5 = 加导入批次列（最近批次 / 首次批次 / 导入时间）+ 风控来源标记
 #: 7 = 加每日活跃历史表 activity，见 wk/activity.py
 #: 8 = 加账户级精确出口 exit_proxy（官网登录时选的代理 URL）
-SCHEMA_VERSION = 8
+#: 9 = 加国际版等级任务快照 level_task + 运行记录 level_run，见 wk/leveltask.py
+SCHEMA_VERSION = 9
 
 #: 探针状态的中文名。与 wk/probe.py 的 STATE_* 常量一一对应，
 #: 界面上不再自己拼字符串。
@@ -182,6 +183,45 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 CREATE INDEX IF NOT EXISTS idx_activity_at ON activity(at DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_row ON activity(row_id, at DESC);
+
+-- 国际版等级任务的当前快照（见 wk/leveltask.py）。每个账号每个任务一行，
+-- 每次跑完整体覆盖：上游只会给「现在什么状态」，留着旧行会让人以为还能领。
+CREATE TABLE IF NOT EXISTS level_task (
+    row_id      INTEGER NOT NULL,
+    task_code   TEXT NOT NULL,
+    label       TEXT,
+    status      TEXT,
+    claimed     INTEGER DEFAULT 0,
+    locked      INTEGER DEFAULT 0,
+    progress    TEXT,
+    current     REAL,
+    target      REAL,
+    source      TEXT,
+    note        TEXT,
+    at          INTEGER DEFAULT 0,
+    PRIMARY KEY (row_id, task_code)
+);
+CREATE INDEX IF NOT EXISTS idx_level_task_row ON level_task(row_id);
+
+-- 等级任务的运行记录。一次账号一次运行一行，和 activity 一样只追加：
+-- 「哪天跑过、领到几个」要能回看，快照表只留最后一次。
+CREATE TABLE IF NOT EXISTS level_run (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_id     INTEGER DEFAULT 0,
+    uid        TEXT,
+    name       TEXT,
+    at         INTEGER DEFAULT 0,
+    ok         INTEGER DEFAULT 0,
+    skipped    INTEGER DEFAULT 0,
+    done       INTEGER DEFAULT 0,
+    claimed    INTEGER DEFAULT 0,
+    proxy      TEXT,
+    elapsed_ms INTEGER DEFAULT 0,
+    detail     TEXT,
+    trigger    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_level_run_at ON level_run(at DESC);
+CREATE INDEX IF NOT EXISTS idx_level_run_row ON level_run(row_id, at DESC);
 """
 
 
@@ -672,6 +712,10 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
         # 只有国际版用它决定「每日活跃」；国内版也给个值，界面自己判断不显示。
         daily = _payload_bool(row["payload"] if "payload" in keys else "",
                               "tasks_enabled", True)
+        # 等级任务的账户级开关。和每日活跃一样存在 payload 里，只是键不同：
+        # 「天天跑活跃」和「把等级任务刷完」是两件事，开关不能共用一个。
+        level_on = _payload_bool(row["payload"] if "payload" in keys else "",
+                                 "level_tasks_enabled", True)
         credit_state = (row["credit_state"] if "credit_state" in keys else "") or ""
         checked_at = int((row["checked_at"] if "checked_at" in keys else 0) or 0)
         recheck_state = (row["recheck_state"] if "recheck_state" in keys else "") or ""
@@ -735,6 +779,9 @@ def list_accounts(realm: str = "", query: str = "", limit: int = 500,
             "exit_proxy": str((row["exit_proxy"] if "exit_proxy" in keys else "") or ""),
             # 每日活跃（hub: tasksEnabled）。默认开，与 hub 的账户缺省一致。
             "daily_active": daily,
+            # 国际版等级任务开关。默认开：等级任务是一次性的，跑完就领完了，
+            # 「默认关着」只会让人以为这功能没做。
+            "level_tasks": level_on,
         })
     return out
 
@@ -1205,6 +1252,25 @@ def set_daily_active(ids: list[int], enabled: bool) -> dict[str, int]:
     复杂度 O(n)，n = 选中行数；每行一次 JSON 解析 + 一次 UPDATE，批量只在
     界面勾选时触发，不是热路径。
     """
+    return _set_payload_bool(ids, "tasks_enabled", enabled)
+
+
+def set_level_tasks(ids: list[int], enabled: bool) -> dict[str, int]:
+    """设置国际版账户的等级任务开关（payload 的 `level_tasks_enabled`）。
+
+    为什么不复用 `tasks_enabled`：每日活跃是「天天跑」，等级任务跑完五个就
+    结束了。绑在一个开关上，想停掉天天跑的活跃就会顺手把还没领的等级任务
+    也停掉，反过来又会用等级任务的开关控制活跃。两件事两个键。
+    """
+    return _set_payload_bool(ids, "level_tasks_enabled", enabled)
+
+
+def _set_payload_bool(ids: list[int], key: str, enabled: bool) -> dict[str, int]:
+    """改 payload 里的一个布尔开关（只限国际版）。
+
+    值存在 payload 的 Account 快照里而不是单开一列，是因为导出账户文件时
+    要按同一份状态渲染，来回只有一份，不会和库里的列漂移。
+    """
     wanted = [int(i) for i in (ids or [])]
     if not wanted:
         return {"changed": 0, "skipped": 0}
@@ -1225,7 +1291,7 @@ def set_daily_active(ids: list[int], enabled: bool) -> dict[str, int]:
                 data = {}
             if not isinstance(data, dict):
                 data = {}
-            data["tasks_enabled"] = bool(enabled)
+            data[key] = bool(enabled)
             updates.append((json.dumps(data, ensure_ascii=False), now, int(row["id"])))
         if updates:
             conn.executemany(
@@ -1355,6 +1421,151 @@ def activity_last() -> dict[int, dict[str, Any]]:
             "trigger": row["trigger"] or "",
         }
     return out
+
+
+# ------------------------------------------------------------------ 等级任务快照
+
+#: 等级任务的结果区间，和活跃记录共用一套写法。
+LEVEL_RANGES = ACTIVITY_RANGES
+
+
+def level_tasks_save(row_id: int, tasks: list[dict[str, Any]]) -> int:
+    """整体覆盖一个账号的等级任务快照，返回写了几行。
+
+    先删后插而不是逐行 UPSERT：上游这一次没下发的任务必须从快照里消失，
+    留着旧行会让界面显示一个已经不存在的任务，还会被「待跑」判断算进去。
+    """
+    row_id = int(row_id)
+    now = int(time.time())
+    with connect() as conn:
+        conn.execute("DELETE FROM level_task WHERE row_id = ?", (row_id,))
+        conn.executemany(
+            """INSERT INTO level_task
+               (row_id, task_code, label, status, claimed, locked, progress,
+                current, target, source, note, at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [(row_id, str(t.get("code") or ""), str(t.get("label") or ""),
+              str(t.get("status") or ""), 1 if t.get("claimed") else 0,
+              1 if t.get("locked") else 0, str(t.get("progress") or ""),
+              t.get("current"), t.get("target"), str(t.get("source") or ""),
+              str(t.get("note") or ""), int(t.get("at") or now))
+             for t in tasks],
+        )
+    return len(tasks)
+
+
+def level_tasks_map() -> dict[int, dict[str, dict[str, Any]]]:
+    """{行 id: {任务码: 快照}}。列表页一次取完，不在循环里查库。"""
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM level_task").fetchall()
+    out: dict[int, dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row)
+        item["claimed"] = bool(item.get("claimed"))
+        item["locked"] = bool(item.get("locked"))
+        item["at_text"] = clock.stamp(item.get("at") or 0)
+        out.setdefault(int(item["row_id"]), {})[str(item["task_code"])] = item
+    return out
+
+
+def level_run_add(rec: dict[str, Any]) -> dict[str, Any]:
+    """写一行等级任务运行记录。"""
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO level_run
+               (row_id, uid, name, at, ok, skipped, done, claimed, proxy,
+                elapsed_ms, detail, trigger)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (int(rec.get("row_id") or 0), str(rec.get("uid") or ""),
+             str(rec.get("name") or ""), int(rec.get("at") or time.time()),
+             1 if rec.get("ok") else 0, 1 if rec.get("skipped") else 0,
+             int(rec.get("done") or 0), int(rec.get("claimed") or 0),
+             str(rec.get("proxy") or ""), int(rec.get("elapsed_ms") or 0),
+             str(rec.get("detail") or ""), str(rec.get("trigger") or "manual")))
+        new_id = cur.lastrowid
+    return {"id": new_id, **rec}
+
+
+def level_run_rows(range_key: str = "7d", result: str = "", uid: str = "",
+                   limit: int = 200) -> list[dict[str, Any]]:
+    """读等级任务运行记录，最新在前。"""
+    key = str(range_key or "7d").strip().lower()
+    if key not in LEVEL_RANGES:
+        key = "7d"
+    sql = "SELECT * FROM level_run WHERE 1=1"
+    args: list[Any] = []
+    days = LEVEL_RANGES[key]
+    if key == "today":
+        sql += " AND at >= ?"
+        args.append(int(clock.day_start()))
+    elif days is not None:
+        sql += " AND at >= ?"
+        args.append(int(time.time()) - days * 86400)
+    if result == "ok":
+        sql += " AND ok = 1"
+    elif result == "failed":
+        sql += " AND ok = 0 AND skipped = 0"
+    elif result == "skipped":
+        sql += " AND skipped = 1"
+    if uid:
+        sql += " AND uid = ?"
+        args.append(str(uid))
+    sql += " ORDER BY at DESC, id DESC LIMIT ?"
+    args.append(max(1, min(int(limit or 200), 1000)))
+    with connect() as conn:
+        rows = conn.execute(sql, args).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["at_text"] = clock.stamp(item.get("at") or 0)
+        item["ok"] = bool(item.get("ok"))
+        item["skipped"] = bool(item.get("skipped"))
+        out.append(item)
+    return out
+
+
+def level_run_last() -> dict[int, dict[str, Any]]:
+    """每一行最近一次等级任务运行：{row_id: {ok, at, detail, claimed}}。"""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT r.row_id, r.ok, r.skipped, r.at, r.detail, r.claimed
+               FROM level_run r
+               JOIN (SELECT row_id, MAX(at) AS last_at FROM level_run
+                     GROUP BY row_id) m
+                 ON r.row_id = m.row_id AND r.at = m.last_at""").fetchall()
+    out: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        out[int(row["row_id"])] = {
+            "ok": bool(row["ok"]), "skipped": bool(row["skipped"]),
+            "at": int(row["at"] or 0), "at_text": clock.stamp(row["at"] or 0),
+            "detail": row["detail"] or "", "claimed": int(row["claimed"] or 0),
+        }
+    return out
+
+
+def level_summary() -> dict[str, Any]:
+    """顶部统计：今日跑过的账号 / 今日新领任务数 / 累计已领任务数。"""
+    day = int(clock.day_start())
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS runs,
+                      SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS ok_runs,
+                      SUM(claimed) AS claimed
+               FROM level_run WHERE at >= ?""", (day,)).fetchone()
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM level_task WHERE claimed = 1").fetchone()
+        done_acc = conn.execute(
+            """SELECT COUNT(*) AS n FROM (
+                   SELECT row_id FROM level_task
+                   WHERE claimed = 1 AND task_code != 'wechat_linked'
+                   GROUP BY row_id HAVING COUNT(*) >= 4)""").fetchone()
+    return {
+        "today_accounts": int(row["runs"] or 0),
+        "today_ok": int(row["ok_runs"] or 0),
+        "today_claimed": int(row["claimed"] or 0),
+        "total_claimed": int(total["n"] or 0),
+        "done_accounts": int(done_acc["n"] or 0),
+    }
 
 
 def exit_ports_of(ids: Iterable[int]) -> dict[int, int]:

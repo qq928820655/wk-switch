@@ -26,6 +26,7 @@
     <button class="tab active" data-view="convert">导入转换</button>
     <button class="tab" data-view="store">账户库 <span class="tab-count" id="store-count">0</span></button>
     <button class="tab" data-view="activity">每日活跃 <span class="tab-dot" id="da-dot" hidden></span></button>
+    <button class="tab" data-view="level">等级任务 <span class="tab-dot" id="lv-dot" hidden></span></button>
     <button class="tab" data-view="recheck">封号复检 <span class="tab-dot" id="recheck-dot" hidden></span></button>
     <button class="tab" data-view="update">升级 <span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
@@ -626,6 +627,154 @@
       </table>
     </div>
     <p class="hint" id="da-log-hint"></p>
+  </section>
+</div>
+
+<div id="view-level" class="hidden">
+
+  <section class="card">
+    <div class="card-head">
+      <h2>等级任务</h2>
+      <span class="hint">国际版成长中心五项任务：真做动作 → 回读状态 → 确认完成才领奖；微信绑定只能在官方客户端做</span>
+    </div>
+
+    <div class="rc-switches">
+      <label class="rc-switch">
+        <input type="checkbox" id="lv-enabled">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>自动运行</b><small>到点补跑还没做完的号；五个任务都领过的号不再打扰</small></span>
+      </label>
+      <label class="rc-switch">
+        <input type="checkbox" id="lv-install">
+        <span class="rc-box"></span>
+        <span class="rc-text"><b>真的安装技能</b><small>「完成技能安装」要在市场装一个技能；关掉只检测，不动账号插件</small></span>
+      </label>
+    </div>
+
+    <div class="rc-grid">
+      <label class="field">
+        <span>每日起始时刻</span>
+        <input type="time" id="lv-daily-at">
+      </label>
+      <label class="field">
+        <span>补跑间隔（分钟）</span>
+        <input type="number" id="lv-interval" min="15" max="1440" step="15">
+      </label>
+      <label class="field">
+        <span>并发（个）</span>
+        <input type="number" id="lv-concurrency" min="1" max="6" step="1">
+      </label>
+      <label class="field">
+        <span>单号等待（秒）</span>
+        <input type="number" id="lv-timeout" min="30" max="600" step="10">
+      </label>
+      <label class="field">
+        <span>网页对话模型（逗号分隔）</span>
+        <input type="text" id="lv-models" placeholder="留空 = deepseek-v4.1-flash, hy3, hy4-preview">
+      </label>
+      <label class="field">
+        <span>对话提示词</span>
+        <input type="text" id="lv-prompt" placeholder="Hello, please reply OK.">
+      </label>
+    </div>
+
+    <div class="store-actions">
+      <button class="btn primary" id="btn-lv-save">保存设置</button>
+      <button class="btn" id="btn-lv-run-pending">跑未完成</button>
+      <button class="btn ghost" id="btn-lv-run-all">全部重跑</button>
+      <button class="btn ghost" id="btn-lv-refresh">刷新</button>
+    </div>
+    <p class="hint" id="lv-hint"></p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>账号任务</h2>
+      <span class="hint" id="lv-state">未运行</span>
+    </div>
+    <div class="store-stats" id="lv-stats"></div>
+    <div class="store-toolbar da-account-tools">
+      <div class="seg" id="lv-zone-seg" title="风控账户不跑等级任务；正常账户再按「参与 / 手动关 / 已完成」排列">
+        <label><input type="radio" name="lv-zone" value="" checked><span>全部 <b class="seg-num" id="lv-zone-all">0</b></span></label>
+        <label><input type="radio" name="lv-zone" value="normal"><span>正常 <b class="seg-num" id="lv-zone-normal">0</b></span></label>
+        <label><input type="radio" name="lv-zone" value="risk"><span>风控 <b class="seg-num" id="lv-zone-risk">0</b></span></label>
+      </div>
+      <label class="search-box">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6" stroke-linecap="round"/>
+        </svg>
+        <input type="search" id="lv-account-search" placeholder="搜索名称 / uid / 邮箱 / 出口 / 任务状态">
+      </label>
+    </div>
+    <div class="table-wrap tall">
+      <table class="grid" id="lv-accounts">
+        <colgroup>
+          <col style="width:32px">
+          <col style="width:140px">
+          <col style="width:62px">
+          <col style="width:60px">
+          <col>
+          <col style="width:104px">
+          <col style="width:66px">
+        </colgroup>
+        <thead>
+          <tr><th class="col-check"><input type="checkbox" id="lv-check-all" title="全选国际版账号"></th>
+            <th>名称</th>
+            <th title="账户级开关：关掉的号本程序不跑等级任务，每日活跃照旧">参与</th>
+            <th>出口</th>
+            <th>五项任务（对话 / 技能 / 专家 / 模板 / 微信）</th>
+            <th>上次</th>
+            <th class="row-actions"></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="store-actions da-bulk">
+      <button class="btn small" id="btn-lv-active-on" disabled title="把勾选账号设为参与等级任务">开任务</button>
+      <button class="btn small ghost" id="btn-lv-active-off" disabled title="把勾选账号设为不参与等级任务">关任务</button>
+      <span class="hint" id="lv-accounts-hint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>运行记录</h2>
+      <div class="head-right">
+        <select class="select-batch" id="lv-range">
+          <option value="today">今日</option>
+          <option value="1d">近 1 天</option>
+          <option value="7d" selected>近 7 天</option>
+          <option value="30d">近 30 天</option>
+          <option value="all">全部</option>
+        </select>
+        <select class="select-batch" id="lv-result">
+          <option value="">全部结果</option>
+          <option value="ok">成功</option>
+          <option value="failed">失败</option>
+          <option value="skipped">跳过</option>
+        </select>
+        <button class="btn small ghost" id="btn-lv-log-refresh">刷新</button>
+      </div>
+    </div>
+    <div class="table-wrap tall">
+      <table class="grid" id="lv-log">
+        <colgroup>
+          <col style="width:120px">
+          <col style="width:150px">
+          <col style="width:64px">
+          <col style="width:64px">
+          <col style="width:140px">
+          <col style="width:64px">
+          <col>
+        </colgroup>
+        <thead>
+          <tr><th>时间</th><th>账号</th><th>结果</th><th>新领</th>
+            <th>出口</th><th>耗时</th><th>说明</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="hint" id="lv-log-hint"></p>
   </section>
 </div>
 
